@@ -1,0 +1,981 @@
+<title>Remote Linux MCP</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+
+<style>
+:root {
+  --bg:        #F7F7F5;
+  --surface:   #FFFFFF;
+  --border:    #E2E0DA;
+  --text:      #1A1A18;
+  --muted:     #6B6B65;
+  --accent:    #1A56DB;
+  --accent-bg: #EEF3FD;
+  --warn:      #C2410C;
+  --warn-bg:   #FFF3EE;
+  --green:     #166534;
+  --green-bg:  #F0FDF4;
+  --code-bg:   #F0EFE9;
+  --mono:      'IBM Plex Mono', 'Courier New', monospace;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:        #141412;
+    --surface:   #1E1E1B;
+    --border:    #2E2E29;
+    --text:      #EEEDE8;
+    --muted:     #888880;
+    --accent:    #6B9FFF;
+    --accent-bg: #1A2340;
+    --warn:      #FB923C;
+    --warn-bg:   #2A1200;
+    --green:     #4ADE80;
+    --green-bg:  #0A1F10;
+    --code-bg:   #252520;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:        #141412;
+  --surface:   #1E1E1B;
+  --border:    #2E2E29;
+  --text:      #EEEDE8;
+  --muted:     #888880;
+  --accent:    #6B9FFF;
+  --accent-bg: #1A2340;
+  --warn:      #FB923C;
+  --warn-bg:   #2A1200;
+  --green:     #4ADE80;
+  --green-bg:  #0A1F10;
+  --code-bg:   #252520;
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding-inline: 24px;
+  padding-block: 32px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.7;
+  max-width: 900px;
+  margin-inline: auto;
+}
+
+/* ── Typography ─────────────────────────────────────────── */
+h1 {
+  font-size: 1.75rem;
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 0 0 6px;
+  text-wrap: balance;
+  letter-spacing: -0.02em;
+}
+.doc-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-bottom: 40px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.doc-meta span::before { content: "· "; }
+.doc-meta span:first-child::before { content: ""; }
+
+h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 44px 0 12px;
+  letter-spacing: -0.01em;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 28px 0 8px;
+  color: var(--text);
+}
+h4 {
+  font-size: 0.88rem;
+  font-weight: 600;
+  margin: 20px 0 6px;
+  color: var(--muted);
+}
+p { margin: 0 0 12px; }
+p + p { margin-top: 0; }
+
+/* ── Nav / TOC ──────────────────────────────────────────── */
+.toc {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px 20px;
+  margin-bottom: 40px;
+  font-size: 0.875rem;
+}
+.toc-title {
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.toc ol {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+
+/* ── Callouts ───────────────────────────────────────────── */
+.callout {
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin: 16px 0;
+  font-size: 0.9rem;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.callout-icon { flex-shrink: 0; font-size: 1rem; line-height: 1.7; }
+.callout.info  { background: var(--accent-bg); }
+.callout.warn  { background: var(--warn-bg);   color: var(--warn); }
+.callout.good  { background: var(--green-bg);  color: var(--green);}
+
+/* ── Tables ─────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; margin: 16px 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-bottom: 2px solid var(--border);
+}
+td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+
+/* ── Code ───────────────────────────────────────────────── */
+code {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  margin: 12px 0 20px;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+/* ── Section anchors ────────────────────────────────────── */
+.section { scroll-margin-top: 24px; }
+
+/* ── Tool list ──────────────────────────────────────────── */
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.tool-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+}
+.tool-name {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.tool-desc { font-size: 0.85rem; color: var(--muted); line-height: 1.5; }
+
+/* ── Figure ─────────────────────────────────────────────── */
+figure {
+  margin: 24px 0;
+}
+figcaption {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-top: 8px;
+  text-align: center;
+}
+figure svg { display: block; margin: 0 auto; }
+
+/* ── Divider ────────────────────────────────────────────── */
+hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+
+@media (max-width: 480px) {
+  body { padding-inline: 16px; }
+  h1 { font-size: 1.4rem; }
+}
+</style>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  HEADER                                                 -->
+<!-- ════════════════════════════════════════════════════════ -->
+<h1>Remote Linux MCP Gateway</h1>
+<div class="doc-meta">
+  <span>设计文档 v1.1</span>
+  <span>2026-09-28（新增直连节点）</span>
+  <span>状态：设计完成，待开发</span>
+</div>
+
+<div class="toc">
+  <div class="toc-title">目录</div>
+  <ol>
+    <li><a href="#background">背景与目标</a></li>
+    <li><a href="#arch">整体架构</a></li>
+    <li><a href="#bastion">连接方案：跳板机与直连</a></li>
+    <li><a href="#tools">MCP 工具 API</a></li>
+    <li><a href="#lifecycle">连接生命周期</a></li>
+    <li><a href="#security">安全策略</a></li>
+    <li><a href="#files">文件结构</a></li>
+    <li><a href="#deploy">部署与接入</a></li>
+    <li><a href="#risks">风险与限制</a></li>
+    <li><a href="#future">后续增强方向</a></li>
+  </ol>
+</div>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  1. BACKGROUND                                          -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="background">
+<h2>1. 背景与目标</h2>
+
+<p>开发者在 Windows 本机使用 Claude Code（CC）或 Codex，但实际的代码运行、调试、编译工作发生在内网 Linux 机器上。这两个世界之间有一道跳板机墙：所有内网机器只能通过跳板机访问，跳板机要求 TOTP 验证码认证。</p>
+
+<p>目标是让 CC / Codex 能像操作本地文件一样操作远端 Linux，读文件、改代码、执行命令、搜索内容，而不是在 PowerShell 里手写 SSH 命令行。</p>
+
+<h3>约束条件</h3>
+<ul>
+  <li>跳板机：标准 sshd，允许 TCP 转发，登录需要 TOTP 验证码</li>
+  <li>目标机：密钥认证，无需 TOTP</li>
+  <li>直连节点：一部分机器不走跳板机，本机可以直接通过 <code>ip:port</code> 访问，用户名加密码或密钥/证书登录（见 3.4）</li>
+  <li>Windows 本机：无 ControlMaster 支持（Windows OpenSSH 限制）</li>
+  <li>远端机器不能安装任何东西</li>
+  <li>需要同时支持 CC 和 Codex 两个客户端</li>
+</ul>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  2. ARCH                                                -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="arch">
+<h2>2. 整体架构</h2>
+
+<figure>
+<svg viewBox="0 0 820 340" role="img" aria-label="整体架构：CC/Codex 通过 HTTP 连接本地 MCP Daemon，Daemon 持有跳板机长连接，所有目标机通过 tunnel 接入"
+     style="max-width:100%;height:auto;width:820px;">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="currentColor"/>
+    </marker>
+    <marker id="arr-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#1A56DB"/>
+    </marker>
+  </defs>
+
+  <!-- Windows box -->
+  <rect x="10" y="10" width="370" height="310" rx="8" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="5,4" opacity="0.35"/>
+  <text x="26" y="32" font-size="11" font-family="IBM Plex Mono, monospace" fill="currentColor" opacity="0.5">Windows 本机</text>
+
+  <!-- CC -->
+  <rect x="30" y="50" width="130" height="44" rx="5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="95" y="69" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">Claude Code</text>
+  <text x="95" y="84" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">MCP client</text>
+
+  <!-- Codex -->
+  <rect x="200" y="50" width="130" height="44" rx="5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="265" y="69" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">Codex</text>
+  <text x="265" y="84" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">MCP client</text>
+
+  <!-- Arrow CC → Daemon -->
+  <line x1="95" y1="94" x2="185" y2="163" stroke="#1A56DB" stroke-width="1.5" marker-end="url(#arr-accent)"/>
+  <text x="108" y="138" font-size="10" font-family="IBM Plex Mono, monospace" fill="#1A56DB">HTTP</text>
+  <text x="94" y="150" font-size="10" font-family="IBM Plex Mono, monospace" fill="#1A56DB">127.0.0.1:8765</text>
+
+  <!-- Arrow Codex → Daemon -->
+  <line x1="265" y1="94" x2="235" y2="163" stroke="#1A56DB" stroke-width="1.5" marker-end="url(#arr-accent)"/>
+  <text x="246" y="138" font-size="10" font-family="IBM Plex Mono, monospace" fill="#1A56DB">HTTP</text>
+
+  <!-- Daemon box -->
+  <rect x="130" y="165" width="220" height="80" rx="6" fill="#EEF3FD" stroke="#1A56DB" stroke-width="1.5"/>
+  <text x="240" y="190" font-size="13" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="#1A56DB">MCP Daemon</text>
+  <text x="240" y="208" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="#1A56DB" opacity="0.8">remote_mcp / daemon.py</text>
+  <text x="240" y="224" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="#1A56DB" opacity="0.7">asyncssh 连接池</text>
+
+  <!-- Daemon audit -->
+  <rect x="40" y="275" width="130" height="36" rx="5" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/>
+  <text x="105" y="290" font-size="10" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="currentColor" opacity="0.6">audit.jsonl</text>
+  <text x="105" y="303" font-size="9" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.5">本地审计日志</text>
+  <line x1="155" y1="245" x2="130" y2="275" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.4" marker-end="url(#arr)"/>
+
+  <!-- Internet/bastion zone -->
+  <rect x="420" y="10" width="385" height="310" rx="8" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+  <text x="436" y="32" font-size="11" font-family="IBM Plex Mono, monospace" fill="currentColor" opacity="0.5">内网</text>
+
+  <!-- Bastion -->
+  <rect x="440" y="90" width="140" height="60" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="510" y="116" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">跳板机</text>
+  <text x="510" y="131" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">bastion.example.com</text>
+  <text x="510" y="144" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">TOTP 认证</text>
+
+  <!-- Arrow Daemon → Bastion: SSH -->
+  <line x1="350" y1="210" x2="440" y2="148" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="364" y="190" font-size="10" font-family="IBM Plex Mono, monospace" fill="currentColor">SSH（TOTP</text>
+  <text x="372" y="202" font-size="10" font-family="IBM Plex Mono, monospace" fill="currentColor">仅启动时）</text>
+
+  <!-- dev1 -->
+  <rect x="600" y="55" width="140" height="55" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="670" y="79" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">dev1</text>
+  <text x="670" y="95" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">10.0.1.x  · 密钥认证</text>
+  <text x="670" y="107" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">tunnel= bastion</text>
+
+  <!-- gpu-box -->
+  <rect x="600" y="135" width="140" height="55" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="670" y="159" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">gpu-box</text>
+  <text x="670" y="175" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">10.0.1.y  · 密钥认证</text>
+  <text x="670" y="187" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">tunnel= bastion</text>
+
+  <!-- N more -->
+  <rect x="600" y="215" width="140" height="40" rx="6" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="4,3" opacity="0.5"/>
+  <text x="670" y="239" font-size="11" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="currentColor" opacity="0.5">其他目标机 …</text>
+
+  <!-- Bastion → dev1 (direct-tcpip tunnel) -->
+  <line x1="580" y1="120" x2="600" y2="100" stroke="#1A56DB" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-accent)"/>
+  <!-- Bastion → gpu-box -->
+  <line x1="580" y1="136" x2="600" y2="162" stroke="#1A56DB" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-accent)"/>
+  <!-- Bastion → others -->
+  <line x1="580" y1="148" x2="600" y2="228" stroke="#1A56DB" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-accent)"/>
+
+  <!-- tunnel label -->
+  <text x="583" y="118" font-size="9" font-family="IBM Plex Mono, monospace" fill="#1A56DB">direct-tcpip</text>
+
+  <!-- Direct node (no bastion) -->
+  <rect x="440" y="195" width="140" height="55" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="510" y="218" font-size="12" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor">lab3（直连）</text>
+  <text x="510" y="233" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">ip:port · 密码/密钥</text>
+  <text x="510" y="245" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor" opacity="0.6">via = direct</text>
+
+  <!-- Arrow Daemon → direct node: SSH -->
+  <line x1="350" y1="230" x2="440" y2="224" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="362" y="244" font-size="10" font-family="IBM Plex Mono, monospace" fill="currentColor">SSH 直连</text>
+
+  <!-- Legend -->
+  <line x1="440" y1="290" x2="470" y2="290" stroke="#1A56DB" stroke-width="1.5"/>
+  <text x="476" y="294" font-size="10" font-family="IBM Plex Sans, sans-serif" fill="currentColor" opacity="0.7">MCP / HTTP</text>
+  <line x1="545" y1="290" x2="575" y2="290" stroke="#1A56DB" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="581" y="294" font-size="10" font-family="IBM Plex Sans, sans-serif" fill="currentColor" opacity="0.7">SSH tunnel</text>
+  <line x1="640" y1="290" x2="670" y2="290" stroke="currentColor" stroke-width="1.5"/>
+  <text x="676" y="294" font-size="10" font-family="IBM Plex Sans, sans-serif" fill="currentColor" opacity="0.7">SSH（初始）</text>
+</svg>
+<figcaption>图 1 — 整体连接拓扑。Daemon 持有唯一的跳板机连接，内网目标机都通过 <code>tunnel=bastion_conn</code> 打隧道，以此绕开 ControlMaster 限制。标了 <code>via = "direct"</code> 的节点不经过跳板机，由 Daemon 直接用 <code>ip:port</code> 连接（见 3.4）。</figcaption>
+</figure>
+
+<h3>为什么选择「本地 HTTP Daemon + asyncssh 连接池」</h3>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>方案</th>
+      <th>TOTP 频率</th>
+      <th>远端依赖</th>
+      <th>关键缺陷</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>PowerShell 直接 <code>ssh host "..."</code></td>
+      <td>每次连接</td>
+      <td>无</td>
+      <td>Windows 无 ControlMaster；引号转义地狱；每条命令重新握手</td>
+    </tr>
+    <tr>
+      <td>CC stdio 每次拉起 MCP 进程</td>
+      <td>每个会话</td>
+      <td>无</td>
+      <td>进程每次重建 SSH 连接，TOTP 无法复用</td>
+    </tr>
+    <tr>
+      <td>远端部署 MCP Server</td>
+      <td>按需</td>
+      <td><strong>每台机器都要安装</strong></td>
+      <td>维护成本高；远端环境差异大；无法统一审计</td>
+    </tr>
+    <tr>
+      <td><strong>本地 HTTP Daemon（本方案）</strong></td>
+      <td><strong>仅启动时一次</strong></td>
+      <td><strong>无</strong></td>
+      <td>需要保持 Daemon 常驻窗口</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout info">
+  <span class="callout-icon">ℹ</span>
+  <div><strong>核心 trick：</strong><code>asyncssh.connect(target, tunnel=bastion_conn)</code>。跳板机连接在 Daemon 启动时建立一次，之后所有目标机通过这条已认证的连接打 <code>direct-tcpip</code> 隧道，TOTP 不再介入。</div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  3. BASTION                                             -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="bastion">
+<h2>3. 连接方案：跳板机与直连</h2>
+
+<h3>3.1 TOTP 认证交互</h3>
+<p>asyncssh 的 <code>kbdint_challenge_received</code> 回调在跳板机发来 keyboard-interactive 挑战时触发。Daemon 进程在启动时占用一个 PowerShell 窗口，TOTP 提示出现在该窗口，用户输入后连接建立，此后不再需要。</p>
+
+<pre><code># 认证回调核心逻辑
+async def kbdint_challenge_received(self, name, instructions, lang, prompts):
+    loop = asyncio.get_event_loop()
+    responses = []
+    for prompt, echo in prompts:
+        sys.stderr.write(prompt); sys.stderr.flush()
+        if echo:
+            resp = await loop.run_in_executor(None, input)
+        else:
+            resp = await loop.run_in_executor(None, lambda: getpass.getpass(""))
+        responses.append(resp)
+    return responses</code></pre>
+
+<h3>3.2 连接建立流程</h3>
+
+<figure>
+<svg viewBox="0 0 700 230" role="img" aria-label="连接建立时序：Daemon 启动后连接跳板机输入 TOTP，之后通过 tunnel 连接目标机，CC 会话复用同一连接"
+     style="max-width:100%;height:auto;width:700px;">
+  <defs>
+    <marker id="arr2" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="currentColor"/>
+    </marker>
+  </defs>
+
+  <!-- Swimlane headers -->
+  <rect x="0" y="0" width="700" height="30" fill="none"/>
+  <text x="80"  y="20" font-size="11" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor" opacity="0.7">Daemon 进程</text>
+  <text x="280" y="20" font-size="11" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor" opacity="0.7">跳板机</text>
+  <text x="480" y="20" font-size="11" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor" opacity="0.7">目标机（dev1）</text>
+  <text x="620" y="20" font-size="11" font-family="IBM Plex Sans, sans-serif" font-weight="600" text-anchor="middle" fill="currentColor" opacity="0.7">CC / Codex</text>
+
+  <!-- Vertical lanes -->
+  <line x1="80"  y1="30" x2="80"  y2="220" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.3"/>
+  <line x1="280" y1="30" x2="280" y2="220" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.3"/>
+  <line x1="480" y1="30" x2="480" y2="220" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.3"/>
+  <line x1="620" y1="30" x2="620" y2="220" stroke="currentColor" stroke-width="1" stroke-dasharray="3,3" opacity="0.3"/>
+
+  <!-- Step 1: Daemon → Bastion SSH connect -->
+  <line x1="80" y1="55" x2="270" y2="55" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="175" y="48" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">SSH connect</text>
+
+  <!-- Step 2: Bastion → Daemon TOTP challenge -->
+  <line x1="270" y1="75" x2="90" y2="75" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="175" y="70" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">kbdint challenge</text>
+
+  <!-- Step 3: user inputs TOTP -->
+  <rect x="10" y="83" width="140" height="22" rx="3" fill="#EEF3FD" stroke="#1A56DB" stroke-width="1"/>
+  <text x="80" y="98" font-size="10" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="#1A56DB">用户在 Daemon 窗口输入 TOTP ← 仅此一次</text>
+
+  <!-- Step 4: Daemon → Bastion send TOTP -->
+  <line x1="80" y1="115" x2="270" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="175" y="108" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">send response</text>
+
+  <!-- Step 5: Bastion ACK -->
+  <line x1="270" y1="130" x2="90" y2="130" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="175" y="124" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">auth success</text>
+
+  <!-- Step 6: CC calls tool -->
+  <line x1="610" y1="152" x2="90" y2="152" stroke="#1A56DB" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="350" y="146" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="#1A56DB">exec(host="dev1", ...)</text>
+
+  <!-- Step 7: Daemon → Bastion tunnel -->
+  <line x1="80" y1="170" x2="270" y2="170" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <text x="175" y="164" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">open direct-tcpip</text>
+
+  <!-- Step 8: Bastion → Target forward -->
+  <line x1="280" y1="170" x2="470" y2="170" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <text x="375" y="164" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">TCP forward</text>
+
+  <!-- Step 9: result back -->
+  <line x1="470" y1="188" x2="90" y2="188" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="275" y="182" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">stdout / stderr</text>
+
+  <line x1="80" y1="205" x2="610" y2="205" stroke="#1A56DB" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text x="350" y="200" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="#1A56DB">tool result</text>
+</svg>
+<figcaption>图 2 — 连接时序。TOTP 只出现在 Daemon 启动阶段（步骤 1–5），后续所有工具调用（步骤 6–10）不经过任何认证对话。</figcaption>
+</figure>
+
+<h3>3.3 keepalive 与断线重连</h3>
+<p>跳板机通常会踢掉空闲连接，须在 SSH 层设置保活：</p>
+<pre><code>asyncssh.connect(host,
+    keepalive_interval=30,     # 每 30 秒发一次 keepalive
+    keepalive_count_max=3,     # 连续 3 次不响应才判定断线
+)</code></pre>
+<p>当工具调用捕获到 <code>ConnectionLost</code> 或 <code>DisconnectError</code> 时，连接池清空所有目标机连接并重试一次。若跳板机本身也断了，Daemon 窗口会再次提示输入 TOTP，也提供一个 <code>reset_connections</code> 工具手动触发。</p>
+
+<h3>3.4 直连节点（不经过跳板机）</h3>
+<p>有一部分节点本机可以直接访问，不需要经过跳板机，通过 <code>ip:port</code> 加用户名登录，认证方式是密码或密钥/证书。这些节点也纳入同一个连接池管理，工具层的用法保持不变：模型只需要传 <code>host="lab3"</code>，不用关心它走哪条路由。</p>
+
+<h4>路由字段 <code>via</code></h4>
+<p>每个 <code>[host.&lt;name&gt;]</code> 新增一个 <code>via</code> 字段：</p>
+<ul>
+  <li><code>via = "bastion"</code>（默认值，不写就是它）：走跳板机隧道，行为和现在完全一样。登录方式是 <code>用户名@节点名</code>，节点名本身就是目标主机名，由跳板机负责解析，因此不用配 <code>address</code>。认证只用密钥免密登录，不需要也不接受 <code>password</code>。</li>
+  <li><code>via = "direct"</code>：Daemon 直接对 <code>address:port</code> 发起 SSH 连接，不经过跳板机，也不需要 TOTP。认证方式可以是密码，也可以是密钥或证书。</li>
+</ul>
+<p>这个字段的设计与 <code>TODO.md</code> 里的多跳板机方案一致：以后 <code>via</code> 的取值可以是某个跳板机的名字，<code>"direct"</code> 作为保留值。现在这样做，将来加多跳板机时配置格式不用再改。</p>
+
+<h4>配置示例</h4>
+<pre><code>[host.dev1]                      # 跳板机节点：songjiajun@dev1，密钥免密
+user        = "songjiajun"
+default_cwd = "/public/home/songjiajun"
+
+[host.lab3]                      # 直连 + 密钥（可选 OpenSSH 用户证书）
+via         = "direct"
+address     = "192.168.10.23"    # 必填：IP 或域名
+port        = 2222               # 默认 22
+user        = "songjiajun"
+auth        = "key"              # key | password
+key         = "C:/Users/songjiajun/.ssh/lab3_ed25519"   # 留空则用默认密钥对
+cert        = ""                 # 可选：lab3_ed25519-cert.pub，CA 签发的用户证书
+default_cwd = "/public/home/songjiajun"
+
+[host.lab4]                      # 直连 + 密码
+via         = "direct"
+address     = "192.168.10.24"
+user        = "songjiajun"
+auth        = "password"
+password    = "********"         # 明文写在本机 config.toml（已 gitignore）；留空则在 Daemon 启动时提示输入
+default_cwd = "/public/home/songjiajun"</code></pre>
+
+<h4>认证方式</h4>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>auth</th><th>asyncssh 参数</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>key</code></td><td><code>client_keys=[key]</code>，有 cert 时传 <code>client_keys=[(key, cert)]</code></td><td>"证书登录"有两种理解，这里都支持：普通私钥文件，或 CA 签发的 OpenSSH 用户证书（<code>*-cert.pub</code>）。如果私钥设了口令，在启动时提示输入一次。</td></tr>
+    <tr><td><code>password</code></td><td><code>password=...</code></td><td>asyncssh 会用这个密码处理 <code>password</code> 认证，也会自动应答只有一个隐藏提示的 <code>keyboard-interactive</code> 认证。有些 sshd 关闭了 PasswordAuthentication 但开着 kbdint，这种情况同样能登录（开发阶段要实测确认）。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout warn">
+  <span class="callout-icon">⚠</span>
+  <div><strong>密码存放：</strong>直连节点的密码可以明文写在 <code>config.toml</code> 的 <code>password</code> 字段。为此 <code>config.toml</code> 要加进 <code>.gitignore</code>，仓库里只提交不含真实凭据的模板 <code>config.example.toml</code>。<code>password</code> 留空时，Daemon 启动时会用 <code>getpass</code> 提示输入。两种来源的密码最终都只保存在进程内存 <code>_passwords[host]</code> 里，断线重连时直接复用，不会再提示。审计日志、错误信息和 <code>list_hosts</code> 的输出里都不能出现密码。</div>
+</div>
+
+<h4>启动顺序</h4>
+<ol>
+  <li>读取 <code>config.toml</code>。如果文件不存在，报错并提示“复制 <code>config.example.toml</code> 为 <code>config.toml</code> 后填写”，然后退出。接着校验配置：direct 节点缺少 <code>address</code> 或 <code>auth</code> 不合法时直接报错；bastion 节点如果写了 <code>password</code> 或 <code>address</code>，打印警告并忽略这两个字段。</li>
+  <li>找出所有 <code>auth = "password"</code> 且 <code>password</code> 为空的 direct 节点，依次提示输入密码，提示信息带上节点名。</li>
+  <li>对每个密码节点做一次验证连接，密码来自配置文件或刚才的输入都算。认证失败（<code>PermissionDenied</code>）时：密码是交互输入的，就重新提示，最多 3 次；密码写在配置文件里的，不重试，直接打印“配置里的密码错误”。两种情况最终都跳过该节点，不阻塞 Daemon 启动。如果是网络不可达或超时，只打印警告，等首次调用时再按需连接。验证成功的连接直接放进连接池。</li>
+  <li>只要配置了 <code>[bastion]</code>，就连接跳板机并输入 TOTP，和现在一样。如果所有节点都是 direct，可以省略 <code>[bastion]</code>，Daemon 也不会去连接跳板机。</li>
+  <li>启动 HTTP 服务。</li>
+</ol>
+<p>密钥节点不做预连接，首次调用时再建连，与现在的 bastion 节点一致。</p>
+
+<h4>连接池改动要点</h4>
+<pre><code>def _route(host) -&gt; str:
+    return cfg.get("host", {}).get(host, {}).get("via", "bastion")
+
+async def get_target(host):
+    ...                                   # 白名单、host 锁、池内复用 —— 不变
+    if _route(host) == "direct":
+        hc = cfg["host"][host]            # 直连节点必须在配置里，且必须有 address
+        conn = await asyncssh.connect(
+            hc["address"], port=hc.get("port", 22), username=hc["user"],
+            client_keys=_host_keys(host),         # auth=key 时
+            password=_passwords.get(host),        # auth=password 时
+            known_hosts=..., keepalive_interval=30, keepalive_count_max=3,
+            connect_timeout=_connect_timeout(),
+            client_factory=lambda: _TargetClient(host))
+    else:
+        async with _bastion_lock:         # 只有 bastion 路由才碰跳板机锁
+            bastion = await _ensure_bastion()
+        conn = await asyncssh.connect(host, tunnel=bastion, ...)   # 不变</code></pre>
+<ul>
+  <li><strong>断线隔离</strong>：现在 <code>_BastionClient.connection_lost</code> 会执行 <code>_target_conns.clear()</code>，把直连节点的连接也一起清掉。改成只清理 <code>_route(h) != "direct"</code> 的条目，直连节点不受跳板机断线影响。</li>
+  <li><strong>认证失败不重试</strong>：<code>asyncssh.PermissionDenied</code> 是 <code>DisconnectError</code> 的子类，现在 <code>run()</code> 和 <code>with_sftp()</code> 捕获 DisconnectError 后会重试一次。密码错了会连续尝试两次，可能触发账号锁定；在 bastion 路由上还会导致重复提示 TOTP。因此在 <code>except TimeoutError: raise</code> 旁边再加一条 <code>except asyncssh.PermissionDenied: raise</code>。</li>
+  <li><strong>密钥来源</strong>：现在目标机统一使用 <code>[bastion] key</code>。改成先看 <code>[host.x] key</code>/<code>cert</code>，没有配置时再回退到 bastion 的 key，最后回退到默认密钥对。</li>
+  <li><strong>主机名</strong>：bastion 路由仍然直接用节点名作为连接的主机名，即 <code>用户名@节点名</code>，由跳板机解析，不引入 <code>address</code>。direct 路由的 <code>address</code> 是必填项，缺失时 Daemon 启动阶段就报错。</li>
+  <li><strong>其余机制通用</strong>：Semaphore(8)、host 锁、远端 <code>timeout</code> 包装、connection_made/lost 身份比较、<code>reset_connections</code>、路径解析规则，直连节点全部沿用。<code>reset_connections</code> 之后，直连节点用缓存的密码静默重连，不会重新提示。</li>
+  <li><strong>list_hosts</strong>：每个节点显示路由（<code>bastion</code> / <code>direct address:port</code>）、认证方式和连接状态。</li>
+</ul>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  4. TOOLS                                               -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="tools">
+<h2>4. MCP 工具 API</h2>
+
+<p>工具语义刻意贴近 CC 内置工具（Read / Edit / Grep），让模型不用学新概念。</p>
+
+<div class="tool-grid">
+  <div class="tool-card">
+    <div class="tool-name">list_hosts</div>
+    <div class="tool-desc">列出跳板机状态、白名单，以及每个已配置节点的路由（bastion / direct address:port）、认证方式和连接状态。无参数。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">exec(host, command, cwd?, timeout?)</div>
+    <div class="tool-desc">执行 shell 命令，返回 exit_code / stdout / stderr。输出超过 30 KB 时截断首尾各 15 KB。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">read_file(host, path, offset?, limit?)</div>
+    <div class="tool-desc">按行号分页读取文件，带行号前缀（类 <code>cat -n</code>）。默认读 2000 行。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">write_file(host, path, content)</div>
+    <div class="tool-desc">原子写入：先写 <code>.mcp.tmp</code>，再 <code>posix_rename</code>。保留原文件权限位。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">edit_file(host, path, old_str, new_str, replace_all?)</div>
+    <div class="tool-desc">精确替换。<code>old_str</code> 必须在文件中唯一，否则报错，要求增加上下文。与 CC Edit 语义一致。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">grep(host, pattern, path?, glob?, context?)</div>
+    <div class="tool-desc">优先用 <code>rg</code>，退回 <code>grep -rn</code>。支持 glob 文件过滤和上下文行数。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">glob_files(host, pattern, base?)</div>
+    <div class="tool-desc">用 <code>find</code> 实现，返回最多 200 条路径。</div>
+  </div>
+  <div class="tool-card">
+    <div class="tool-name">reset_connections</div>
+    <div class="tool-desc">清空连接池，触发跳板机重连。跳板机重启或 TOTP 过期后使用。</div>
+  </div>
+</div>
+
+<h3>输出截断策略</h3>
+<p>所有工具的文本输出共用同一个截断函数，阈值 30 000 字符：保留头部 15 000 字符 + 截断说明 + 尾部 15 000 字符。这个形状让模型既看到文件开头的 import 和函数签名，又看到末尾的实现细节，比只保留头部更有用。</p>
+
+<h3>edit_file 的错误处理</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>情况</th><th>返回</th></tr></thead>
+  <tbody>
+    <tr><td><code>old_str</code> 不存在</td><td><code>error: old_str 未找到</code></td></tr>
+    <tr><td><code>old_str</code> 出现多次 且 <code>replace_all=False</code></td><td><code>error: old_str 出现 N 次，请增加上下文使其唯一</code></td></tr>
+    <tr><td>SFTP 权限错误</td><td><code>sftp error: ...</code>（原始错误文本）</td></tr>
+    <tr><td>成功</td><td><code>ok: 替换了 1 处</code></td></tr>
+  </tbody>
+</table>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  5. LIFECYCLE                                           -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="lifecycle">
+<h2>5. 连接生命周期</h2>
+
+<h3>连接池结构</h3>
+<pre><code>_bastion_conn: SSHClientConnection | None      # 唯一跳板机连接
+_target_conns: dict[str, SSHClientConnection]  # host → 目标机连接
+_sems:         dict[str, asyncio.Semaphore]    # host → 并发限制（8）
+_bastion_lock: asyncio.Lock                    # 跳板机建连时互斥
+_host_locks:   dict[str, asyncio.Lock]         # host → 该目标机建连时互斥（懒创建）</code></pre>
+<p>跳板机只有一条连接，所以用单独一把 <code>_bastion_lock</code> 就够了；目标机有多台，如果所有目标机共用一把锁，A 机器正在建连会挡住 B 机器的建连请求，明明两者毫无关系。因此每个 host 各自懒创建一把锁（<code>_host_locks.setdefault(host, asyncio.Lock())</code>），只互斥同一台目标机的并发建连，不同目标机之间互不影响。</p>
+
+<h3>并发限制</h3>
+<p>sshd 默认 <code>MaxSessions 10</code>，每条 SSH 连接最多同时开 10 个 channel。CC 可能并发调用多个工具，超过上限时 sshd 会拒绝新 channel。每个目标机设 <code>Semaphore(8)</code>，留 2 个 channel 余量给 SFTP 操作。</p>
+
+<h3>connect_timeout：建连超时</h3>
+<p><code>config.toml</code> 的 <code>[daemon] connect_timeout</code>（默认 20 秒）传给每一次 <code>asyncssh.connect(...)</code>（跳板机和目标机都用同一个值），对应 asyncssh 自己的 <code>connect_timeout</code> 参数——超过这个时间连接还没建立就直接抛 <code>TimeoutError</code>。<code>run()</code>/<code>with_sftp()</code> 里 <code>except TimeoutError: raise</code> 专门写在 <code>except OSError</code> 之前，确保建连超时不会被断线重试逻辑当成普通断线吞掉再重试一次（Python 3.11 起 <code>TimeoutError</code> 是 <code>OSError</code> 的子类，顺序反了会导致误吞）。</p>
+
+<h3>远端命令的 timeout 包装</h3>
+<p><code>exec</code>/<code>read_file</code>/<code>grep</code>/<code>glob_files</code> 等工具执行远端命令时，实际发给 shell 的不是原始命令本身，而是 <code>timeout -k 5 {N} bash -c {quoted}</code>——<code>N</code> 是工具调用时传入的 <code>timeout</code>（默认 60 秒）。这是因为单纯 SSH 层面 <code>terminate()</code> 或关闭 channel，并不保证杀掉远端已经 fork 出去的子进程（没有分配 pty 时尤其如此）；用远端自带的 <code>timeout</code> 命令，由远端内核负责在超时后先发 <code>SIGTERM</code>，5 秒后还没退出再补一个 <code>SIGKILL</code>（<code>-k 5</code>），可靠得多。退出码 124（<code>SIGTERM</code> 超时）或 137（<code>SIGKILL</code>，128+9）都被识别为"远端超时"而不是命令本身失败。客户端这一侧再叠加一层 <code>asyncio.wait_for(..., timeout=N+15)</code> 作为兜底——多给 15 秒余量，用来覆盖远端 <code>timeout</code> 命令本身的调度延迟和网络往返，避免远端已经如期杀掉进程、只是回包慢了一点就被客户端误判成连接卡死。如果目标机上根本没有 <code>timeout</code> 命令（<code>command -v timeout</code> 探测失败），会退化成直接 <code>bash -c</code> 执行、不做远端强制超时，这时全靠客户端的 <code>wait_for</code> 兜底——一旦触发就只能断连了事，不保证远端进程被杀掉，纯属兼容极端精简环境的降级路径。</p>
+
+<h3>Daemon 的传输方式：Streamable HTTP vs stdio</h3>
+<p>CC 和 Codex 都支持 Streamable HTTP（<code>/mcp</code> 端点，取代旧的 SSE 传输）和 stdio 两种传输。本方案选 Streamable HTTP：</p>
+<ul>
+  <li>进程在 Daemon 窗口常驻，多个 CC / Codex 会话共用同一组连接</li>
+  <li>stdio 模式下 CC 每个会话拉起一个新进程，TOTP 无法复用</li>
+  <li>Streamable HTTP 只监听 <code>127.0.0.1</code>，不暴露到局域网</li>
+</ul>
+
+<h3>Daemon 崩溃或重启</h3>
+<p>CC 的 MCP 客户端会在工具调用失败后自动重试连接。Daemon 重启后，daemon 启动时会立即触发跳板机重连（再次输 TOTP），目标机连接随后在首次调用时按需重建。</p>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  6. SECURITY                                            -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="security">
+<h2>6. 安全策略</h2>
+
+<h3>主机白名单</h3>
+<p>在 <code>config.toml</code> 的 <code>[hosts] allowed</code> 列表里配置允许访问的主机，支持通配符（如 <code>10.0.*</code>）。留空表示不限制，生产环境建议显式配置。</p>
+
+<h3>密钥管理</h3>
+<div class="callout warn">
+  <span class="callout-icon">⚠</span>
+  <div>不要开启 <code>agent_forwarding=True</code>。本方案用的是 <code>tunnel=bastion_conn</code>，目标机认证直接用本地私钥，私钥不经过跳板机。开启 agent forwarding 会让跳板机的 root 用户能借用你的 key。</div>
+</div>
+
+<h3>审计日志</h3>
+<p>所有 <code>exec</code>、<code>write_file</code>、<code>edit_file</code> 操作写入本地 <code>audit.jsonl</code>，每行一条 JSON：</p>
+<pre><code>{"ts": 1727136000.0, "host": "dev1", "action": "exec",
+ "detail": "cwd=/workspace cmd=git diff HEAD~1"}</code></pre>
+
+<h3>known_hosts</h3>
+<p>内网机器经常重装，host key 会变。默认配置 <code>known_hosts=None</code> 跳过验证。如果内网 DNS / DHCP 稳定，建议改为指向一个独立的 known_hosts 文件，并在机器重装时手动更新。</p>
+<p>直连节点不在跳板机后面，所在网络的可信度可能更低。对这类节点，建议通过 <code>[host.x] known_hosts = "路径"</code> 开启校验，尤其是使用密码认证的节点：不校验 host key 时，密码可能被中间人截获。</p>
+
+<h3>直连节点的凭据</h3>
+<p>直连节点的密码可以明文写在 <code>config.toml</code> 里。这个文件只存放在本机，并且已加入 <code>.gitignore</code>，仓库里只提交模板 <code>config.example.toml</code>，模板里全是占位值。<code>password</code> 字段留空时，改为启动时交互输入。认证失败不会自动重试，以免触发账号锁定。私钥和证书在配置里只写路径，文件本身留在本机。跳板机节点只用密钥免密登录，不涉及密码。</p>
+
+<h3>端口暴露</h3>
+<p>Daemon 仅监听 <code>127.0.0.1:8765</code>，不绑定 <code>0.0.0.0</code>，局域网内其他机器无法访问。</p>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  7. FILES                                               -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="files">
+<h2>7. 文件结构</h2>
+
+<pre><code>D:\tools\remote-mcp\
+├── config.toml        # 本机真实配置（含直连节点密码），已 gitignore，不提交
+├── config.example.toml # 配置模板（占位值），提交到仓库；首次使用复制为 config.toml
+├── .gitignore         # config.toml、audit.jsonl、.venv/、__pycache__/
+├── requirements.txt   # mcp[cli], asyncssh, tomli
+├── pool.py            # SSH 连接池：_BastionClient, get_bastion(), get_target(), run()
+├── tools.py           # MCP 工具定义（FastMCP），引用 pool
+├── daemon.py          # 入口：加载 config，启动 FastMCP streamable HTTP server
+└── audit.jsonl        # 运行时生成的审计日志</code></pre>
+
+<h3>config.toml 结构</h3>
+<pre><code>[bastion]
+host = "bastion.example.com"
+port = 22
+user = "yourname"
+key  = ""              # 留空自动读取 ~/.ssh/id_*
+
+[daemon]
+port      = 8765
+audit_log = "D:/tools/remote-mcp/audit.jsonl"
+
+[hosts]
+allowed = ["dev1", "gpu-box", "10.0.1.*"]
+
+[host.dev1]
+user        = "songjiajun"
+default_cwd = "/public/home/songjiajun"
+
+[host.gpu-box]
+user        = "user"
+default_cwd = "/workspace"
+
+[host.lab3]            # 直连节点，完整字段见 3.4
+via         = "direct"
+address     = "192.168.10.23"
+port        = 2222
+user        = "songjiajun"
+auth        = "key"
+default_cwd = "/public/home/songjiajun"</code></pre>
+
+<h3>模块职责边界</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>模块</th><th>职责</th><th>不做的事</th></tr></thead>
+  <tbody>
+    <tr><td><code>pool.py</code></td><td>维护 SSH 连接、处理断连重试、TOTP 交互</td><td>不知道 MCP 协议，不知道工具语义</td></tr>
+    <tr><td><code>tools.py</code></td><td>定义工具签名、参数校验、输出格式化、审计日志</td><td>不直接持有 SSH 连接</td></tr>
+    <tr><td><code>daemon.py</code></td><td>加载配置、注入依赖、启动 HTTP 服务</td><td>不包含业务逻辑</td></tr>
+  </tbody>
+</table>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  8. DEPLOY                                              -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="deploy">
+<h2>8. 部署与接入</h2>
+
+<p>部署方案是"架构 A"：<code>daemon.py</code> 常驻在 Windows 本机，跳板机和目标 Linux 机器<strong>不需要安装任何组件</strong>，私钥始终留在本机。完整步骤见仓库里的 <code>DEPLOY.md</code>，这里摘录要点。</p>
+
+<h3>本机环境</h3>
+<p>Windows 上安装 <a href="https://docs.astral.sh/uv/">uv</a>（免管理员权限），要求 Python ≥ 3.10（推荐 3.11+：3.11 起 <code>tomllib</code> 是标准库，且本项目的超时/断线判定依赖 3.11 之后 <code>TimeoutError</code> 与 <code>OSError</code> 的继承关系）：</p>
+<pre><code>cd &lt;REMOTE_MCP_DIR&gt;   # 本机存放项目文件的目录，自选位置，不必是固定路径
+uv venv --python 3.11
+uv pip install -r requirements.txt</code></pre>
+
+<div class="callout warn">
+  <span class="callout-icon">⚠</span>
+  <div><strong>pywin32 postinstall 坑：</strong><code>mcp[cli]</code> 在 Windows 上依赖 <code>pywin32</code>。如果用 <code>pip install --target</code> 等不经过标准 venv 安装流程的方式装依赖，pywin32 的安装后脚本不会被执行，运行时报 <code>ModuleNotFoundError: No module named 'pywintypes'</code>。<code>uv pip install</code> 装进真正的 venv 通常不会踩这个坑；如果遇到，手动补跑一次：<code>&amp; ".venv\Scripts\python.exe" ".venv\Scripts\pywin32_postinstall.py" -install</code>。</div>
+</div>
+
+<h3>config.toml 关键字段</h3>
+<p>远端账号是 <code>songjiajun</code>，家目录是 <code>/public/home/songjiajun</code>（注意不是 <code>/home/songjiajun</code>）：</p>
+<pre><code>[daemon]
+connect_timeout = 20   # 建连超时（秒），与命令级 timeout 参数是两回事，见第 5 节
+
+[host.dev1]
+user        = "songjiajun"
+default_cwd = "/public/home/songjiajun"</code></pre>
+<p>字段全表见第 7 节「config.toml 结构」。</p>
+
+<h3>密钥部署</h3>
+<p>把本机公钥追加到跳板机和每台目标机的 <code>/public/home/songjiajun/.ssh/authorized_keys</code>（目标机家目录同样是这个路径），并设好权限：</p>
+<pre><code>chmod 700 /public/home/songjiajun/.ssh
+chmod 600 /public/home/songjiajun/.ssh/authorized_keys</code></pre>
+<p>私钥只留在本机，不上传、不复制到跳板机或目标机。</p>
+
+<h3>启动 Daemon</h3>
+<pre><code># 在专用窗口启动，保持常驻
+cd &lt;REMOTE_MCP_DIR&gt;
+uv run daemon.py</code></pre>
+
+<div class="callout warn">
+  <span class="callout-icon">⚠</span>
+  <div>daemon 启动时，此窗口会出现 TOTP 提示，输入一次后当次进程运行期间不需要再输入——<strong>除非</strong>调用了 <code>reset_connections</code>，或跳板机连接因网络问题被断开：这两种情况下，下一次工具调用触发重连时会<strong>再次在这个窗口阻塞式地提示输入 TOTP</strong>。因此这个窗口必须保持前台可交互（一个独立窗口或常驻标签页），不能扔进看不到输出、也没法输入的后台任务里，否则一旦触发重连，所有工具调用会一直卡住直到有人发现并回去输入。</div>
+</div>
+
+<h3>接入 Claude Code</h3>
+<pre><code>claude mcp add --transport http --scope user remote-linux http://127.0.0.1:8765/mcp</code></pre>
+<p><code>--scope user</code> 让所有项目都能用这个 MCP server，不需要每个项目单独配置。</p>
+
+<h3>接入 Codex</h3>
+<pre><code># ~/.codex/config.toml（新版支持 url）
+[mcp_servers.remote-linux]
+url = "http://127.0.0.1:8765/mcp"
+
+# 旧版不支持 url 的，用 mcp-remote 做 stdio→HTTP 桥接
+[mcp_servers.remote-linux]
+command = "npx"
+args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
+
+<h3>验证接入</h3>
+<pre><code># 或直接调用工具，依次验证
+> @remote-linux list_hosts
+> @remote-linux exec(host="dev1", command="pwd")   # 预期返回 /public/home/songjiajun
+> @remote-linux read_file(host="dev1", path="...")
+
+# 在 CC 里测试
+> 帮我在 dev1 上查看某个文件的内容</code></pre>
+
+<h3>排障</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>现象</th><th>处理</th></tr></thead>
+  <tbody>
+    <tr><td>daemon 窗口没有 TOTP 提示，卡住不动</td><td>检查 <code>[bastion]</code> 的 host/port/user 是否正确；超过 <code>connect_timeout</code> 秒还没反应说明连接没建立，检查网络/防火墙</td></tr>
+    <tr><td>连接超时</td><td>确认跳板机端口可达；适当调大 <code>connect_timeout</code></td></tr>
+    <tr><td>触发 <code>MaxSessions</code> 限制</td><td>sshd 默认单连接 10 个并发 channel，daemon 已对每台目标机限制 <code>Semaphore(8)</code>；仍触发则检查是否有其它进程占用同一条连接，或联系管理员确认 sshd 配置</td></tr>
+    <tr><td>提示 host 不在白名单</td><td><code>[hosts] allowed</code> 里补上（支持 <code>fnmatch</code> 通配符）</td></tr>
+    <tr><td>端口被占用</td><td>改 <code>[daemon] port</code>，同步更新 <code>claude mcp add</code> / Codex 里的 URL</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout good">
+  <span class="callout-icon">✓</span>
+  <div>远端无需安装任何组件，也不需要在 <code>/public/home/songjiajun</code> 下建立服务目录——唯一的远端改动是 <code>authorized_keys</code>。</div>
+</div>
+
+<h3>多跳板机</h3>
+<p>暂不支持并列多台跳板机；改动方案见仓库里的 <code>TODO.md</code>，此处不展开。</p>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  9. RISKS                                               -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="risks">
+<h2>9. 风险与限制</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>风险</th><th>影响</th><th>缓解措施</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Daemon 窗口被误关</td>
+      <td>所有工具调用失败，需重新启动并输 TOTP</td>
+      <td>可考虑用 Windows Task Scheduler 或 NSSM 将 Daemon 注册为后台服务；届时 TOTP 改为 TOTP secret 自动生成（需评估合规性）</td>
+    </tr>
+    <tr>
+      <td>跳板机长时间空闲被踢</td>
+      <td>连接断开，下次调用触发重连，需再输 TOTP</td>
+      <td><code>keepalive_interval=30</code>；如跳板机仍会踢，可在 Daemon 里加一个后台任务每 5 分钟跑一次无害的 <code>echo keepalive</code></td>
+    </tr>
+    <tr>
+      <td><code>edit_file</code> 写到一半进程崩溃</td>
+      <td>临时文件 <code>.file.mcp.tmp</code> 残留</td>
+      <td>原子 rename 保证目标文件要么是旧版本要么是新版本，不会有中间状态；残留 tmp 文件不影响原文件</td>
+    </tr>
+    <tr>
+      <td>模型生成危险命令（<code>rm -rf</code> 等）</td>
+      <td>远端数据损失</td>
+      <td>当前设计无命令黑名单（见后续增强）；生产机建议配置只读策略，不允许 <code>exec</code></td>
+    </tr>
+    <tr>
+      <td>直连节点密码错误或被锁定</td>
+      <td>该节点不可用</td>
+      <td>认证失败不自动重试；交互输入的密码在启动时最多允许输错 3 次，写在配置里的密码错误则直接跳过该节点，都不影响其他节点；改好密码后重启 Daemon</td>
+    </tr>
+    <tr>
+      <td>Python 依赖版本冲突</td>
+      <td>Daemon 无法启动</td>
+      <td>用 <code>venv</code> 或 <code>uv venv</code> 隔离环境</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  10. FUTURE                                             -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="future">
+<h2>10. 后续增强方向</h2>
+
+<p>以下功能不在 v1 范围内，列出供后续迭代参考：</p>
+
+<ul>
+  <li><strong>后台长任务</strong>：<code>exec(background=True)</code> 将命令放入 tmux 会话，返回 <code>job_id</code>；配合 <code>job_status</code> / <code>job_output</code> 轮询结果，适合编译和训练任务</li>
+  <li><strong>命令黑名单</strong>：在 <code>exec</code> 工具里拦截 <code>rm -rf /</code>、<code>mkfs</code>、<code>dd if=/dev/</code> 等危险模式，记录告警</li>
+  <li><strong>只读模式</strong>：在 <code>config.toml</code> 里对特定主机开启 <code>readonly = true</code>，禁用 <code>exec</code>、<code>write_file</code>、<code>edit_file</code></li>
+  <li><strong>tail_log</strong>：实时追尾日志文件，支持关键字过滤，通过 SSE 流式返回</li>
+  <li><strong>upload / download</strong>：通过 SFTP 传输二进制文件（core dump、模型权重等）</li>
+  <li><strong>TOTP 自动填入</strong>：如果公司合规政策允许，将 TOTP secret 存入 Windows Credential Manager，Daemon 自动生成验证码，无需手动输入</li>
+  <li><strong>Go 重写</strong>：用 <code>golang.org/x/crypto/ssh</code> 实现成单一 exe，分发给团队其他成员更方便</li>
+  <li><strong>多级跳板</strong>：目前 <code>tunnel=bastion_conn</code> 支持单跳；如果有二级跳板，可以在 pool 里把 tunnel 串起来：<code>asyncssh.connect(target2, tunnel=target1_conn)</code></li>
+</ul>
+</section>
+
+<hr>
+<p style="color:var(--muted);font-size:0.82rem;text-align:center;">Remote Linux MCP Gateway · 设计文档 v1.0 · 2026-09-24</p>

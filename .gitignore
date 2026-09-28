@@ -1,0 +1,25 @@
+# Configuration with credentials
+config.toml
+
+# Audit logs
+audit.jsonl
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Temporary files
+*.mcp.tmp
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*

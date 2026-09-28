@@ -12,6 +12,16 @@ _bastion_lock = asyncio.Lock()
 _host_locks: dict[str, asyncio.Lock] = {}
 cfg: dict = {}
 
+# In-memory only — populated at startup (config value or interactive prompt)
+# and reused silently on reconnect. Never written to disk, never logged.
+_passwords: dict[str, str] = {}
+
+
+class ConfigError(ValueError):
+    """Raised for a configuration problem that should abort startup, or (for
+    a route/auth mixup discovered later) surface as a clear tool error
+    instead of a raw KeyError/AttributeError."""
+
 
 class RemoteTimeout(RuntimeError):
     """Raised when a remote command exceeds its timeout; the process was killed."""
@@ -30,6 +40,45 @@ def _host_lock(host: str) -> asyncio.Lock:
 
 def _connect_timeout() -> float:
     return cfg.get("daemon", {}).get("connect_timeout", 20)
+
+
+def _route(host: str) -> str:
+    """"bastion" (default) tunnels through the jump host; "direct" connects
+    straight to [host.<name>].address. Reserved for future values naming a
+    specific bastion once multi-bastion support (see TODO.md) lands."""
+    return cfg.get("host", {}).get(host, {}).get("via", "bastion")
+
+
+def _default_keypairs() -> list:
+    # asyncssh.load_default_keypairs isn't re-exported at the top-level
+    # `asyncssh` namespace (only load_keypairs/load_public_keys/
+    # load_certificates are) — it only exists in asyncssh.public_key.
+    from asyncssh.public_key import load_default_keypairs
+
+    return list(load_default_keypairs())
+
+
+def _bastion_client_keys() -> list:
+    path = cfg.get("bastion", {}).get("key", "")
+    if path:
+        return list(asyncssh.load_keypairs(path))
+    return _default_keypairs()
+
+
+def _host_client_keys(host: str) -> list:
+    """Key resolution order for a target (bastion-routed or direct) node:
+    [host.x] key/cert first, then [bastion] key, then the default keypair."""
+    hc = cfg.get("host", {}).get(host, {})
+    key = hc.get("key", "")
+    cert = hc.get("cert", "")
+    if key:
+        if cert:
+            return list(asyncssh.load_keypairs([(key, cert)]))
+        return list(asyncssh.load_keypairs(key))
+    bastion_key = cfg.get("bastion", {}).get("key", "")
+    if bastion_key:
+        return list(asyncssh.load_keypairs(bastion_key))
+    return _default_keypairs()
 
 
 class _BastionClient(asyncssh.SSHClient):
@@ -75,7 +124,11 @@ class _BastionClient(asyncssh.SSHClient):
         # only clear the pool entry if it's still this client's connection.
         if _bastion_conn is self._conn:
             _bastion_conn = None
-            _target_conns.clear()  # every target is tunneled through the bastion
+            # Only bastion-routed targets are tunneled through this
+            # connection — direct nodes have their own socket and must not
+            # be dropped just because the bastion went away.
+            for h in [h for h in _target_conns if _route(h) != "direct"]:
+                _target_conns.pop(h, None)
 
 
 class _TargetClient(asyncssh.SSHClient):
@@ -91,13 +144,6 @@ class _TargetClient(asyncssh.SSHClient):
             _target_conns.pop(self._host, None)
 
 
-def _client_keys() -> list:
-    path = cfg.get("bastion", {}).get("key", "")
-    if path:
-        return asyncssh.load_keypairs(path)
-    return asyncssh.load_default_keypairs()
-
-
 def _allowed(host: str) -> bool:
     patterns: list[str] = cfg.get("hosts", {}).get("allowed", [])
     if not patterns:
@@ -106,7 +152,15 @@ def _allowed(host: str) -> bool:
 
 
 async def _connect_bastion() -> asyncssh.SSHClientConnection:
-    b = cfg["bastion"]
+    b = cfg.get("bastion")
+    if not b:
+        # Reachable if a bastion-routed host is used without a [bastion]
+        # section configured at all — give a clear error instead of the
+        # KeyError that cfg["bastion"] below would raise.
+        raise ConfigError(
+            "no [bastion] section is configured; this host needs one "
+            "(or set via = \"direct\" and give it an address)"
+        )
     print(
         f"Connecting to bastion {b['user']}@{b['host']}:{b['port']} — "
         "enter TOTP / password in this terminal when prompted.",
@@ -117,7 +171,7 @@ async def _connect_bastion() -> asyncssh.SSHClientConnection:
         b["host"],
         port=b["port"],
         username=b["user"],
-        client_keys=_client_keys(),
+        client_keys=_bastion_client_keys(),
         known_hosts=None,
         keepalive_interval=30,
         keepalive_count_max=3,
@@ -154,23 +208,53 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
         if conn is not None:
             return conn
 
-        async with _bastion_lock:
-            bastion = await _ensure_bastion()
-
         host_cfg = cfg.get("host", {}).get(host, {})
-        username = host_cfg.get("user", cfg.get("bastion", {}).get("user", ""))
 
-        conn = await asyncssh.connect(
-            host,
-            username=username,
-            tunnel=bastion,
-            client_keys=_client_keys(),
-            known_hosts=None,
-            keepalive_interval=30,
-            keepalive_count_max=3,
-            connect_timeout=_connect_timeout(),
-            client_factory=lambda: _TargetClient(host),
-        )
+        if _route(host) == "direct":
+            if host not in cfg.get("host", {}):
+                raise ConfigError(f"direct host '{host}' is not configured under [host.{host}]")
+            address = host_cfg.get("address", "")
+            if not address:
+                raise ConfigError(f"[host.{host}] via=\"direct\" requires an 'address' field")
+            username = host_cfg.get("user", "")
+            auth = host_cfg.get("auth", "key")
+            kwargs: dict = dict(
+                port=host_cfg.get("port", 22),
+                username=username,
+                # "" in config means "don't verify"; asyncssh would treat
+                # an empty string as a file path, so map it to None.
+                known_hosts=host_cfg.get("known_hosts") or None,
+                keepalive_interval=30,
+                keepalive_count_max=3,
+                connect_timeout=_connect_timeout(),
+                client_factory=lambda: _TargetClient(host),
+            )
+            if auth == "password":
+                kwargs["password"] = _passwords.get(host, "")
+                # Don't offer local keys first: each rejected key counts
+                # toward the server's MaxAuthTries / lockout policy.
+                kwargs["client_keys"] = None
+                kwargs["agent_path"] = None
+            else:
+                kwargs["client_keys"] = _host_client_keys(host)
+            conn = await asyncssh.connect(address, **kwargs)
+        else:
+            async with _bastion_lock:
+                bastion = await _ensure_bastion()
+
+            username = host_cfg.get("user", cfg.get("bastion", {}).get("user", ""))
+
+            conn = await asyncssh.connect(
+                host,
+                username=username,
+                tunnel=bastion,
+                client_keys=_host_client_keys(host),
+                known_hosts=None,
+                keepalive_interval=30,
+                keepalive_count_max=3,
+                connect_timeout=_connect_timeout(),
+                client_factory=lambda: _TargetClient(host),
+            )
         _target_conns[host] = conn
         if host not in _sems:
             _sems[host] = asyncio.Semaphore(8)
@@ -254,6 +338,13 @@ async def run(
         # double the wait). RemoteTimeout (command timeout) is a distinct,
         # non-OSError type and is unaffected by this clause.
         raise
+    except asyncssh.PermissionDenied:
+        # PermissionDenied is a DisconnectError subclass, so it must be
+        # caught (and re-raised, not retried) before the broader
+        # DisconnectError clause below. Retrying a wrong password risks
+        # tripping an account lockout, and on the bastion route would force
+        # a second TOTP prompt for what's already a known-bad credential.
+        raise
     except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
         _invalidate_target(host)
         return await _run_once()
@@ -273,6 +364,8 @@ async def with_sftp(host: str, func):
     try:
         return await _attempt()
     except TimeoutError:
+        raise  # see the matching comment in run()
+    except asyncssh.PermissionDenied:
         raise  # see the matching comment in run()
     except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
         _invalidate_target(host)

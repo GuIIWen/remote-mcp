@@ -615,23 +615,26 @@ async def get_target(host):
     ...                                   # 白名单、host 锁、池内复用 —— 不变
     if _route(host) == "direct":
         hc = cfg["host"][host]            # 直连节点必须在配置里，且必须有 address
-        conn = await asyncssh.connect(
-            hc["address"], port=hc.get("port", 22), username=hc["user"],
-            client_keys=_host_keys(host),         # auth=key 时
-            password=_passwords.get(host),        # auth=password 时
-            known_hosts=..., keepalive_interval=30, keepalive_count_max=3,
-            connect_timeout=_connect_timeout(),
+        kwargs = dict(port=hc.get("port", 22), username=hc["user"],
+            known_hosts=hc.get("known_hosts"), keepalive_interval=30,
+            keepalive_count_max=3, connect_timeout=_connect_timeout(),
             client_factory=lambda: _TargetClient(host))
+        if hc.get("auth", "key") == "password":
+            kwargs["password"] = _passwords.get(host, "")
+        else:
+            kwargs["client_keys"] = _host_client_keys(host)   # auth=key 时
+        conn = await asyncssh.connect(hc["address"], **kwargs)
     else:
         async with _bastion_lock:         # 只有 bastion 路由才碰跳板机锁
             bastion = await _ensure_bastion()
         conn = await asyncssh.connect(host, tunnel=bastion, ...)   # 不变</code></pre>
 <ul>
   <li><strong>断线隔离</strong>：现在 <code>_BastionClient.connection_lost</code> 会执行 <code>_target_conns.clear()</code>，把直连节点的连接也一起清掉。改成只清理 <code>_route(h) != "direct"</code> 的条目，直连节点不受跳板机断线影响。</li>
-  <li><strong>认证失败不重试</strong>：<code>asyncssh.PermissionDenied</code> 是 <code>DisconnectError</code> 的子类，现在 <code>run()</code> 和 <code>with_sftp()</code> 捕获 DisconnectError 后会重试一次。密码错了会连续尝试两次，可能触发账号锁定；在 bastion 路由上还会导致重复提示 TOTP。因此在 <code>except TimeoutError: raise</code> 旁边再加一条 <code>except asyncssh.PermissionDenied: raise</code>。</li>
-  <li><strong>密钥来源</strong>：现在目标机统一使用 <code>[bastion] key</code>。改成先看 <code>[host.x] key</code>/<code>cert</code>，没有配置时再回退到 bastion 的 key，最后回退到默认密钥对。</li>
+  <li><strong>认证失败不重试</strong>：<code>asyncssh.PermissionDenied</code> 是 <code>DisconnectError</code> 的子类，现在 <code>run()</code> 和 <code>with_sftp()</code> 捕获 DisconnectError 后会重试一次。密码错了会连续尝试两次，可能触发账号锁定；在 bastion 路由上还会导致重复提示 TOTP。因此在 <code>except TimeoutError: raise</code> 旁边再加一条 <code>except asyncssh.PermissionDenied: raise</code>，且必须排在 <code>except (ConnectionLost, DisconnectError, OSError)</code> 之前。</li>
+  <li><strong>密钥来源</strong>：现在目标机统一使用 <code>[bastion] key</code>。改成先看 <code>[host.x] key</code>/<code>cert</code>，没有配置时再回退到 bastion 的 key，最后回退到默认密钥对（<code>_host_client_keys(host)</code>）——这条链对 bastion 路由和 direct 路由的目标机统一生效，不是只有直连节点才这样。</li>
   <li><strong>主机名</strong>：bastion 路由仍然直接用节点名作为连接的主机名，即 <code>用户名@节点名</code>，由跳板机解析，不引入 <code>address</code>。direct 路由的 <code>address</code> 是必填项，缺失时 Daemon 启动阶段就报错。</li>
   <li><strong>其余机制通用</strong>：Semaphore(8)、host 锁、远端 <code>timeout</code> 包装、connection_made/lost 身份比较、<code>reset_connections</code>、路径解析规则，直连节点全部沿用。<code>reset_connections</code> 之后，直连节点用缓存的密码静默重连，不会重新提示。</li>
+  <li><strong>缺少 [bastion] 段</strong>：如果某个 bastion 路由的节点被使用，但配置文件里根本没有 <code>[bastion]</code> 段，连接池会抛出清晰的 <code>ConfigError</code>（"no [bastion] section is configured..."），而不是原始的 <code>KeyError</code>。</li>
   <li><strong>list_hosts</strong>：每个节点显示路由（<code>bastion</code> / <code>direct address:port</code>）、认证方式和连接状态。</li>
 </ul>
 </section>
@@ -841,6 +844,8 @@ uv pip install -r requirements.txt</code></pre>
 </div>
 
 <h3>config.toml 关键字段</h3>
+<p>仓库里只提交模板 <code>config.example.toml</code>（占位值，可以安全提交），首次部署先复制一份出来再改成真实值，<code>config.toml</code> 本身已加入 <code>.gitignore</code>，不会被提交：</p>
+<pre><code>copy config.example.toml config.toml</code></pre>
 <p>远端账号是 <code>songjiajun</code>，家目录是 <code>/public/home/songjiajun</code>（注意不是 <code>/home/songjiajun</code>）：</p>
 <pre><code>[daemon]
 connect_timeout = 20   # 建连超时（秒），与命令级 timeout 参数是两回事，见第 5 节
@@ -848,13 +853,21 @@ connect_timeout = 20   # 建连超时（秒），与命令级 timeout 参数是�
 [host.dev1]
 user        = "songjiajun"
 default_cwd = "/public/home/songjiajun"</code></pre>
+<p>如果有不经过跳板机、直接可达的目标机，用 <code>via = "direct"</code> 加一段直连节点，字段和认证方式见第 3.4 节：</p>
+<pre><code>[host.lab3]
+via         = "direct"
+address     = "192.168.10.23"
+port        = 2222
+user        = "songjiajun"
+auth        = "key"          # key | password
+default_cwd = "/public/home/songjiajun"</code></pre>
 <p>字段全表见第 7 节「config.toml 结构」。</p>
 
 <h3>密钥部署</h3>
 <p>把本机公钥追加到跳板机和每台目标机的 <code>/public/home/songjiajun/.ssh/authorized_keys</code>（目标机家目录同样是这个路径），并设好权限：</p>
 <pre><code>chmod 700 /public/home/songjiajun/.ssh
 chmod 600 /public/home/songjiajun/.ssh/authorized_keys</code></pre>
-<p>私钥只留在本机，不上传、不复制到跳板机或目标机。</p>
+<p>私钥只留在本机，不上传、不复制到跳板机或目标机。<code>via = "direct"</code> 的节点不在跳板机后面，是单独一条 SSH 连接，需要把本机公钥<strong>额外</strong>追加到该节点自己的 <code>authorized_keys</code>（和跳板机、其它节点各自独立，不能共用一份）；<code>auth = "password"</code> 的直连节点不需要这一步。</p>
 
 <h3>启动 Daemon</h3>
 <pre><code># 在专用窗口启动，保持常驻
@@ -865,6 +878,8 @@ uv run daemon.py</code></pre>
   <span class="callout-icon">⚠</span>
   <div>daemon 启动时，此窗口会出现 TOTP 提示，输入一次后当次进程运行期间不需要再输入——<strong>除非</strong>调用了 <code>reset_connections</code>，或跳板机连接因网络问题被断开：这两种情况下，下一次工具调用触发重连时会<strong>再次在这个窗口阻塞式地提示输入 TOTP</strong>。因此这个窗口必须保持前台可交互（一个独立窗口或常驻标签页），不能扔进看不到输出、也没法输入的后台任务里，否则一旦触发重连，所有工具调用会一直卡住直到有人发现并回去输入。</div>
 </div>
+
+<p>如果某个 <code>via = "direct"</code>、<code>auth = "password"</code> 的节点没有在 <code>config.toml</code> 里填 <code>password</code>，daemon 启动时也会在这个窗口出现一次密码提示（如 <code>[lab4] password:</code>），交互输入最多允许试 3 次；直接写在配置文件里的密码只用一次，错了不重试、直接跳过该节点（不影响其它节点和跳板机继续启动）。网络不通或超时不会阻塞启动，会打印警告并留给后续调用时懒重连。</p>
 
 <h3>接入 Claude Code</h3>
 <pre><code>claude mcp add --transport http --scope user remote-linux http://127.0.0.1:8765/mcp</code></pre>
@@ -899,6 +914,8 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
     <tr><td>触发 <code>MaxSessions</code> 限制</td><td>sshd 默认单连接 10 个并发 channel，daemon 已对每台目标机限制 <code>Semaphore(8)</code>；仍触发则检查是否有其它进程占用同一条连接，或联系管理员确认 sshd 配置</td></tr>
     <tr><td>提示 host 不在白名单</td><td><code>[hosts] allowed</code> 里补上（支持 <code>fnmatch</code> 通配符）</td></tr>
     <tr><td>端口被占用</td><td>改 <code>[daemon] port</code>，同步更新 <code>claude mcp add</code> / Codex 里的 URL</td></tr>
+    <tr><td>直连密码错误或被锁</td><td>交互输入的密码最多允许试 3 次；写在 <code>config.toml</code> 里的密码只试 1 次，错了直接跳过该节点，不影响其它节点和跳板机。确认密码后改好 <code>config.toml</code> 或重启 daemon 重新交互输入</td></tr>
+    <tr><td>direct 节点连不上</td><td>先确认 <code>address</code>/<code>port</code> 填得对、目标机可达（不经过跳板机，网络层面要直连得通）；如果是 <code>PermissionDenied</code>（密钥或密码错误）不会重试，需要改配置后重新触发连接；如果是网络不通/超时，daemon 只是记录警告并留给下次调用时懒重连，不会阻塞启动</td></tr>
   </tbody>
 </table>
 </div>

@@ -1,0 +1,52 @@
+# 配置模板：复制为 config.toml 后填写真实值。
+# config.toml 本身已加入 .gitignore，不会被提交；这份模板里全是占位值，可以放心提交。
+
+[bastion]
+host = "bastion.example.com"   # 跳板机地址（域名或 IP）
+port = 22
+user = "yourname"              # 你在跳板机上的登录用户名
+key  = ""                      # 私钥路径；留空则用默认密钥对（~/.ssh/id_*）
+# 跳板机只支持密钥认证（配合 keyboard-interactive 做 TOTP），不要在这里写 password/address——
+# 写了会在启动时被忽略并打印警告。
+
+[daemon]
+port            = 8765   # daemon 监听的本地端口，仅绑定 127.0.0.1
+audit_log       = ""      # 留空则不记录；填绝对路径则写 JSONL 审计日志（不含密码）
+connect_timeout = 20      # 跳板机 / 目标机建连超时（秒）
+
+[hosts]
+# 允许访问的目标机白名单，支持 fnmatch 通配符；留空表示不限制（生产环境建议显式配置）
+allowed = ["dev1", "lab3", "lab4"]
+
+# ── 跳板机路由节点（默认，via 可以省略） ──────────────────────────
+[host.dev1]
+user        = "songjiajun"                 # 该目标机上的登录用户名
+default_cwd = "/public/home/songjiajun"    # 相对路径参数的解析基准（远端 Linux 路径），留空则用家目录
+# via = "bastion" 是默认值，省略即可；节点名 dev1 本身会作为主机名交给跳板机解析
+# （即 songjiajun@dev1），认证只用密钥（key / cert，规则同下面的 direct+key 节点），
+# 不支持也不接受 password。
+
+# ── 直连节点 + 密钥认证（可选 OpenSSH 用户证书） ───────────────────
+[host.lab3]
+via         = "direct"                      # 不经过跳板机，直接连 address:port
+address     = "192.168.10.23"               # 必填：IP 或域名
+port        = 2222                          # 默认 22
+user        = "songjiajun"
+auth        = "key"                         # key | password
+key         = "C:\\Users\\songjiajun\\.ssh\\lab3_ed25519"   # 本机私钥路径；留空则依次回退到 [bastion] key、默认密钥对
+cert        = ""                            # 可选：CA 签发的用户证书路径（*-cert.pub），配合 key 一起用
+default_cwd = "/public/home/songjiajun"     # 远端 Linux 路径
+# known_hosts = ""   # 可选：这台机器的 known_hosts 文件路径，用来校验 host key；
+                     # 留空则不校验。direct 节点不在跳板机后面，建议至少给密码
+                     # 认证的 direct 节点配这个字段。
+
+# ── 直连节点 + 密码认证 ────────────────────────────────────────
+[host.lab4]
+via         = "direct"
+address     = "192.168.10.24"
+port        = 22
+user        = "songjiajun"
+auth        = "password"
+password    = ""    # 明文写在本机 config.toml（已 gitignore）；留空则在 daemon 启动时用 getpass 交互输入
+default_cwd = "/public/home/songjiajun"     # 远端 Linux 路径
+# known_hosts = ""   # 同上，密码认证节点尤其建议配置

@@ -56,6 +56,16 @@ ModuleNotFoundError: No module named 'pywintypes'
 
 ## 3. config.toml 填法
 
+把 `config.example.toml` 复制一份改名成 `config.toml`，再按自己的环境填值（`config.example.toml` 里每个字段都有中文注释，`.gitignore` 已经排除了 `config.toml` 本身，放心填真实凭据）：
+
+```powershell
+cd <REMOTE_MCP_DIR>
+copy config.example.toml config.toml
+notepad config.toml
+```
+
+`config.toml` 里的节点分两类，用每个 `[host.x]` 段的 `via` 字段区分（省略 `via` 时默认是 `"bastion"`）：
+
 ```toml
 [bastion]
 host = "bastion.example.com"   # 跳板机地址，换成你实际的跳板机域名/IP
@@ -69,11 +79,32 @@ audit_log       = ""           # 留空不记录；填绝对路径（如 "D:/too
 connect_timeout = 20           # 跳板机 / 目标机建连超时（秒），超时不重试，直接报错
 
 [hosts]
-allowed = ["dev1"]             # 允许访问的目标机白名单，支持 fnmatch 通配符（如 "10.0.*"）；留空表示不限制
+allowed = ["dev1", "lab3", "lab4"]   # 允许访问的目标机白名单，支持 fnmatch 通配符（如 "10.0.*"）；留空表示不限制
 
+# 走跳板机的节点：省略 via，或写 via = "bastion"
 [host.dev1]
 user        = "songjiajun"
 default_cwd = "/public/home/songjiajun"   # exec/read_file/grep/glob_files/write_file/edit_file 的默认工作目录
+# 直连节点（密钥认证）：不经过跳板机，daemon 直接和这台机器的 sshd 建立连接
+[host.lab3]
+via         = "direct"
+address     = "192.168.10.23"                # 必填：这台机器的地址（域名或 IP）
+port        = 2222                           # 选填，默认 22
+user        = "songjiajun"
+auth        = "key"                          # "key" 或 "password"
+key         = "C:\\Users\\songjiajun\\.ssh\\lab3_ed25519"  # 留空则回退到 [bastion] key，再回退到默认密钥对
+cert        = ""                             # 如果用 OpenSSH 用户证书，填证书路径，和 key 配对使用
+default_cwd = "/public/home/songjiajun"
+
+# 直连节点（密码认证）：password 留空则 daemon 启动时用 getpass 提示输入，不会明文写在这里
+[host.lab4]
+via         = "direct"
+address     = "192.168.10.24"
+port        = 22
+user        = "songjiajun"
+auth        = "password"
+password    = ""                             # 留空 = 启动时交互输入；填了就直接用（仅一次机会，错了不重试）
+default_cwd = "/public/home/songjiajun"
 ```
 
 字段说明：
@@ -87,6 +118,13 @@ default_cwd = "/public/home/songjiajun"   # exec/read_file/grep/glob_files/write
 | `hosts.allowed` | 目标机白名单，防止误操作连到没打算连的机器 |
 | `host.<name>.user` | 该目标机上的登录用户名 |
 | `host.<name>.default_cwd` | 该目标机的默认工作目录；`exec` 的 `cwd` 参数、`read_file`/`grep`/`glob_files`/`write_file`/`edit_file` 的相对路径参数，都会以这个目录为基准解析 |
+| `host.<name>.via` | 省略或 `"bastion"`：通过跳板机连接（原有行为不变）。`"direct"`：daemon 直接连这台机器，不经过跳板机、不占用跳板机连接 |
+| `host.<name>.address` | **仅 direct 节点需要**：这台机器的地址（域名或 IP）。bastion 路由的节点不需要这个字段（直接用节点名当主机名，交给跳板机解析），如果误填了会在启动时打印警告并忽略 |
+| `host.<name>.port` | 仅 direct 节点：SSH 端口，默认 22 |
+| `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion 路由的节点固定用密钥登录，不支持这个字段 |
+| `host.<name>.key` / `cert` | 仅 direct + `auth="key"`：私钥路径（和可选的 OpenSSH 用户证书路径）。留空时的回退顺序是 `[host.x] key` → `[bastion] key` → 本机默认密钥对（`~/.ssh/id_*`） |
+| `host.<name>.password` | 仅 direct + `auth="password"`：留空则 daemon 启动时用 `getpass` 交互提示输入（提示里会带上节点名），不会明文出现在配置文件里；如果填了，daemon 只会用这一份密码尝试一次，认证失败不重试（避免触发远端账号锁定策略），也绝不会出现在日志、错误信息或 `list_hosts` 输出里 |
+| `host.<name>.known_hosts` | 选填，direct 节点：一个 `known_hosts` 文件路径，用来校验目标机的 host key。direct 节点不在跳板机后面，建议至少对密码认证的 direct 节点配置这个字段；留空则不校验（等同现在 bastion 路由节点的行为） |
 
 **注意**：这套环境里远端家目录是 `/public/home/songjiajun`，**不是** `/home/songjiajun`——两者路径不同，必须逐字照抄成 `/public/home/songjiajun`，写错会导致所有相对路径解析到不存在的目录。
 
@@ -97,7 +135,7 @@ daemon 用同一对本机私钥分别认证跳板机和目标机（目标机认�
 1. 确认本机有一对可用的密钥（没有就 `ssh-keygen -t ed25519` 生成一对）。
 2. 把**公钥**内容分别追加到跳板机和目标机的 `authorized_keys`：
    - 跳板机：`/public/home/songjiajun/.ssh/authorized_keys`
-   - 目标机（每台要访问的目标机都要做一遍）：`/public/home/songjiajun/.ssh/authorized_keys`（目标机的家目录同样是 `/public/home/songjiajun`）
+   - 目标机（每台要访问的目标机都要做一遍，不管是走跳板机还是直连）：`/public/home/songjiajun/.ssh/authorized_keys`（目标机的家目录同样是 `/public/home/songjiajun`）
 3. 权限要求（sshd 对权限过松的文件会直接拒绝，即使公钥内容正确）：
    ```bash
    chmod 700 /public/home/songjiajun/.ssh
@@ -106,6 +144,8 @@ daemon 用同一对本机私钥分别认证跳板机和目标机（目标机认�
 4. 私钥**只放在本机**，不上传、不复制到跳板机或目标机。
 
 跳板机额外要求开启 TOTP（keyboard-interactive）登录——这个通常是跳板机侧已有的策略，本文档不涉及配置它，只是 daemon 在连接时会走这个交互流程。
+
+**direct 节点（`via = "direct"`，`auth = "key"`）同样要把公钥放到这台机器自己的 `authorized_keys`，路径同上——`/public/home/songjiajun/.ssh/authorized_keys`（用户名换成这台机器实际登录用的账号）。因为 direct 节点不经过跳板机，这一步是这台机器独立要做的，和跳板机、其它节点的 `authorized_keys` 互不影响。密码认证的 direct 节点（`auth = "password"`）不需要这一步。**
 
 ## 5. 启动 daemon
 
@@ -122,6 +162,8 @@ daemon 启动时会立即连接跳板机，并在**这个窗口**里提示输入
 以上两种情况都会**再次在 daemon 窗口弹出 TOTP 提示**，而且是阻塞式的——重连协程会一直等在那里，直到有人在这个窗口里输入验证码为止。这意味着：
 
 > **daemon 必须运行在一个你能随时切回去、保持前台可交互的窗口里**（一个独立的 PowerShell 窗口、或者 Windows Terminal 的一个常驻标签页）。不要把它扔进看不到输出、也没法输入的后台任务里，否则一旦触发重连，所有工具调用会一直卡住直到有人发现并去那个窗口输入 TOTP。
+
+**如果配置了 direct + `auth = "password"` 的节点，且对应的 `password` 字段留空，daemon 启动过程中还会额外弹出一次或多次密码提示**（提示文字里带节点名，比如 `[lab4] password:`），同样在这个窗口里输入，输入不回显。这一步和跳板机的 TOTP 提示是独立的、顺序发生的（先处理密码节点，再连跳板机），都发生在同一次 `uv run daemon.py` 启动过程中。如果交互输入的密码连续错误达到 3 次，或者配置文件里写的密码本身就是错的，daemon 会打印一条提示、跳过这台机器，不会阻塞其它节点或跳板机的启动；也不会因为个别 direct 节点一时连不上（网络不通/超时）而卡住启动——这种情况只打印警告，等第一次调用这个节点时再按需重连。
 
 ## 6. 接入 Claude Code / Codex
 
@@ -163,6 +205,8 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | 报错 `Host '...' is not in the allowed list` | `config.toml` 的 `[hosts] allowed` 白名单里没有这台机器，按需加上（支持 `fnmatch` 通配符），或者确认没有手滑写错主机名 |
 | daemon 启动报端口被占用 | `config.toml` 里的 `daemon.port` 和本机其它程序冲突，改成一个空闲端口，同时同步更新 `claude mcp add` / Codex 里配置的 URL |
 | TOTP 输错 / 认证失败 | 直接在 daemon 窗口按 Ctrl+C 退出重新 `uv run daemon.py`；不需要额外清理状态 |
+| 直连密码错误或被锁 | 交互输入的密码连续错 3 次，或配置文件里 `password` 字段本身就是错的，daemon 会打印提示并跳过这台机器，不阻塞启动；确认密码正确后重新 `uv run daemon.py`，或者手动调用 `reset_connections` 后重试该节点。如果远端账号已经因为多次失败被锁，需要先在目标机上解锁（这不是本工具能处理的） |
+| direct 节点连不上 | 先确认 `config.toml` 里这个节点的 `address`/`port` 正确、网络可达（`Test-NetConnection <address> -Port <port>`）；direct 节点不经过跳板机，所以跳板机状态正常不代表 direct 节点能连上。密钥认证失败会报 `PermissionDenied`，检查公钥是否已经放到这台机器的 `authorized_keys`（见第 4 节）；网络不可达或超时只在启动时打印警告，不影响其它节点，下一次调用这个节点时会按需重连并把真正的错误返回 |
 
 ## 9. 远端机器的要求
 

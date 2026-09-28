@@ -47,6 +47,24 @@ def _audit(host: str, action: str, detail: str) -> None:
         pass
 
 
+def _scrub(msg: str) -> str:
+    """Redact any configured direct-node password that might otherwise leak
+    through a library's exception message (some SSH error strings echo back
+    connection parameters)."""
+    for pwd in pool._passwords.values():
+        if pwd:
+            msg = msg.replace(pwd, "***")
+    return msg
+
+
+def _fmt_error(e: Exception, *, brief: bool = False) -> str:
+    """Format an exception for a tool's return value. `brief=True` matches
+    the existing plain `error: {e}` style used for ValueError (validation
+    errors, which never come from asyncssh and don't need the type name)."""
+    msg = f"error: {e}" if brief else f"error: {type(e).__name__}: {e}"
+    return _scrub(msg)
+
+
 def _fmt(r: asyncssh.SSHCompletedProcess) -> str:
     parts = [f"exit_code: {r.returncode}"]
     if r.stdout:
@@ -202,35 +220,57 @@ async def _atomic_write(sftp, path: str, content: str) -> None:
 
 @mcp.tool()
 async def list_hosts() -> str:
-    """List bastion status, allowed hosts, connected targets, and configured hosts."""
-    b = pool.cfg.get("bastion", {})
-    bastion_addr = f"{b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}"
-    bastion_up = not pool._is_closed(pool._bastion_conn)
+    """List bastion status, allowed hosts, connected targets, and configured
+    hosts (route, auth method, connection state). Never includes passwords."""
+    b = pool.cfg.get("bastion")
+    if b:
+        bastion_addr = f"{b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}"
+        bastion_up = not pool._is_closed(pool._bastion_conn)
+        bastion_line = f"bastion: {bastion_addr} ({'connected' if bastion_up else 'disconnected'})"
+    else:
+        bastion_line = "bastion: (not configured)"
     allowed = pool.cfg.get("hosts", {}).get("allowed", [])
-    connected = [h for h, c in pool._target_conns.items() if not pool._is_closed(c)]
-    configured = sorted(pool.cfg.get("host", {}).keys())
 
     lines = [
-        f"bastion: {bastion_addr} ({'connected' if bastion_up else 'disconnected'})",
+        bastion_line,
         f"allowed: {allowed if allowed else '(unrestricted)'}",
-        f"connected targets: {connected if connected else '(none)'}",
-        f"configured hosts: {configured if configured else '(none)'}",
+        "configured hosts:",
     ]
+    configured = sorted(pool.cfg.get("host", {}).keys())
+    if not configured:
+        lines.append("  (none)")
+    for host in configured:
+        hc = pool.cfg["host"][host]
+        route = pool._route(host)
+        if route == "direct":
+            route_desc = f"direct {hc.get('address', '?')}:{hc.get('port', 22)}"
+            auth = hc.get("auth", "key")
+        else:
+            route_desc = "bastion"
+            auth = "key"
+        conn = pool._target_conns.get(host)
+        state = "connected" if not pool._is_closed(conn) else "disconnected"
+        lines.append(f"  {host}: {route_desc}, auth={auth}, {state}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def exec(host: str, command: str, cwd: str = "", timeout: int = 60) -> str:
-    """Execute a shell command on the remote host."""
+    """Execute a shell command on the remote host. A relative `cwd` resolves
+    against the host's default_cwd (same as glob_files' `base`), not the
+    login directory; an absolute or ~-rooted `cwd` overrides it as usual."""
     _audit(host, "exec", command)
-    effective_cwd = cwd or _host_default_cwd(host)
-    full_cmd = _cd_prefix(effective_cwd) + command
+    # Chain _cd_prefix calls exactly like glob_files does for `base`: cd into
+    # default_cwd first, then into cwd (each a no-op if unset/"."), so a
+    # relative cwd lands relative to default_cwd rather than the login cwd —
+    # exec(cwd="src") and glob_files(base="src") now agree on where "src" is.
+    full_cmd = _cd_prefix(_host_default_cwd(host)) + _cd_prefix(cwd) + command
     try:
         r = await pool.run(host, full_cmd, timeout=timeout)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
     return _fmt(r)
 
 
@@ -246,9 +286,9 @@ async def read_file(host: str, path: str, offset: int = 1, limit: int = 2000) ->
     try:
         r = await pool.run(host, cmd)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
     if r.returncode != 0:
         return _fmt(r)
     return _trunc(r.stdout) if r.stdout else "(empty)"
@@ -267,9 +307,9 @@ async def write_file(host: str, path: str, content: str) -> str:
     try:
         await pool.with_sftp(host, _do)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
 
     return f"ok: wrote {len(content.encode('utf-8'))} bytes to {path}"
 
@@ -336,13 +376,13 @@ async def edit_file(
     try:
         await pool.with_sftp(host, _do)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except _RemoteFileNotFound:
         return f"error: file not found: {path}"
     except _OldStrNotFound:
         return f"error: old_str not found in {path}"
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
 
     replacements = result["count"] if replace_all else 1
     return f"ok: replaced {replacements} occurrence(s) in {path}"
@@ -376,9 +416,9 @@ async def grep(
     try:
         r = await pool.run(host, cmd)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
     if not r.stdout and r.returncode in (0, 1):
         return "(no matches)"
     return _fmt(r)
@@ -406,9 +446,9 @@ async def glob_files(host: str, pattern: str, base: str = ".") -> str:
     try:
         r = await pool.run(host, cmd)
     except ValueError as e:
-        return f"error: {e}"
+        return _fmt_error(e, brief=True)
     except Exception as e:
-        return f"error: {type(e).__name__}: {e}"
+        return _fmt_error(e)
 
     # find printed "./foo/bar" (relative to base); strip the "./" so the
     # result reads like an ordinary relative path under base.

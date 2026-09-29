@@ -70,7 +70,7 @@ notepad config.toml
 [bastion]
 host = "bastion.example.com"   # 跳板机地址，换成你实际的跳板机域名/IP
 port = 22
-user = "songjiajun"            # 你在跳板机上的登录用户名
+user = "<跳板机用户名>"            # 你在跳板机上的登录用户名
 key  = ""                      # 私钥路径；留空则用默认密钥对 (~/.ssh/id_*)
 
 [daemon]
@@ -83,28 +83,28 @@ allowed = ["dev1", "lab3", "lab4"]   # 允许访问的目标机白名单，支�
 
 # 走跳板机的节点：省略 via，或写 via = "bastion"
 [host.dev1]
-user        = "songjiajun"
-default_cwd = "/public/home/songjiajun"   # exec/read_file/grep/glob_files/write_file/edit_file 的默认工作目录
+user        = "<远端用户名>"
+default_cwd = "<远端家目录>"   # exec/read_file/grep/glob_files/write_file/edit_file 的默认工作目录
 # 直连节点（密钥认证）：不经过跳板机，daemon 直接和这台机器的 sshd 建立连接
 [host.lab3]
 via         = "direct"
 address     = "192.168.10.23"                # 必填：这台机器的地址（域名或 IP）
 port        = 2222                           # 选填，默认 22
-user        = "songjiajun"
+user        = "<远端用户名>"
 auth        = "key"                          # "key" 或 "password"
-key         = "C:\\Users\\songjiajun\\.ssh\\lab3_ed25519"  # 留空则回退到 [bastion] key，再回退到默认密钥对
+key         = "C:/Users/<本机用户名>/.ssh/lab3_ed25519"  # 留空则回退到 [bastion] key，再回退到默认密钥对
 cert        = ""                             # 如果用 OpenSSH 用户证书，填证书路径，和 key 配对使用
-default_cwd = "/public/home/songjiajun"
+default_cwd = "<远端家目录>"
 
 # 直连节点（密码认证）：password 留空则 daemon 启动时用 getpass 提示输入，不会明文写在这里
 [host.lab4]
 via         = "direct"
 address     = "192.168.10.24"
 port        = 22
-user        = "songjiajun"
+user        = "<远端用户名>"
 auth        = "password"
 password    = ""                             # 留空 = 启动时交互输入；填了就直接用（仅一次机会，错了不重试）
-default_cwd = "/public/home/songjiajun"
+default_cwd = "<远端家目录>"
 ```
 
 字段说明：
@@ -126,7 +126,7 @@ default_cwd = "/public/home/songjiajun"
 | `host.<name>.password` | 仅 direct + `auth="password"`：留空则 daemon 启动时用 `getpass` 交互提示输入（提示里会带上节点名），不会明文出现在配置文件里；如果填了，daemon 只会用这一份密码尝试一次，认证失败不重试（避免触发远端账号锁定策略），也绝不会出现在日志、错误信息或 `list_hosts` 输出里 |
 | `host.<name>.known_hosts` | 选填，direct 节点：一个 `known_hosts` 文件路径，用来校验目标机的 host key。direct 节点不在跳板机后面，建议至少对密码认证的 direct 节点配置这个字段；留空则不校验（等同现在 bastion 路由节点的行为） |
 
-**注意**：这套环境里远端家目录是 `/public/home/songjiajun`，**不是** `/home/songjiajun`——两者路径不同，必须逐字照抄成 `/public/home/songjiajun`，写错会导致所有相对路径解析到不存在的目录。
+**注意**：`<远端家目录>` 因集群而异，不一定是 `/home/<远端用户名>`（有的集群是 `/public/home/<远端用户名>` 这类形式）。请在远端执行 `echo $HOME` 确认后原样填入 `default_cwd`，写错会导致所有相对路径解析到不存在的目录。
 
 ## 4. 密钥部署
 
@@ -134,18 +134,18 @@ daemon 用同一对本机私钥分别认证跳板机和目标机（目标机认�
 
 1. 确认本机有一对可用的密钥（没有就 `ssh-keygen -t ed25519` 生成一对）。
 2. 把**公钥**内容分别追加到跳板机和目标机的 `authorized_keys`：
-   - 跳板机：`/public/home/songjiajun/.ssh/authorized_keys`
-   - 目标机（每台要访问的目标机都要做一遍，不管是走跳板机还是直连）：`/public/home/songjiajun/.ssh/authorized_keys`（目标机的家目录同样是 `/public/home/songjiajun`）
+   - 跳板机：`<远端家目录>/.ssh/authorized_keys`
+   - 目标机（每台要访问的目标机都要做一遍，不管是走跳板机还是直连）：`<远端家目录>/.ssh/authorized_keys`
 3. 权限要求（sshd 对权限过松的文件会直接拒绝，即使公钥内容正确）：
    ```bash
-   chmod 700 /public/home/songjiajun/.ssh
-   chmod 600 /public/home/songjiajun/.ssh/authorized_keys
+   chmod 700 <远端家目录>/.ssh
+   chmod 600 <远端家目录>/.ssh/authorized_keys
    ```
 4. 私钥**只放在本机**，不上传、不复制到跳板机或目标机。
 
 跳板机额外要求开启 TOTP（keyboard-interactive）登录——这个通常是跳板机侧已有的策略，本文档不涉及配置它，只是 daemon 在连接时会走这个交互流程。
 
-**direct 节点（`via = "direct"`，`auth = "key"`）同样要把公钥放到这台机器自己的 `authorized_keys`，路径同上——`/public/home/songjiajun/.ssh/authorized_keys`（用户名换成这台机器实际登录用的账号）。因为 direct 节点不经过跳板机，这一步是这台机器独立要做的，和跳板机、其它节点的 `authorized_keys` 互不影响。密码认证的 direct 节点（`auth = "password"`）不需要这一步。**
+**direct 节点（`via = "direct"`，`auth = "key"`）同样要把公钥放到这台机器自己的 `authorized_keys`，路径同上——`<远端家目录>/.ssh/authorized_keys`（这台机器登录账号自己的家目录）。因为 direct 节点不经过跳板机，这一步是这台机器独立要做的，和跳板机、其它节点的 `authorized_keys` 互不影响。密码认证的 direct 节点（`auth = "password"`）不需要这一步。**
 
 ## 5. 启动 daemon
 
@@ -191,7 +191,7 @@ url = "http://127.0.0.1:8765/mcp"
 daemon 启动、TOTP 输入完成后，依次验证：
 
 1. **`list_hosts`**：确认跳板机状态是 `connected`，`configured hosts` 里能看到 `dev1`。
-2. **`exec(host="dev1", command="pwd")`**：预期返回 `/public/home/songjiajun`（即 `default_cwd`，因为没传 `cwd` 参数时 `exec` 会先 `cd` 进 `default_cwd` 再执行命令）。
+2. **`exec(host="dev1", command="pwd")`**：预期返回该节点的 `default_cwd`（即 `<远端家目录>`，因为没传 `cwd` 参数时 `exec` 会先 `cd` 进 `default_cwd` 再执行命令）。
 3. **`read_file(host="dev1", path="一个已知存在的文件")`**：确认能读到内容，行号格式正确。
 4. 如果要验证路径解析的一致性，可以试 `exec(host="dev1", command="ls some_dir")` 之后再 `read_file(host="dev1", path="some_dir/some_file")`——两者应该指向同一个文件。
 
@@ -210,7 +210,7 @@ daemon 启动、TOTP 输入完成后，依次验证：
 
 ## 9. 远端机器的要求
 
-**跳板机和目标机不需要安装任何组件，也不需要在 `/public/home/songjiajun` 下建立任何服务目录。** 唯一需要的远端改动是第 4 节里的 `authorized_keys` 配置——除此之外，所有逻辑（连接池、超时控制、命令拼接、审计日志）都跑在本机的 daemon 进程里，远端只是被 SSH/SFTP 到的普通目标。
+**跳板机和目标机不需要安装任何组件，也不需要在 `<远端家目录>` 下建立任何服务目录。** 唯一需要的远端改动是第 4 节里的 `authorized_keys` 配置——除此之外，所有逻辑（连接池、超时控制、命令拼接、审计日志）都跑在本机的 daemon 进程里，远端只是被 SSH/SFTP 到的普通目标。
 
 ## 10. 多跳板机
 

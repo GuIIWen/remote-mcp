@@ -559,27 +559,27 @@ async def kbdint_challenge_received(self, name, instructions, lang, prompts):
 <p>这个字段的设计与 <code>TODO.md</code> 里的多跳板机方案一致：以后 <code>via</code> 的取值可以是某个跳板机的名字，<code>"direct"</code> 作为保留值。现在这样做，将来加多跳板机时配置格式不用再改。</p>
 
 <h4>配置示例</h4>
-<pre><code>[host.dev1]                      # 跳板机节点：songjiajun@dev1，密钥免密
-user        = "songjiajun"
-default_cwd = "/public/home/songjiajun"
+<pre><code>[host.dev1]                      # 跳板机节点：&lt;远端用户名&gt;@dev1，密钥免密
+user        = "&lt;远端用户名&gt;"
+default_cwd = "&lt;远端家目录&gt;"
 
 [host.lab3]                      # 直连 + 密钥（可选 OpenSSH 用户证书）
 via         = "direct"
 address     = "192.168.10.23"    # 必填：IP 或域名
 port        = 2222               # 默认 22
-user        = "songjiajun"
+user        = "&lt;远端用户名&gt;"
 auth        = "key"              # key | password
-key         = "C:/Users/songjiajun/.ssh/lab3_ed25519"   # 留空则用默认密钥对
+key         = "C:/Users/&lt;本机用户名&gt;/.ssh/lab3_ed25519"   # 留空则用默认密钥对
 cert        = ""                 # 可选：lab3_ed25519-cert.pub，CA 签发的用户证书
-default_cwd = "/public/home/songjiajun"
+default_cwd = "&lt;远端家目录&gt;"
 
 [host.lab4]                      # 直连 + 密码
 via         = "direct"
 address     = "192.168.10.24"
-user        = "songjiajun"
+user        = "&lt;远端用户名&gt;"
 auth        = "password"
 password    = "********"         # 明文写在本机 config.toml（已 gitignore）；留空则在 Daemon 启动时提示输入
-default_cwd = "/public/home/songjiajun"</code></pre>
+default_cwd = "&lt;远端家目录&gt;"</code></pre>
 
 <h4>认证方式</h4>
 <div class="table-wrap">
@@ -796,8 +796,8 @@ audit_log = "D:/tools/remote-mcp/audit.jsonl"
 allowed = ["dev1", "gpu-box", "10.0.1.*"]
 
 [host.dev1]
-user        = "songjiajun"
-default_cwd = "/public/home/songjiajun"
+user        = "&lt;远端用户名&gt;"
+default_cwd = "&lt;远端家目录&gt;"
 
 [host.gpu-box]
 user        = "user"
@@ -807,9 +807,9 @@ default_cwd = "/workspace"
 via         = "direct"
 address     = "192.168.10.23"
 port        = 2222
-user        = "songjiajun"
+user        = "&lt;远端用户名&gt;"
 auth        = "key"
-default_cwd = "/public/home/songjiajun"</code></pre>
+default_cwd = "&lt;远端家目录&gt;"</code></pre>
 
 <h3>模块职责边界</h3>
 <div class="table-wrap">
@@ -846,27 +846,27 @@ uv pip install -r requirements.txt</code></pre>
 <h3>config.toml 关键字段</h3>
 <p>仓库里只提交模板 <code>config.example.toml</code>（占位值，可以安全提交），首次部署先复制一份出来再改成真实值，<code>config.toml</code> 本身已加入 <code>.gitignore</code>，不会被提交：</p>
 <pre><code>copy config.example.toml config.toml</code></pre>
-<p>远端账号是 <code>songjiajun</code>，家目录是 <code>/public/home/songjiajun</code>（注意不是 <code>/home/songjiajun</code>）：</p>
+<p>把下文的 <code>&lt;远端用户名&gt;</code>、<code>&lt;远端家目录&gt;</code> 换成你自己的远端账号和家目录（家目录因集群而异，在远端执行 <code>echo $HOME</code> 确认）：</p>
 <pre><code>[daemon]
 connect_timeout = 20   # 建连超时（秒），与命令级 timeout 参数是两回事，见第 5 节
 
 [host.dev1]
-user        = "songjiajun"
-default_cwd = "/public/home/songjiajun"</code></pre>
+user        = "&lt;远端用户名&gt;"
+default_cwd = "&lt;远端家目录&gt;"</code></pre>
 <p>如果有不经过跳板机、直接可达的目标机，用 <code>via = "direct"</code> 加一段直连节点，字段和认证方式见第 3.4 节：</p>
 <pre><code>[host.lab3]
 via         = "direct"
 address     = "192.168.10.23"
 port        = 2222
-user        = "songjiajun"
+user        = "&lt;远端用户名&gt;"
 auth        = "key"          # key | password
-default_cwd = "/public/home/songjiajun"</code></pre>
+default_cwd = "&lt;远端家目录&gt;"</code></pre>
 <p>字段全表见第 7 节「config.toml 结构」。</p>
 
 <h3>密钥部署</h3>
-<p>把本机公钥追加到跳板机和每台目标机的 <code>/public/home/songjiajun/.ssh/authorized_keys</code>（目标机家目录同样是这个路径），并设好权限：</p>
-<pre><code>chmod 700 /public/home/songjiajun/.ssh
-chmod 600 /public/home/songjiajun/.ssh/authorized_keys</code></pre>
+<p>把本机公钥追加到跳板机和每台目标机的 <code>&lt;远端家目录&gt;/.ssh/authorized_keys</code>（每台机器用各自登录账号的家目录），并设好权限：</p>
+<pre><code>chmod 700 &lt;远端家目录&gt;/.ssh
+chmod 600 &lt;远端家目录&gt;/.ssh/authorized_keys</code></pre>
 <p>私钥只留在本机，不上传、不复制到跳板机或目标机。<code>via = "direct"</code> 的节点不在跳板机后面，是单独一条 SSH 连接，需要把本机公钥<strong>额外</strong>追加到该节点自己的 <code>authorized_keys</code>（和跳板机、其它节点各自独立，不能共用一份）；<code>auth = "password"</code> 的直连节点不需要这一步。</p>
 
 <h3>启动 Daemon</h3>
@@ -898,7 +898,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
 <h3>验证接入</h3>
 <pre><code># 或直接调用工具，依次验证
 > @remote-linux list_hosts
-> @remote-linux exec(host="dev1", command="pwd")   # 预期返回 /public/home/songjiajun
+> @remote-linux exec(host="dev1", command="pwd")   # 预期返回 &lt;远端家目录&gt;
 > @remote-linux read_file(host="dev1", path="...")
 
 # 在 CC 里测试
@@ -922,7 +922,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
 
 <div class="callout good">
   <span class="callout-icon">✓</span>
-  <div>远端无需安装任何组件，也不需要在 <code>/public/home/songjiajun</code> 下建立服务目录——唯一的远端改动是 <code>authorized_keys</code>。</div>
+  <div>远端无需安装任何组件，也不需要在 <code>&lt;远端家目录&gt;</code> 下建立服务目录——唯一的远端改动是 <code>authorized_keys</code>。</div>
 </div>
 
 <h3>多跳板机</h3>

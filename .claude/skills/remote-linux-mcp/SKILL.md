@@ -13,6 +13,31 @@ remote-linux 是一个跑在 **Windows 本机**的 MCP daemon（Python + asyncss
 
 下文 `<REPO>` 指包含 `daemon.py` 的仓库目录（这个 skill 放在 `<REPO>\.claude\skills\remote-linux-mcp\` 下）。不确定在哪就先问用户，不要猜。完整说明见 `<REPO>\DEPLOY.md`，设计见 `<REPO>\remote-mcp-design.html`。
 
+## 0. 安装这个 skill
+
+skill 就是 `remote-linux-mcp\` 这个目录（里面是 `SKILL.md`），整个目录复制过去即可，目录名保持 `remote-linux-mcp`。
+
+| 客户端 | 范围 | 路径 |
+|---|---|---|
+| Claude Code | 仅本仓库（已自带，在仓库里启动 CC 即生效） | `<REPO>\.claude\skills\remote-linux-mcp\` |
+| Claude Code | 用户级，所有项目可用 | `%USERPROFILE%\.claude\skills\remote-linux-mcp\` |
+| Codex | 用户级，所有项目可用 | `%USERPROFILE%\.agents\skills\remote-linux-mcp\` |
+| Codex | 仅本仓库 | `<REPO>\.agents\skills\remote-linux-mcp\` |
+
+在 `<REPO>` 下执行（按需选一条或两条）：
+
+```powershell
+# Claude Code 用户级
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
+Copy-Item -Recurse -Force .claude\skills\remote-linux-mcp "$env:USERPROFILE\.claude\skills\"
+
+# Codex 用户级
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.agents\skills" | Out-Null
+Copy-Item -Recurse -Force .claude\skills\remote-linux-mcp "$env:USERPROFILE\.agents\skills\"
+```
+
+复制后新开会话才会加载。之后仓库里的 skill 有更新，需要重新复制一次。
+
 ## 必须遵守的规则
 
 - `config.toml` 里有真实账号和密码，已被 `.gitignore` 排除。**不要提交它，不要把密码回显到对话、日志或命令行参数里**；改动只提交 `config.example.toml`。

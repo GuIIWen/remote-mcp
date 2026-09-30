@@ -8,6 +8,7 @@ description: 安装、配置并接入 remote-linux MCP server（本机 Windows d
 remote-linux 是一个跑在 **Windows 本机**的 MCP daemon（Python + asyncssh + FastMCP），通过 `http://127.0.0.1:8765/mcp` 给 Claude Code / Codex 提供操作远端 Linux 的工具。
 
 - 走跳板机的节点：daemon 常驻一条跳板机连接（登录需要 TOTP），目标机以 `用户名@节点名` 经跳板机免密登录。
+- hop 节点（`via = "hop"`）：目标机只有跳板机能免密登录，本机没有它的私钥（比如某些计算节点，私钥一直留在跳板机上）。daemon 不打隧道直连，而是让跳板机自己代跑 `ssh <节点名> '<命令>'`。
 - 直连节点（`via = "direct"`）：直接连 `address:port`，用密钥/证书或密码登录，不经过跳板机。
 - 跳板机和目标机上**不装任何东西**，也不建服务目录；远端唯一的改动是 `authorized_keys`。
 
@@ -86,20 +87,32 @@ Copy-Item config.example.toml config.toml
 | `[hosts] allowed` | 节点白名单，支持 fnmatch 通配符；`[]` 表示不限制（建议填写） |
 | `[host.<名字>] user` | 目标机登录用户名 |
 | `[host.<名字>] default_cwd` | 远端默认工作目录，相对路径都以它为基准 |
-| `[host.<名字>] via` | 省略或 `"bastion"` 走跳板机；`"direct"` 直连 |
-| `address` / `port` | 仅 direct：目标地址（必填）和端口（默认 22） |
+| `[host.<名字>] via` | 省略或 `"bastion"` 走跳板机；`"hop"` 走跳板机代跑 ssh（目标机私钥只在跳板机上）；`"direct"` 直连 |
+| `address` / `port` | 仅 direct：目标地址（必填）和端口（默认 22）；hop 的 `port` 选填，是跳板机 ssh 到目标机时用的 `-p`，留空交给跳板机自己的 `~/.ssh/config` |
 | `auth` | 仅 direct：`"key"`（默认）或 `"password"` |
-| `key` / `cert` | 私钥 / OpenSSH 用户证书路径；key 回退顺序：`[host.x] key` → `[bastion] key` → 默认密钥对 |
+| `key` / `cert` | 私钥 / OpenSSH 用户证书路径；key 回退顺序：`[host.x] key` → `[bastion] key` → 默认密钥对（hop 节点不适用——它用的是跳板机自己的密钥，不是本机的） |
 | `password` | 仅 direct + password：明文；留空则启动时交互输入 |
 | `known_hosts` | 仅 direct，可选：本机 known_hosts 文件，用来校验主机密钥；留空不校验 |
 
-三种节点的写法：
+hop 节点如果同时填了 `address`/`password`/`auth`/`key`/`cert`，这些字段会被忽略并在启动时打印警告；没配 `[bastion]` 却写了 `via = "hop"` 是致命错误，daemon 直接退出。
+
+四种节点的写法：
 
 ```toml
 # 走跳板机：段名就是跳板机能解析的节点名，登录为 <远端用户名>@dev1
 [host.dev1]
 user        = "<远端用户名>"
 default_cwd = "<远端家目录>"
+
+# hop：目标机只有跳板机能免密登录，本机没有它的私钥（比如某些计算节点）；
+# daemon 让跳板机自己执行 `ssh nmz01 '<命令>'`，不打隧道、不用本机密钥。
+[host.nmz01]
+via         = "hop"
+user        = "<远端用户名>"   # 选填：跳板机 ssh 到 nmz01 用的 -l；留空用跳板机自己的 ~/.ssh/config
+default_cwd = "<远端家目录>"
+# 部署前提（在跳板机上做，不是本机）：私钥放在跳板机上，且跳板机已能免密
+# ssh 到 nmz01。自检：登录跳板机后跑 `ssh -o BatchMode=yes nmz01 hostname`，
+# 能直接打印 hostname、不弹密码/口令提示，才说明这里能正常工作。
 
 # 直连 + 密钥（或证书）
 [host.lab3]
@@ -122,7 +135,8 @@ password    = ""          # 留空 = 启动时提示输入
 default_cwd = "<远端家目录>"
 ```
 
-- 所有节点都是直连时，删掉整个 `[bastion]` 段，启动时就不会连跳板机、不会要 TOTP。
+- 所有节点都是直连时，删掉整个 `[bastion]` 段，启动时就不会连跳板机、不会要 TOTP。但只要有一个 hop 节点，`[bastion]` 就是必需的。
+- hop 节点不能用 `get_target` 那条直连路径，但 `exec`/`read_file`/`write_file`/`edit_file`/`grep`/`glob_files` 这几个工具对它的用法和 bastion 节点完全一样。
 - 新加的节点记得同时加进 `[hosts] allowed`。
 - 用密钥登录的机器（跳板机、目标机、direct+key 节点）都要把本机公钥追加到对方登录账号的 `~/.ssh/authorized_keys`（即 `<远端家目录>/.ssh/authorized_keys`），并设置 `chmod 700 ~/.ssh`、`chmod 600 ~/.ssh/authorized_keys`。
 
@@ -180,7 +194,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 
 在新会话里依次调用：
 
-1. `list_hosts()`：跳板机 `connected`，每个节点显示路由（`bastion` / `direct 地址:端口`）、认证方式和连接状态。
+1. `list_hosts()`：跳板机 `connected`，每个节点显示路由（`bastion` / `direct 地址:端口` / `hop via bastion`）、认证方式和连接状态。
 2. `exec(host="dev1", command="pwd")`：应返回该节点配置的 `default_cwd`（即 `<远端家目录>`）。
 3. `read_file(host="dev1", path="<一个已知存在的文件>")`：能读到带行号的内容。
 
@@ -193,7 +207,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | `list_hosts` | 无 | 跳板机状态、白名单、各节点路由/认证/连接状态（不含密码） |
 | `exec` | `host, command, cwd="", timeout=60` | 执行 shell 命令；超时后远端进程会被杀掉 |
 | `read_file` | `host, path, offset=1, limit=2000` | 带行号读文件 |
-| `write_file` | `host, path, content` | 经 SFTP 原子覆盖写入，保留原权限，跟随软链接 |
+| `write_file` | `host, path, content` | 原子覆盖写入，保留原权限，跟随软链接（SFTP 节点走 SFTP，hop 节点经跳板机命令实现，对外行为一致） |
 | `edit_file` | `host, path, old_str, new_str, replace_all=False` | 精确字符串替换；多处匹配需 `replace_all=True` |
 | `grep` | `host, pattern, path=".", glob="", context=0` | 优先用 rg，否则 `grep -rnE` |
 | `glob_files` | `host, pattern, base="."` | `**` 匹配任意层目录，最多返回 200 条 |
@@ -208,7 +222,8 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | 启动时报 `config.toml not found` | 从 `config.example.toml` 复制一份 |
 | 启动时报 `config error: ...` | 按提示补 `address` 或改正 `auth` |
 | `not in the allowed list` | 把节点加进 `[hosts] allowed` |
-| `ConfigError: no [bastion] section` | 该节点走跳板机但没配 `[bastion]`；补上，或改成 `via = "direct"` |
+| `ConfigError: no [bastion] section` | 该节点走跳板机但没配 `[bastion]`；补上，或改成 `via = "direct"`。hop 节点同理——没配 `[bastion]` 时写 `via = "hop"` 是启动致命错误 |
+| hop 节点报 `ssh to <节点> on the bastion failed: ...` | 跳板机上 `ssh <节点名>` 本身失败（对应 ssh 退出码 255），daemon 不重试。登录跳板机手动跑 `ssh -o BatchMode=yes <节点名> hostname` 复现：常见是跳板机缺该机器的私钥、目标机 `authorized_keys` 没加跳板机公钥、host key 变了，或 `user`/`port` 与跳板机 `~/.ssh/config` 不一致 |
 | `PermissionDenied` | 密钥没加进对方 `authorized_keys`、权限不对，或密码错误；认证失败不会重试，改好后 `reset_connections` 或重启 daemon |
 | 连接超时 | `Test-NetConnection <地址> -Port <端口>` 检查可达性，必要时调大 `connect_timeout` |
 | 端口被占用 | 改 `[daemon] port`，同步更新客户端 URL |

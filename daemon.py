@@ -32,6 +32,16 @@ def _validate_config(cfg: dict) -> None:
             auth = hc.get("auth", "key")
             if auth not in ("key", "password"):
                 errors.append(f"[host.{host}] auth 必须是 \"key\" 或 \"password\"，当前是 {auth!r}")
+        elif via == "hop":
+            if not cfg.get("bastion"):
+                errors.append(f"[host.{host}] via=\"hop\" 需要配置 [bastion] 段")
+            ignored = [f for f in ("address", "password", "auth", "key", "cert") if hc.get(f)]
+            if ignored:
+                print(
+                    f"warning: [host.{host}] via=\"hop\" 时 {', '.join(ignored)} 字段会被忽略"
+                    "（命令直接由跳板机上的 ssh 发起，用的是跳板机自己的密钥和 known_hosts）",
+                    flush=True,
+                )
         else:
             if hc.get("password") or hc.get("address"):
                 print(

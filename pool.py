@@ -12,6 +12,14 @@ _bastion_lock = asyncio.Lock()
 _host_locks: dict[str, asyncio.Lock] = {}
 cfg: dict = {}
 
+# Hop-routed hosts (via = "hop") all ride the single bastion connection
+# (`ssh <node> '<cmd>'` run *on* the bastion) instead of getting a
+# connection of their own, so they share one semaphore sized against the
+# bastion's own sshd MaxSessions — never a per-host one (see run()/
+# _run_hop()), or concurrent calls to different hop hosts could add up
+# past the bastion's limit even though each host's own count looks fine.
+_hop_sem = asyncio.Semaphore(8)
+
 # In-memory only — populated at startup (config value or interactive prompt)
 # and reused silently on reconnect. Never written to disk, never logged.
 _passwords: dict[str, str] = {}
@@ -30,6 +38,14 @@ class RemoteTimeout(RuntimeError):
         super().__init__(f"command timed out after {timeout}s; the remote process was terminated")
 
 
+class HopSSHError(RuntimeError):
+    """Raised when the `ssh` client running on the bastion exits 255 — ssh's
+    own "the connection never got as far as running the command" code
+    (host key changed, permission denied, unresolvable host, ...). The
+    message carries ssh's stderr verbatim so the tool output actually names
+    the cause instead of just showing exit_code: 255."""
+
+
 def _host_lock(host: str) -> asyncio.Lock:
     lock = _host_locks.get(host)
     if lock is None:
@@ -44,8 +60,12 @@ def _connect_timeout() -> float:
 
 def _route(host: str) -> str:
     """"bastion" (default) tunnels through the jump host; "direct" connects
-    straight to [host.<name>].address. Reserved for future values naming a
-    specific bastion once multi-bastion support (see TODO.md) lands."""
+    straight to [host.<name>].address and owns its own connection; "hop"
+    keeps no connection of its own either — every operation runs `ssh
+    <node> '<cmd>'` on the resident bastion connection, which is the only
+    way to reach a node whose key lives on the bastion rather than here.
+    Reserved for future values naming a specific bastion once multi-bastion
+    support (see TODO.md) lands."""
     return cfg.get("host", {}).get(host, {}).get("via", "bastion")
 
 
@@ -202,6 +222,19 @@ async def get_bastion() -> asyncssh.SSHClientConnection:
 async def get_target(host: str) -> asyncssh.SSHClientConnection:
     if not _allowed(host):
         raise ValueError(f"Host '{host}' is not in the allowed list")
+    if _route(host) == "hop":
+        # A hop-routed host has no connection of its own — every access
+        # goes through run()'s hop branch (ssh run on the bastion
+        # connection), never through get_target()/with_sftp(). Reaching
+        # here means a caller (a new tool, most likely) forgot to route on
+        # _route(host) == "hop" first; fail loudly instead of silently
+        # falling through to the tunnel= path below, which needs a private
+        # key for the node that, for a hop host, only exists on the
+        # bastion and never on this machine.
+        raise ConfigError(
+            f"[host.{host}] via=\"hop\" has no direct connection; "
+            "use pool.run() (or a hop-aware file helper), not get_target()/with_sftp()"
+        )
 
     async with _host_lock(host):
         conn = _target_conns.get(host)
@@ -289,6 +322,24 @@ def _invalidate_target(host: str) -> None:
             pass
 
 
+def _invalidate_bastion() -> None:
+    """Drop and close the bastion connection, plus every target connection
+    tunneled through it, so the next hop/bastion-routed call reconnects
+    instead of reusing a socket that's already dead but hasn't run its
+    connection_lost() callback yet (same reasoning as _invalidate_target).
+    direct-routed targets have their own socket and are left alone."""
+    global _bastion_conn
+    conn = _bastion_conn
+    _bastion_conn = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for h in [h for h in _target_conns if _route(h) != "direct"]:
+        _target_conns.pop(h, None)
+
+
 def _timeout_wrap(cmd: str, timeout: int) -> str:
     # terminate() over the SSH channel is a request many sshd builds ignore,
     # and closing the channel without a pty doesn't deliver SIGHUP either —
@@ -303,19 +354,106 @@ def _timeout_wrap(cmd: str, timeout: int) -> str:
     )
 
 
+def hop_ssh_command(host: str, cmd: str, timeout: int) -> str:
+    """Build the command line a hop-routed host's operation runs *on the
+    bastion*: an `ssh` client that hops one more time to `host` and runs
+    `cmd` there.
+
+    Why a plain `ssh` invocation rather than a tunnel: the private key that
+    authenticates to `host` lives on the bastion, not on this machine, so
+    the hop cannot be an asyncssh tunnel= (which would sign with a local
+    key). It is also why port/user are optional — with neither set we emit
+    no `-p`/`-l` at all and let the bastion's own ~/.ssh/config (or plain
+    ssh defaults) resolve hostname, port, user and identity file, which is
+    exactly how `ssh nmz01` typed by hand on the bastion behaves.
+
+    ControlMaster/ControlPath/ControlPersist let every command reuse one
+    underlying SSH connection to the node (ControlPath's %C is a hash of
+    the connection parameters, so the socket name stays short regardless of
+    how long the hostname/options are), which is what keeps a burst of
+    tools from paying a fresh handshake each time.
+
+    BatchMode=yes forbids any interactive prompt (password, host-key
+    confirmation, passphrase) — the daemon's terminal is shared with the
+    TOTP prompt and must never be blocked by a nested ssh asking a question;
+    an unexpected prompt instead surfaces as exit code 255.
+
+    Quoting is deliberately exactly one layer: this whole string is what
+    the *bastion's* shell parses, so shlex.quote(wrapped) hands the node's
+    login shell the wrapped command byte-for-byte, and the node's shell
+    then unpacks the `timeout ... bash -c <quoted>` that _timeout_wrap
+    produced. Two layers, one quote each — no more.
+
+    The timeout wrap is applied *before* the ssh hop, so the clock covers
+    the hop handshake and the remote command together: if the node is
+    unreachable the client-side wait_for (timeout + 15) fires and the
+    process gets terminated, exactly as for a direct/bastion host.
+    """
+    hc = cfg.get("host", {}).get(host, {})
+    opts = ["-o", "BatchMode=yes", "-o", "ControlMaster=auto",
+            "-o", f"ControlPath=~/.ssh/remote-mcp-%C",
+            "-o", "ControlPersist=10m"]
+    port = hc.get("port")
+    if port:
+        opts += ["-p", str(port)]
+    user = hc.get("user")
+    if user:
+        opts += ["-l", str(user)]
+    payload = shlex.quote(_timeout_wrap(cmd, timeout))
+    return "ssh " + " ".join(opts) + " " + host + " " + payload
+
+
+async def _run_hop(
+    host: str,
+    cmd: str,
+    timeout: int,
+    stdin: str | None,
+) -> asyncssh.SSHCompletedProcess:
+    """Run one command on a hop host, by running `ssh <node> '<cmd>'` on the
+    bastion connection.
+
+    Two semantics differ from the direct/bastion path on purpose:
+    - exit code 255 is ssh-on-the-bastion's own failure (auth, host key,
+      hostname resolution, ControlPersist denial), not the command's — it
+      is turned into HopSSHError carrying ssh's stderr, because "exit_code:
+      255" alone tells the caller nothing about which of those it was;
+    - a *remote* timeout (124/137) is ssh's exit status once the nested
+      `timeout` fires, so it maps to RemoteTimeout just like the local path.
+    """
+    async with _bastion_lock:
+        bastion = await _ensure_bastion()
+    async with _hop_sem:
+        process = await bastion.create_process(
+            hop_ssh_command(host, cmd, timeout), input=stdin, errors="replace"
+        )
+        try:
+            result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
+        except asyncio.TimeoutError:
+            await _kill_process(process)
+            raise RemoteTimeout(timeout) from None
+    if result.returncode == 255:
+        detail = (result.stderr or "").strip() or "(no stderr)"
+        raise HopSSHError(
+            f"ssh to {host} on the bastion failed: {detail}"
+        )
+    if result.returncode in (124, 137):
+        raise RemoteTimeout(timeout)
+    return result
+
+
 async def run(
     host: str,
     cmd: str,
     timeout: int = 60,
     stdin: str | None = None,
 ) -> asyncssh.SSHCompletedProcess:
-    sem = _sems.setdefault(host, asyncio.Semaphore(8))
-    wrapped = _timeout_wrap(cmd, timeout)
-
     async def _run_once() -> asyncssh.SSHCompletedProcess:
         conn = await get_target(host)
+        sem = _sems.setdefault(host, asyncio.Semaphore(8))
         async with sem:
-            process = await conn.create_process(wrapped, input=stdin, errors="replace")
+            process = await conn.create_process(
+                _timeout_wrap(cmd, timeout), input=stdin, errors="replace"
+            )
             try:
                 # The remote `timeout` above is the real enforcement; this is
                 # only a backstop in case the channel itself wedges, so it's
@@ -327,6 +465,24 @@ async def run(
             if result.returncode in (124, 137):
                 raise RemoteTimeout(timeout)
             return result
+
+    if _route(host) == "hop":
+        # Only the bastion connection can be stale here, so a retry just
+        # reconnects it (prompting for TOTP again). A HopSSHError is an ssh
+        # *auth/config* failure against the node and is deliberately NOT in
+        # the retry clause below — retrying a known-bad credential risks an
+        # account lockout and cannot fix a host key mismatch.
+        try:
+            return await _run_hop(host, cmd, timeout, stdin)
+        except TimeoutError:
+            raise  # bastion connect_timeout expired; see the local path below
+        except asyncssh.PermissionDenied:
+            raise  # bastion auth rejected; never retry (lockout / TOTP again)
+        except HopSSHError:
+            raise
+        except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
+            _invalidate_bastion()
+            return await _run_hop(host, cmd, timeout, stdin)
 
     try:
         return await _run_once()

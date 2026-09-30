@@ -1,6 +1,8 @@
 # 部署指南
 
-方案是"架构 A"：`daemon.py` 常驻在你的 Windows 本机上，跳板机和内网目标 Linux 机器上**不需要安装任何东西**，你的 SSH 私钥也始终留在本机，不会上传到跳板机或目标机。
+方案是"架构 A"：`daemon.py` 常驻在你的 Windows 本机上，跳板机和内网目标 Linux 机器上**不需要安装任何东西**，你自己的 SSH 私钥也始终留在本机，不会上传到跳板机或目标机。
+
+（唯一的例外是 `via = "hop"` 节点：这种节点本来就只有跳板机能免密登录，私钥在跳板机上而不是本机——daemon 不去碰这把私钥，只是让跳板机用它自己已有的 ssh 配置代跑命令，详见第 3、4 节。）
 
 ## 1. 本机环境
 
@@ -64,7 +66,7 @@ copy config.example.toml config.toml
 notepad config.toml
 ```
 
-`config.toml` 里的节点分两类，用每个 `[host.x]` 段的 `via` 字段区分（省略 `via` 时默认是 `"bastion"`）：
+`config.toml` 里的节点分三类，用每个 `[host.x]` 段的 `via` 字段区分（省略 `via` 时默认是 `"bastion"`）：
 
 ```toml
 [bastion]
@@ -85,6 +87,14 @@ allowed = ["dev1", "lab3", "lab4"]   # 允许访问的目标机白名单，支�
 [host.dev1]
 user        = "<远端用户名>"
 default_cwd = "<远端家目录>"   # exec/read_file/grep/glob_files/write_file/edit_file 的默认工作目录
+# hop 节点：目标机只有跳板机能免密登录，本机没有它的私钥（比如某些计算节点，私钥一直
+# 留在跳板机上）。daemon 不会给这种节点开一条直连的隧道，而是让跳板机自己代跑
+# `ssh <节点名> '<命令>'`，即执行的是跳板机上的 ssh，不是本机的。
+[host.nmz01]
+via         = "hop"
+user        = "<远端用户名>"          # 选填：跳板机 ssh 到 nmz01 时用的 -l；留空则用跳板机自己的 ~/.ssh/config
+port        = 22                    # 选填：跳板机 ssh 到 nmz01 时用的 -p；留空同上
+default_cwd = "<远端家目录>"
 # 直连节点（密钥认证）：不经过跳板机，daemon 直接和这台机器的 sshd 建立连接
 [host.lab3]
 via         = "direct"
@@ -118,15 +128,17 @@ default_cwd = "<远端家目录>"
 | `hosts.allowed` | 目标机白名单，防止误操作连到没打算连的机器 |
 | `host.<name>.user` | 该目标机上的登录用户名 |
 | `host.<name>.default_cwd` | 该目标机的默认工作目录；`exec` 的 `cwd` 参数、`read_file`/`grep`/`glob_files`/`write_file`/`edit_file` 的相对路径参数，都会以这个目录为基准解析 |
-| `host.<name>.via` | 省略或 `"bastion"`：通过跳板机连接（原有行为不变）。`"direct"`：daemon 直接连这台机器，不经过跳板机、不占用跳板机连接 |
-| `host.<name>.address` | **仅 direct 节点需要**：这台机器的地址（域名或 IP）。bastion 路由的节点不需要这个字段（直接用节点名当主机名，交给跳板机解析），如果误填了会在启动时打印警告并忽略 |
-| `host.<name>.port` | 仅 direct 节点：SSH 端口，默认 22 |
-| `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion 路由的节点固定用密钥登录，不支持这个字段 |
+| `host.<name>.via` | 省略或 `"bastion"`：通过跳板机连接（原有行为不变）。`"direct"`：daemon 直接连这台机器，不经过跳板机、不占用跳板机连接。`"hop"`：这台机器只有跳板机能免密登录，daemon 没有它的私钥；每次操作都是让跳板机自己执行 `ssh <节点名> '<命令>'`，命令实际跑在跳板机的 ssh 进程里 |
+| `host.<name>.address` | **仅 direct 节点需要**：这台机器的地址（域名或 IP）。bastion / hop 路由的节点不需要这个字段（直接用节点名当主机名，交给跳板机或跳板机上的 ssh 解析），如果误填了会在启动时打印警告并忽略 |
+| `host.<name>.port` | direct 节点：SSH 端口，默认 22。hop 节点：选填，跳板机 ssh 到目标机时用的 `-p`；留空则由跳板机自己的 `~/.ssh/config` 或 ssh 默认值决定 |
+| `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion / hop 路由的节点固定用密钥登录（且密钥都不在本机——bastion 路由是跳板机隧道到目标机时用本机私钥，hop 路由是跳板机自己的私钥），不支持这个字段 |
 | `host.<name>.key` / `cert` | 仅 direct + `auth="key"`：私钥路径（和可选的 OpenSSH 用户证书路径）。留空时的回退顺序是 `[host.x] key` → `[bastion] key` → 本机默认密钥对（`~/.ssh/id_*`） |
 | `host.<name>.password` | 仅 direct + `auth="password"`：留空则 daemon 启动时用 `getpass` 交互提示输入（提示里会带上节点名），不会明文出现在配置文件里；如果填了，daemon 只会用这一份密码尝试一次，认证失败不重试（避免触发远端账号锁定策略），也绝不会出现在日志、错误信息或 `list_hosts` 输出里 |
 | `host.<name>.known_hosts` | 选填，direct 节点：一个 `known_hosts` 文件路径，用来校验目标机的 host key。direct 节点不在跳板机后面，建议至少对密码认证的 direct 节点配置这个字段；留空则不校验（等同现在 bastion 路由节点的行为） |
 
 **注意**：`<远端家目录>` 因集群而异，不一定是 `/home/<远端用户名>`（有的集群是 `/public/home/<远端用户名>` 这类形式）。请在远端执行 `echo $HOME` 确认后原样填入 `default_cwd`，写错会导致所有相对路径解析到不存在的目录。
+
+`via = "hop"` 节点如果同时填了 `address`/`password`/`auth`/`key`/`cert`，daemon 启动时会打印警告并忽略这些字段——它们属于"daemon 直接连这台机器"的场景，hop 节点从头到尾都是跳板机在连，本机根本用不上这些字段。没有配置 `[bastion]` 却给某个节点写了 `via = "hop"` 是致命配置错误，daemon 会在启动时直接报错退出。
 
 ## 4. 密钥部署
 
@@ -146,6 +158,14 @@ daemon 用同一对本机私钥分别认证跳板机和目标机（目标机认�
 跳板机额外要求开启 TOTP（keyboard-interactive）登录——这个通常是跳板机侧已有的策略，本文档不涉及配置它，只是 daemon 在连接时会走这个交互流程。
 
 **direct 节点（`via = "direct"`，`auth = "key"`）同样要把公钥放到这台机器自己的 `authorized_keys`，路径同上——`<远端家目录>/.ssh/authorized_keys`（这台机器登录账号自己的家目录）。因为 direct 节点不经过跳板机，这一步是这台机器独立要做的，和跳板机、其它节点的 `authorized_keys` 互不影响。密码认证的 direct 节点（`auth = "password"`）不需要这一步。**
+
+**hop 节点（`via = "hop"`）完全不涉及本机密钥**——本机既没有、也不需要它的私钥。需要的是跳板机自己能免密 `ssh` 到这台机器：私钥放在跳板机上（不是本机），且跳板机上已经把它的公钥加进了这台机器的 `authorized_keys`。这套配置通常是集群内网已经有的（跳板机到计算节点互信），本项目不负责生成或分发这把私钥。部署前建议登录跳板机手动自检一次：
+
+```bash
+ssh -o BatchMode=yes nmz01 hostname
+```
+
+能直接打印出 `nmz01` 的 hostname、不弹密码或密钥口令提示，才说明 daemon 这边能正常工作；如果这一步本身就卡住或报错，要先在跳板机上把它解决，而不是去改 daemon 的配置。
 
 ## 5. 启动 daemon
 
@@ -190,10 +210,11 @@ url = "http://127.0.0.1:8765/mcp"
 
 daemon 启动、TOTP 输入完成后，依次验证：
 
-1. **`list_hosts`**：确认跳板机状态是 `connected`，`configured hosts` 里能看到 `dev1`。
-2. **`exec(host="dev1", command="pwd")`**：预期返回该节点的 `default_cwd`（即 `<远端家目录>`，因为没传 `cwd` 参数时 `exec` 会先 `cd` 进 `default_cwd` 再执行命令）。
+1. **`list_hosts`**：确认跳板机状态是 `connected`，`configured hosts` 里能看到 `dev1`；hop 节点会显示成 `hop via bastion`，连接状态跟着跳板机走（跳板机 `connected` 时它也是 `connected`，不是单独一条连接）。
+2. **`exec(host="dev1", command="pwd")`**：预期返回该节点配置的 `default_cwd`（即 `<远端家目录>`，因为没传 `cwd` 参数时 `exec` 会先 `cd` 进 `default_cwd` 再执行命令）。
 3. **`read_file(host="dev1", path="一个已知存在的文件")`**：确认能读到内容，行号格式正确。
 4. 如果要验证路径解析的一致性，可以试 `exec(host="dev1", command="ls some_dir")` 之后再 `read_file(host="dev1", path="some_dir/some_file")`——两者应该指向同一个文件。
+5. 配置了 hop 节点的话，额外用它跑一遍 `exec`/`read_file`/`write_file`/`edit_file`——这几个工具对 hop 节点的外部行为应该和 bastion 节点完全一致，区别只在内部是跳板机代跑 ssh 还是 daemon 自己直连/打隧道。
 
 ## 8. 排障
 
@@ -207,6 +228,9 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | TOTP 输错 / 认证失败 | 直接在 daemon 窗口按 Ctrl+C 退出重新 `uv run daemon.py`；不需要额外清理状态 |
 | 直连密码错误或被锁 | 交互输入的密码连续错 3 次，或配置文件里 `password` 字段本身就是错的，daemon 会打印提示并跳过这台机器，不阻塞启动；确认密码正确后重新 `uv run daemon.py`，或者手动调用 `reset_connections` 后重试该节点。如果远端账号已经因为多次失败被锁，需要先在目标机上解锁（这不是本工具能处理的） |
 | direct 节点连不上 | 先确认 `config.toml` 里这个节点的 `address`/`port` 正确、网络可达（`Test-NetConnection <address> -Port <port>`）；direct 节点不经过跳板机，所以跳板机状态正常不代表 direct 节点能连上。密钥认证失败会报 `PermissionDenied`，检查公钥是否已经放到这台机器的 `authorized_keys`（见第 4 节）；网络不可达或超时只在启动时打印警告，不影响其它节点，下一次调用这个节点时会按需重连并把真正的错误返回 |
+| hop 节点报 `ssh to <节点> on the bastion failed: ...`（对应 ssh 退出码 255） | 说明跳板机上的 `ssh <节点名>` 本身失败了，跟 daemon/本机配置无关，daemon 也不会重试这类失败。先登录跳板机手动跑 `ssh -o BatchMode=yes <节点名> hostname` 复现：常见原因是跳板机上没有这台机器的私钥、这台机器的 `authorized_keys` 没加跳板机的公钥、host key 变了，或者 `user`/`port` 填得跟跳板机 `~/.ssh/config` 里的不一致 |
+| `ConfigError: [host.x] via="hop" 有 ... 需要 [bastion] 段` | hop 节点必须有 `[bastion]` 配置（所有命令都要经跳板机代跑）；补上 `[bastion]`，或者如果这台机器本机能直连，改成 `via = "direct"` |
+| hop 节点并发调用偶尔失败、或报跟 session 数量有关的错误 | 所有 hop 节点共用同一条跳板机连接，daemon 对全部 hop 流量合计限制了 8 个并发 session（留给跳板机自己 sshd `MaxSessions` 一点余量）；如果同时有大量 hop 调用在跑，属于预期的排队等待，不是错误 |
 
 ## 9. 远端机器的要求
 

@@ -247,8 +247,8 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
 <!-- ════════════════════════════════════════════════════════ -->
 <h1>Remote Linux MCP Gateway</h1>
 <div class="doc-meta">
-  <span>设计文档 v1.1</span>
-  <span>2026-09-28（新增直连节点）</span>
+  <span>设计文档 v1.2</span>
+  <span>2026-09-30（新增 hop 路由）</span>
   <span>状态：设计完成，待开发</span>
 </div>
 
@@ -257,7 +257,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
   <ol>
     <li><a href="#background">背景与目标</a></li>
     <li><a href="#arch">整体架构</a></li>
-    <li><a href="#bastion">连接方案：跳板机与直连</a></li>
+    <li><a href="#bastion">连接方案：跳板机、直连与 hop</a></li>
     <li><a href="#tools">MCP 工具 API</a></li>
     <li><a href="#lifecycle">连接生命周期</a></li>
     <li><a href="#security">安全策略</a></li>
@@ -283,6 +283,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
   <li>跳板机：标准 sshd，允许 TCP 转发，登录需要 TOTP 验证码</li>
   <li>目标机：密钥认证，无需 TOTP</li>
   <li>直连节点：一部分机器不走跳板机，本机可以直接通过 <code>ip:port</code> 访问，用户名加密码或密钥/证书登录（见 3.4）</li>
+  <li>hop 节点：一部分机器（多为计算节点）本机从没拿到过私钥，只有跳板机能免密登录，靠跳板机代跑 <code>ssh &lt;节点&gt;</code> 访问（见 3.5）</li>
   <li>Windows 本机：无 ControlMaster 支持（Windows OpenSSH 限制）</li>
   <li>远端机器不能安装任何东西</li>
   <li>需要同时支持 CC 和 Codex 两个客户端</li>
@@ -455,7 +456,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
 <!--  3. BASTION                                             -->
 <!-- ════════════════════════════════════════════════════════ -->
 <section class="section" id="bastion">
-<h2>3. 连接方案：跳板机与直连</h2>
+<h2>3. 连接方案：跳板机、直连与 hop</h2>
 
 <h3>3.1 TOTP 认证交互</h3>
 <p>asyncssh 的 <code>kbdint_challenge_received</code> 回调在跳板机发来 keyboard-interactive 挑战时触发。Daemon 进程在启动时占用一个 PowerShell 窗口，TOTP 提示出现在该窗口，用户输入后连接建立，此后不再需要。</p>
@@ -635,8 +636,48 @@ async def get_target(host):
   <li><strong>主机名</strong>：bastion 路由仍然直接用节点名作为连接的主机名，即 <code>用户名@节点名</code>，由跳板机解析，不引入 <code>address</code>。direct 路由的 <code>address</code> 是必填项，缺失时 Daemon 启动阶段就报错。</li>
   <li><strong>其余机制通用</strong>：Semaphore(8)、host 锁、远端 <code>timeout</code> 包装、connection_made/lost 身份比较、<code>reset_connections</code>、路径解析规则，直连节点全部沿用。<code>reset_connections</code> 之后，直连节点用缓存的密码静默重连，不会重新提示。</li>
   <li><strong>缺少 [bastion] 段</strong>：如果某个 bastion 路由的节点被使用，但配置文件里根本没有 <code>[bastion]</code> 段，连接池会抛出清晰的 <code>ConfigError</code>（"no [bastion] section is configured..."），而不是原始的 <code>KeyError</code>。</li>
-  <li><strong>list_hosts</strong>：每个节点显示路由（<code>bastion</code> / <code>direct address:port</code>）、认证方式和连接状态。</li>
+  <li><strong>list_hosts</strong>：每个节点显示路由（<code>bastion</code> / <code>direct address:port</code> / <code>hop via bastion</code>）、认证方式和连接状态。</li>
 </ul>
+</section>
+
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  3.5 HOP ROUTE                                          -->
+<!-- ════════════════════════════════════════════════════════ -->
+<section class="section" id="hop">
+<h3>3.5 hop 路由（跳板机代跑 ssh）</h3>
+<p>还有一类节点，本机既到不了（不在同一网段），<code>tunnel=</code> 那套转发也不适用——因为本机上根本没有它的私钥。典型场景是计算节点：只有跳板机能免密登录它，用的私钥一直留在跳板机上，本机从没拿到过、也不需要拿到。人工运维的做法是先登录跳板机，再在跳板机自己的 shell 里执行 <code>ssh &lt;节点&gt;</code>。</p>
+<p>于是新增第三种路由 <code>via = "hop"</code>：Daemon 不尝试建立到这台节点的独立连接，而是把每一条操作都翻译成一段命令，在<strong>已经常驻的跳板机连接上</strong>执行，由跳板机上的 <code>ssh</code> 客户端再去连这台节点。跳板机连接的唯一性和 TOTP 输入时机都没变化。</p>
+
+<h4>执行的命令形态</h4>
+<p>每次操作等价于在跳板机上执行：</p>
+<pre><code>ssh -o BatchMode=yes -o ControlMaster=auto \
+    -o ControlPath=~/.ssh/remote-mcp-%C -o ControlPersist=10m \
+    [-p &lt;port&gt;] [-l &lt;user&gt;] &lt;节点名&gt; '&lt;被 timeout 包裹的命令&gt;'</code></pre>
+<ul>
+  <li><code>ControlMaster=auto</code> + <code>ControlPath</code>：复用跳板机到这台节点之间的 SSH 连接，避免每次操作都重新做一次密钥/主机密钥校验。路径里用 <code>%C</code> 而不是手写主机名——<code>%C</code> 是 ssh 根据本机主机名、远端主机名、端口、用户算出的定长哈希，能保证 <code>ControlPath</code> 不会因为拼接出来的绝对路径过长而超过 AF_UNIX socket 的长度上限。</li>
+  <li><code>BatchMode=yes</code>：禁止一切交互式提示（密码、密钥口令、host key 确认）。跳板机没有终端可供应答，任何提示都会变成挂起，所以必须在协议层面直接禁掉；真的缺密钥或 host key 不对时，ssh 会以非零状态退出，而不是卡住。</li>
+  <li><code>-p</code> / <code>-l</code> 只在配置里写了 <code>port</code>/<code>user</code> 时才加。都不写的话，跳板机自己的 <code>~/.ssh/config</code>（或 ssh 默认值）说了算——这也意味着跳板机上已有的 <code>Host &lt;节点名&gt;</code> 配置能直接生效。</li>
+  <li>命令参数只多包一层引号：内层 <code>shlex.quote()</code> 把整段脚本包成一个参数交给目标节点的 shell（和 bastion 路由的 <code>bash -c</code> 用的是同一个 helper），外层再 <code>shlex.quote()</code> 一次以通过跳板机 shell 的解析；ssh 拿到的是一个已经成形的字符串，会原样转发给目标节点的 sshd。跳板机 shell 解一层、目标机 shell 跑剩下的，正好两层，不多不少。</li>
+  <li><code>timeout</code>、<code>cwd</code> 前缀、stdin 透传全部复用现有 helper：远端仍然是 <code>timeout -k 5 N bash -c '...'</code>，退出码 124/137 仍然解释为超时。</li>
+  <li>ssh 自身失败（退出码 255：密钥不对、host key 变了、目标不可达等）包装成专门的 <code>HopSSHError</code> 抛出，错误信息带上 stderr，明确指出问题在跳板机这一侧的 ssh 上，而不是 daemon 的配置。</li>
+</ul>
+
+<h4>并发控制</h4>
+<p>所有 hop 节点共用<strong>同一条</strong>跳板机连接，而跳板机 sshd 的 <code>MaxSessions</code> 默认是 10。因此并发限制不能按节点各算一份——那样 N 个 hop 节点会各自跑到 8，合计远超 10。改成一个模块级的 <code>_hop_sem = asyncio.Semaphore(8)</code>，全部 hop 流量合计共享这一个信号量，而不是在节点级信号量之外再叠加一层。跳板机连接本身仍受既有的 <code>_bastion_lock</code> 保护。</p>
+
+<h4>文件类工具</h4>
+<p><code>exec</code>/<code>read_file</code>/<code>grep</code>/<code>glob_files</code> 本来就只是拼 shell 命令再走 <code>run()</code>，<code>run()</code> 认识 hop 路由之后它们自动就能用，不需要任何改动。<code>write_file</code>/<code>edit_file</code> 则不然——它们走的是 SFTP，而 hop 节点压根没有可供 <code>start_sftp_client()</code> 的连接。做法是按路由分派到两个等价实现，而不是复制两套工具：</p>
+<ul>
+  <li><strong>读</strong>：一条命令先按 <code>-L</code>/<code>readlink -f</code> 解析软链接（对齐 <code>_sftp_real_path</code>），再输出权限位和 base64 编码的文件内容，一次往返同时拿到内容和 <code>mode</code>。用 base64 而不是直接 <code>cat</code>，是因为 <code>create_process</code> 按文本（<code>errors="replace"</code>）解码 stdout，非 UTF-8 字节会被破坏。</li>
+  <li><strong>写</strong>：内容 base64 编码后经 stdin 送过去，远端 <code>base64 -d</code> 写进同目录的临时文件，再 <code>chmod</code> + <code>mv -f</code> 落位——和 SFTP 版本的 <code>posix_rename</code> 一样是原子的。不传 <code>mode</code> 时沿用目标文件现有权限、新文件按 644，与 <code>_atomic_write</code> 一致；<code>edit_file</code> 会把读阶段拿到的 <code>mode</code> 传回来精确保持。</li>
+  <li><strong>路径语义</strong>：直接复用 <code>_cd_prefix()</code>/<code>_quote_cd_path()</code>，命令在 shell 里先 <code>cd</code> 到 <code>default_cwd</code>，所以相对路径、<code>~</code>、<code>~/...</code> 的展开方式和 <code>exec</code>/<code>read_file</code> 完全一致，不需要再实现一套 SFTP 式的绝对路径解析。</li>
+</ul>
+
+<h4>重连与错误处理</h4>
+<p>hop 节点在池里没有自己的条目（<code>get_target()</code> 遇到 hop 路由直接抛 <code>ConfigError</code>，防止误用 SFTP）。跳板机断线后，下一次调用按既有逻辑重连，TOTP 照常重新提示。断线重试前会先调用 <code>_invalidate_bastion()</code> 清掉旧的跳板机连接引用及所有非直连的目标连接，否则重试会捡起那个已经死了、<code>connection_lost</code> 还没跑完的旧对象。退出码 255 与 <code>HopSSHError</code> 都<strong>不</strong>重试——密钥/配置类错误重试没有意义。网络类异常（<code>ConnectionLost</code>/<code>DisconnectError</code>/<code>OSError</code>）才重连一次。直接的 hop 连接、每个节点自己的 host 锁、<code>reset_connections</code> 的行为都不变。</p>
+
+<h4>配置与校验</h4>
+<p>hop 节点如果同时写了 <code>address</code>/<code>password</code>/<code>auth</code>/<code>key</code>/<code>cert</code>，这些字段属于“Daemon 直连这台机器”的场景，对 hop 路由没有意义，启动时打印警告并忽略。没有配置 <code>[bastion]</code> 段却写了 <code>via = "hop"</code> 是致命的启动错误——所有命令都必须经跳板机代跑，没有跳板机就无从谈起。<code>list_hosts</code> 里这类节点显示为 <code>hop via bastion</code>，连接状态跟随跳板机连接（它本来就没有自己的连接）。</p>
 </section>
 
 <!-- ════════════════════════════════════════════════════════ -->
@@ -803,6 +844,11 @@ default_cwd = "&lt;远端家目录&gt;"
 user        = "user"
 default_cwd = "/workspace"
 
+[host.nmz01]            # hop 节点：私钥只在跳板机上，完整字段见 3.5
+via         = "hop"
+user        = "&lt;远端用户名&gt;"
+default_cwd = "&lt;远端家目录&gt;"
+
 [host.lab3]            # 直连节点，完整字段见 3.4
 via         = "direct"
 address     = "192.168.10.23"
@@ -963,6 +1009,11 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
       <td>直连节点密码错误或被锁定</td>
       <td>该节点不可用</td>
       <td>认证失败不自动重试；交互输入的密码在启动时最多允许输错 3 次，写在配置里的密码错误则直接跳过该节点，都不影响其他节点；改好密码后重启 Daemon</td>
+    </tr>
+    <tr>
+      <td>hop 节点全部挤占同一条跳板机连接</td>
+      <td>hop 流量过多时排队，或触及跳板机 sshd 的 <code>MaxSessions</code></td>
+      <td>所有 hop 节点共用一个 <code>Semaphore(8)</code>，不与节点级信号量叠加；跳板机断线只影响 hop/bastion 路由的节点，direct 节点不受影响</td>
     </tr>
     <tr>
       <td>Python 依赖版本冲突</td>

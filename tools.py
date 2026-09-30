@@ -1,3 +1,4 @@
+import base64
 import json
 import posixpath
 import re
@@ -218,6 +219,70 @@ async def _atomic_write(sftp, path: str, content: str) -> None:
         raise
 
 
+# ── hop-routed file ops ─────────────────────────────────────────────────
+# A hop host has no SFTP session (no direct connection to open one on — see
+# pool.get_target's guard), so write_file/edit_file fall back to these
+# command-based equivalents of _atomic_write / the SFTP read+stat above,
+# run through pool.run() the same way exec/read_file/grep/glob_files
+# already do. read_file/grep/glob_files themselves need no hop-specific
+# code at all: they were already shell-command-based (never SFTP), so
+# pool.run()'s route dispatch alone is enough to make them work over hop.
+
+
+async def _hop_read_raw(host: str, path: str) -> tuple[str, int]:
+    """Command-based equivalent of an SFTP stat+read for a hop-routed host:
+    dereference a symlink the same way _sftp_real_path does, then print the
+    file's permission bits followed by its base64-encoded content, so one
+    pool.run() round trip yields both. base64 (rather than a raw cat) keeps
+    non-UTF-8 bytes intact across the trip — pool.run() decodes command
+    stdout with errors="replace", which would otherwise corrupt them."""
+    quoted = _quote_cd_path(path)
+    script = (
+        _cd_prefix(_host_default_cwd(host))
+        + f"if [ -L {quoted} ]; then t=$(readlink -f -- {quoted}); else t={quoted}; fi; "
+        f'if [ ! -e "$t" ]; then exit 3; fi; '
+        f'stat -c %a -- "$t" && base64 -- "$t"'
+    )
+    r = await pool.run(host, script)
+    if r.returncode == 3:
+        raise _RemoteFileNotFound(path)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip()
+        raise RuntimeError(f"hop read failed (exit {r.returncode}): {detail}")
+    mode_line, _, b64_body = r.stdout.partition("\n")
+    content = base64.b64decode(b64_body).decode("utf-8")
+    return content, int(mode_line.strip(), 8)
+
+
+async def _hop_write_raw(host: str, path: str, content: str, mode: int | None = None) -> None:
+    """Command-based equivalent of _atomic_write for a hop-routed host: the
+    content travels as base64 over stdin (so arbitrary bytes/newlines
+    survive the trip), gets base64-decoded into a same-directory tmp file
+    on the node, then chmod+mv makes the write visible atomically. `mode`
+    pins the permission bits (edit_file passes the mode it already read);
+    left unset, the target's current mode is kept, or 644 for a new file —
+    matching _atomic_write exactly."""
+    quoted = _quote_cd_path(path)
+    mode_expr = (
+        f"m={mode:o}; "
+        if mode is not None
+        else 'if [ -e "$t" ]; then m=$(stat -c %a -- "$t"); else m=644; fi; '
+    )
+    script = (
+        _cd_prefix(_host_default_cwd(host))
+        + f"if [ -L {quoted} ]; then t=$(readlink -f -- {quoted}); else t={quoted}; fi; "
+        + mode_expr
+        + 'd=$(dirname -- "$t"); tmp="$d/.mcp.tmp.$$"; '
+        'base64 -d > "$tmp" && chmod "$m" "$tmp" && mv -f "$tmp" "$t"; '
+        'rc=$?; if [ "$rc" -ne 0 ]; then rm -f "$tmp"; fi; exit "$rc"'
+    )
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    r = await pool.run(host, script, stdin=b64)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip()
+        raise RuntimeError(f"hop write failed (exit {r.returncode}): {detail}")
+
+
 @mcp.tool()
 async def list_hosts() -> str:
     """List bastion status, allowed hosts, connected targets, and configured
@@ -245,11 +310,18 @@ async def list_hosts() -> str:
         if route == "direct":
             route_desc = f"direct {hc.get('address', '?')}:{hc.get('port', 22)}"
             auth = hc.get("auth", "key")
+            state = "connected" if not pool._is_closed(pool._target_conns.get(host)) else "disconnected"
+        elif route == "hop":
+            # hop hosts never get their own entry in _target_conns (see
+            # pool.get_target's guard) — every call rides the one bastion
+            # connection, so that's what "connected" reflects here.
+            route_desc = "hop via bastion"
+            auth = "key"
+            state = "connected" if not pool._is_closed(pool._bastion_conn) else "disconnected"
         else:
             route_desc = "bastion"
             auth = "key"
-        conn = pool._target_conns.get(host)
-        state = "connected" if not pool._is_closed(conn) else "disconnected"
+            state = "connected" if not pool._is_closed(pool._target_conns.get(host)) else "disconnected"
         lines.append(f"  {host}: {route_desc}, auth={auth}, {state}")
     return "\n".join(lines)
 
@@ -296,7 +368,8 @@ async def read_file(host: str, path: str, offset: int = 1, limit: int = 2000) ->
 
 @mcp.tool()
 async def write_file(host: str, path: str, content: str) -> str:
-    """Overwrite a remote file atomically via SFTP."""
+    """Overwrite a remote file atomically (via SFTP, or via the bastion for
+    a hop-routed host, which has no SFTP session of its own)."""
     _audit(host, "write_file", path)
 
     async def _do(sftp):
@@ -305,7 +378,10 @@ async def write_file(host: str, path: str, content: str) -> str:
         await _atomic_write(sftp, real_path, content)
 
     try:
-        await pool.with_sftp(host, _do)
+        if pool._route(host) == "hop":
+            await _hop_write_raw(host, path, content)
+        else:
+            await pool.with_sftp(host, _do)
     except ValueError as e:
         return _fmt_error(e, brief=True)
     except Exception as e:
@@ -326,6 +402,35 @@ async def edit_file(
     if old_str == "":
         return "error: old_str must not be empty"
     _audit(host, "edit_file", path)
+
+    if pool._route(host) == "hop":
+        # Two independently-retried pool.run() calls (read, then write)
+        # rather than one compound with_sftp closure, so this doesn't need
+        # the "count" in result idempotency guard below: each call's own
+        # reconnect-and-retry-once logic is already safe on its own, and
+        # there's no single retried unit that could re-apply a successful
+        # write.
+        try:
+            original, file_mode = await _hop_read_raw(host, path)
+            count = original.count(old_str)
+            if count == 0:
+                raise _OldStrNotFound(path)
+            if count > 1 and not replace_all:
+                raise ValueError(
+                    f"old_str appears {count} times; set replace_all=true or provide more context"
+                )
+            updated = original.replace(old_str, new_str)
+            await _hop_write_raw(host, path, updated, mode=file_mode)
+        except ValueError as e:
+            return _fmt_error(e, brief=True)
+        except _RemoteFileNotFound:
+            return f"error: file not found: {path}"
+        except _OldStrNotFound:
+            return f"error: old_str not found in {path}"
+        except Exception as e:
+            return _fmt_error(e)
+        replacements = count if replace_all else 1
+        return f"ok: replaced {replacements} occurrence(s) in {path}"
 
     result: dict = {}
 

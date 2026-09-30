@@ -16,7 +16,7 @@ connect_timeout = 20      # 跳板机 / 目标机建连超时（秒）
 
 [hosts]
 # 允许访问的目标机白名单，支持 fnmatch 通配符；留空表示不限制（生产环境建议显式配置）
-allowed = ["dev1", "lab3", "lab4"]
+allowed = ["dev1", "lab3", "lab4", "nmz01"]
 
 # ── 跳板机路由节点（默认，via 可以省略） ──────────────────────────
 [host.dev1]
@@ -25,6 +25,27 @@ default_cwd = "/home/yourname"    # 相对路径参数的解析基准（远端 L
 # via = "bastion" 是默认值，省略即可；节点名 dev1 本身会作为主机名交给跳板机解析
 # （即 yourname@dev1），认证只用密钥（key / cert，规则同下面的 direct+key 节点），
 # 不支持也不接受 password。
+
+# ── hop 路由节点：这台机器只有跳板机能免密登录，本机没有它的私钥 ─────
+# 典型场景：计算节点（如 nmz01）只在跳板机的 authorized_keys 里加过本机公钥，
+# 私钥则一直留在跳板机上，本机从没拿到过、也不需要拿到——这种节点没法用
+# tunnel= 直连（那需要本机私钥能认证 nmz01），只能让跳板机自己代跑
+# `ssh nmz01 '<命令>'`，daemon 在跳板机上执行这条命令，而不是在本机上转发端口。
+[host.nmz01]
+via         = "hop"
+user        = "yourname"          # 可选：跳板机 ssh 到 nmz01 时用的 -l 用户名；
+                                   # 留空则交给跳板机自己的 ~/.ssh/config 或 ssh 默认值决定
+# port      = 22                  # 可选：跳板机 ssh 到 nmz01 时用的 -p 端口；同上，留空则用默认/~/.ssh/config
+default_cwd = "/home/yourname"    # 远端 Linux 路径，语义和其它节点一致
+# 部署前提（在跳板机上准备，不是在本机）：
+#   1. nmz01 的私钥已经放在跳板机上，且跳板机能免密 ssh 到 nmz01——
+#      这通常是跳板机侧已有的集群内网配置，本项目不负责生成或分发这把私钥。
+#   2. 自检：登录跳板机后手动跑一次
+#        ssh -o BatchMode=yes nmz01 hostname
+#      能直接打印 nmz01 的 hostname、不弹密码/密钥口令提示，才说明这里能正常工作；
+#      如果卡住或报错，先在跳板机上把这一步跑通，再回来用这个 daemon。
+# hop 节点不支持 address/password/auth/key/cert——这些字段属于"daemon 直接连这台机器"
+# 的场景，hop 节点从头到尾都是跳板机在连，填了会在启动时打印警告并被忽略。
 
 # ── 直连节点 + 密钥认证（可选 OpenSSH 用户证书） ───────────────────
 [host.lab3]

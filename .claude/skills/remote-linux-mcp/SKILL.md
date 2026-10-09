@@ -154,6 +154,8 @@ default_cwd = "<远端家目录>"
   - 起长时间服务用 `setsid nohup <命令> > <日志> 2>&1 < /dev/null &`（日志写在工作目录里）；不要用 `docker exec -d`，包装本身已经是一层 docker exec。
   - `exec` 超时只会杀跳板机上的 ssh/docker 客户端，容器里已起的前台进程不一定被杀。
   - 容器不存在/没运行时，docker 的错误（`No such container` / `is not running`，退出码 125/126/127）会作为普通命令失败返回，不会重试；容器里需要 `bash`、`stat`、`readlink`、`base64`、`timeout`。
+  - 容器属于某一台节点：`node` 必须填容器所在的那台，`docker ps -a` 要在对应节点上查（先对宿主机节点 `exec` 一次 `docker ps -a --format '{{.ID}}|{{.Names}}|{{.Status}}'` 确认）。已退出的容器不能 `docker exec`，需用户自己 `docker start`，不要替用户启动。`container` 优先填容器名，ID 在重建后会变。
+- 跳板机本身不能配成 hop 节点：hop 是让跳板机再 `ssh` 一跳，而跳板机通常只接受密码/验证码，不接受密钥，BatchMode 下会失败。需要在跳板机上执行命令时目前没有对应路由，不要用 `ssh localhost` 凑。
 - 新加的节点记得同时加进 `[hosts] allowed`。
 - 用密钥登录的机器（跳板机、目标机、direct+key 节点）都要把本机公钥追加到对方登录账号的 `~/.ssh/authorized_keys`（即 `<远端家目录>/.ssh/authorized_keys`），并设置 `chmod 700 ~/.ssh`、`chmod 600 ~/.ssh/authorized_keys`。
 
@@ -241,6 +243,9 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | `not in the allowed list` | 把节点加进 `[hosts] allowed` |
 | `ConfigError: no [bastion] section` | 该节点走跳板机但没配 `[bastion]`；补上，或改成 `via = "direct"`。hop 节点同理——没配 `[bastion]` 时写 `via = "hop"` 是启动致命错误 |
 | hop 节点报 `ssh to <节点> on the bastion failed: ...` | 跳板机上 `ssh <节点名>` 本身失败（对应 ssh 退出码 255），daemon 不重试。登录跳板机手动跑 `ssh -o BatchMode=yes <节点名> hostname` 复现：常见是跳板机缺该机器的私钥、目标机 `authorized_keys` 没加跳板机公钥、host key 变了，或 `user`/`port` 与跳板机 `~/.ssh/config` 不一致 |
+| 在跳板机上手动 `ssh -o BatchMode=yes <节点名> hostname` 报 `Host key verification failed` | 只是 known_hosts 里没有该主机；改用 `-o StrictHostKeyChecking=accept-new` 跑一次记住即可，之后才能看到真正的认证结果 |
+| 在跳板机上手动 ssh 报 `Permission denied (gssapi...,password,keyboard-interactive)`，列表里没有 `publickey` | 该主机不接受密钥登录，hop 路由走不通（跳板机自己就是这种情况） |
+| 容器节点报 `No such container: <名>` | 容器不在 `node` 指向的这台机器上，或已重建换了 ID；对宿主机节点跑 `docker ps -a` 核对，改 `container`/`node` 后重启 daemon |
 | `PermissionDenied` | 密钥没加进对方 `authorized_keys`、权限不对，或密码错误；认证失败不会重试，改好后 `reset_connections` 或重启 daemon |
 | 连接超时 | `Test-NetConnection <地址> -Port <端口>` 检查可达性，必要时调大 `connect_timeout` |
 | 端口被占用 | 改 `[daemon] port`，同步更新客户端 URL |

@@ -1002,6 +1002,9 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
 
 <h3>多跳板机</h3>
 <p>暂不支持并列多台跳板机；改动方案见仓库里的 <code>TODO.md</code>，此处不展开。</p>
+
+<h3>待办：局域网访问</h3>
+<p>目前 daemon 固定只监听 <code>127.0.0.1</code>，也没有认证，所以只有本机能用。计划增加 <code>[daemon] host</code>（默认 <code>127.0.0.1</code>，可指定 <code>0.0.0.0</code>）和 <code>[daemon] api_key</code>（<code>Authorization: Bearer</code> 校验）；绑定非回环地址而没配 key 时拒绝启动。HTTP 明文传输的限制和客户端接入写法见 <code>TODO.md</code>，实现后再并入正文。</p>
 </section>
 
 <!-- ════════════════════════════════════════════════════════ -->

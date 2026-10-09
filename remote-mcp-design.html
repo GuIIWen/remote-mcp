@@ -247,7 +247,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
 <!-- ════════════════════════════════════════════════════════ -->
 <h1>Remote Linux MCP Gateway</h1>
 <div class="doc-meta">
-  <span>设计文档 v1.2</span>
+  <span>设计文档 v1.3</span>
   <span>2026-09-30（新增 hop 路由）</span>
   <span>状态：设计完成，待开发</span>
 </div>
@@ -678,6 +678,16 @@ async def get_target(host):
 
 <h4>配置与校验</h4>
 <p>hop 节点如果同时写了 <code>address</code>/<code>password</code>/<code>auth</code>/<code>key</code>/<code>cert</code>，这些字段属于“Daemon 直连这台机器”的场景，对 hop 路由没有意义，启动时打印警告并忽略。没有配置 <code>[bastion]</code> 段却写了 <code>via = "hop"</code> 是致命的启动错误——所有命令都必须经跳板机代跑，没有跳板机就无从谈起。<code>list_hosts</code> 里这类节点显示为 <code>hop via bastion</code>，连接状态跟随跳板机连接（它本来就没有自己的连接）。</p>
+
+<h4>容器模式</h4>
+<p>hop 节点可以进一步让命令在目标节点的 docker 容器里执行：在 <code>[host.x]</code> 里加 <code>container</code> 即可，其余路由逻辑不变。</p>
+<ul>
+  <li><strong>字段</strong>：<code>node</code>（选填，跳板机实际 ssh 的目标，省略则等于段名）；<code>container</code>（容器名或 ID 前缀，设了就进入容器模式）；<code>container_user</code>（选填，<code>docker exec -u</code> 的值，省略则不传 <code>-u</code>）。段名仍是 MCP 里使用的节点名，也是 <code>[hosts] allowed</code> 匹配的名字；缓存、锁、信号量都按段名区分，所以多个段可以共用同一个 <code>node</code>、各配不同容器。<code>user</code> 的含义不变，仍是跳板机 ssh 到 <code>node</code> 的 <code>-l</code>，与 <code>container_user</code> 是两个不同字段。<code>default_cwd</code> 和所有路径参数此时是容器内路径。</li>
+  <li><strong>命令包装结构</strong>：先把原命令包成 <code>docker exec -i [-u &lt;container_user&gt;] &lt;container&gt; bash -c &lt;shlex.quote(原命令)&gt;</code>，再交给 <code>_timeout_wrap</code>，最后按原有方式 <code>shlex.quote</code> 后交给 ssh。超时包装仍在最外层，覆盖整个 <code>docker exec</code>。必须用 <code>-i</code>（<code>write_file</code>/<code>edit_file</code> 经 stdin 传 base64 内容），不能加 <code>-t</code>。<code>cd_prefix</code> 以及 <code>_hop_read_raw</code>/<code>_hop_write_raw</code> 的脚本都是原命令的一部分，自然在容器里执行，不需要改动；容器里除 <code>bash</code>、<code>stat -c</code>、<code>readlink -f</code>、<code>base64</code>、<code>timeout</code> 之外没有新增依赖。ssh 的 ControlPath 等选项不变。</li>
+  <li><strong>校验</strong>：<code>container</code>/<code>container_user</code> 都做 <code>shlex.quote</code>，启动校验还把字符集限制为字母、数字、<code>.</code>、<code>_</code>、<code>-</code>（且不以 <code>-</code> 开头，避免被当成 docker 选项），不合法是致命配置错误。<code>node</code>/<code>container</code>/<code>container_user</code> 在非 hop 路由下配置会打印警告并忽略；<code>container_user</code> 没配 <code>container</code> 同样警告。</li>
+  <li><strong>限制</strong>：① 退出码 255 的处理不变；容器不存在或没运行时，docker 返回 125/126/127，或在 stderr 打印 <code>No such container</code>/<code>is not running</code>，这些作为普通命令失败（非零退出码加 stderr）返回，不新增重试。② 每次 <code>exec</code> 都是新 shell，<code>cd</code> 不保留，用 <code>default_cwd</code> 或 <code>cwd</code> 参数。③ 起长时间服务用 <code>setsid nohup ... &gt; 日志 2&gt;&amp;1 &lt; /dev/null &amp;</code>，不要用 <code>docker exec -d</code>（包装本身已经是一层 docker exec）。④ 超时只会杀跳板机上的 ssh/docker 客户端，容器里已起的前台进程不一定被杀。⑤ 跳板机上的 ssh 用户必须能在 <code>node</code> 上直接运行 <code>docker</code>。</li>
+  <li><strong>list_hosts</strong>：容器节点显示为 <code>hop via bastion → docker:&lt;容器名&gt;</code>，有 <code>container_user</code> 时后面带 <code>(-u &lt;container_user&gt;)</code>。</li>
+</ul>
 </section>
 
 <!-- ════════════════════════════════════════════════════════ -->

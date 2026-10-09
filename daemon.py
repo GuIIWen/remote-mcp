@@ -1,5 +1,6 @@
 import asyncio
 import getpass
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,10 @@ CONFIG_PATH = Path(__file__).parent / "config.toml"
 
 PASSWORD_RETRIES = 3
 
+# container / container_user charset (docker names, plus a numeric uid is fine);
+# no leading "-" so the value can never be parsed as a docker option.
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
+
 
 def _validate_config(cfg: dict) -> None:
     """Check [host.x] fields that must be right before anything connects.
@@ -26,6 +31,13 @@ def _validate_config(cfg: dict) -> None:
     errors: list[str] = []
     for host, hc in cfg.get("host", {}).items():
         via = hc.get("via", "bastion")
+        if via != "hop":
+            hop_only = [f for f in ("node", "container", "container_user") if hc.get(f)]
+            if hop_only:
+                print(
+                    f"warning: [host.{host}] 只有 via=\"hop\" 才支持 {', '.join(hop_only)} 字段，将被忽略",
+                    flush=True,
+                )
         if via == "direct":
             if not hc.get("address"):
                 errors.append(f"[host.{host}] via=\"direct\" 需要配置 address")
@@ -40,6 +52,19 @@ def _validate_config(cfg: dict) -> None:
                 print(
                     f"warning: [host.{host}] via=\"hop\" 时 {', '.join(ignored)} 字段会被忽略"
                     "（命令直接由跳板机上的 ssh 发起，用的是跳板机自己的密钥和 known_hosts）",
+                    flush=True,
+                )
+            for f in ("container", "container_user"):
+                # These end up inside a shlex.quote()d docker command, but
+                # restrict the charset anyway (docker names are [A-Za-z0-9_.-]).
+                v = hc.get(f)
+                if v and not (isinstance(v, str) and _SAFE_NAME_RE.match(v)):
+                    errors.append(
+                        f"[host.{host}] {f} 只能包含字母、数字、. _ -（且不能以 - 开头），当前是 {v!r}"
+                    )
+            if hc.get("container_user") and not hc.get("container"):
+                print(
+                    f"warning: [host.{host}] 配置了 container_user 但没有 container，将被忽略",
                     flush=True,
                 )
         else:

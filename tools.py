@@ -316,6 +316,10 @@ async def list_hosts() -> str:
             # pool.get_target's guard) — every call rides the one bastion
             # connection, so that's what "connected" reflects here.
             route_desc = "hop via bastion"
+            if hc.get("container"):
+                route_desc += f" → docker:{hc['container']}"
+                if hc.get("container_user"):
+                    route_desc += f" (-u {hc['container_user']})"
             auth = "key"
             state = "connected" if not pool._is_closed(pool._bastion_conn) else "disconnected"
         else:

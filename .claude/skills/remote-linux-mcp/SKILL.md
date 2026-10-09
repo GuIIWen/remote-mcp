@@ -88,6 +88,9 @@ Copy-Item config.example.toml config.toml
 | `[host.<名字>] user` | 目标机登录用户名 |
 | `[host.<名字>] default_cwd` | 远端默认工作目录，相对路径都以它为基准 |
 | `[host.<名字>] via` | 省略或 `"bastion"` 走跳板机；`"hop"` 走跳板机代跑 ssh（目标机私钥只在跳板机上）；`"direct"` 直连 |
+| `node` | 仅 hop，选填：跳板机实际 ssh 的目标；省略则等于段名 |
+| `container` | 仅 hop，选填：容器名或 ID 前缀，设了就用 `docker exec -i` 在容器里执行；字符集限字母、数字、`.`、`_`、`-` |
+| `container_user` | 仅 hop 且已配 `container`，选填：`docker exec -u` 的值，省略不传；与 `user` 不同 |
 | `address` / `port` | 仅 direct：目标地址（必填）和端口（默认 22）；hop 的 `port` 选填，是跳板机 ssh 到目标机时用的 `-p`，留空交给跳板机自己的 `~/.ssh/config` |
 | `auth` | 仅 direct：`"key"`（默认）或 `"password"` |
 | `key` / `cert` | 私钥 / OpenSSH 用户证书路径；key 回退顺序：`[host.x] key` → `[bastion] key` → 默认密钥对（hop 节点不适用——它用的是跳板机自己的密钥，不是本机的） |
@@ -114,6 +117,15 @@ default_cwd = "<远端家目录>"
 # ssh 到 nmz01。自检：登录跳板机后跑 `ssh -o BatchMode=yes nmz01 hostname`，
 # 能直接打印 hostname、不弹密码/口令提示，才说明这里能正常工作。
 
+# hop + 容器：命令在 nmz01 的 docker 容器里执行；段名是 MCP 里的节点名（也要加进 allowed）
+[host.nmz01-ctr]
+via            = "hop"
+node           = "nmz01"            # 选填：跳板机实际 ssh 的目标；省略则等于段名
+user           = "<远端用户名>"      # 跳板机 ssh 到 node 的 -l（不是容器内用户）
+container      = "<容器名>"
+container_user = "root"             # 选填：docker exec -u
+default_cwd    = "/workspace/proj"  # 容器内路径
+
 # 直连 + 密钥（或证书）
 [host.lab3]
 via         = "direct"
@@ -137,6 +149,11 @@ default_cwd = "<远端家目录>"
 
 - 所有节点都是直连时，删掉整个 `[bastion]` 段，启动时就不会连跳板机、不会要 TOTP。但只要有一个 hop 节点，`[bastion]` 就是必需的。
 - hop 节点不能用 `get_target` 那条直连路径，但 `exec`/`read_file`/`write_file`/`edit_file`/`grep`/`glob_files` 这几个工具对它的用法和 bastion 节点完全一样。
+- hop 容器节点（配了 `container`）：命令被包成 `docker exec -i [-u <容器用户>] <容器名> bash -c ...` 在容器里跑，`default_cwd` 和所有路径都是容器内路径。使用要点：
+  - 每次 `exec` 都是新 shell，`cd` 不会保留；用 `default_cwd` 或 `cwd` 参数指定目录。
+  - 起长时间服务用 `setsid nohup <命令> > <日志> 2>&1 < /dev/null &`（日志写在工作目录里）；不要用 `docker exec -d`，包装本身已经是一层 docker exec。
+  - `exec` 超时只会杀跳板机上的 ssh/docker 客户端，容器里已起的前台进程不一定被杀。
+  - 容器不存在/没运行时，docker 的错误（`No such container` / `is not running`，退出码 125/126/127）会作为普通命令失败返回，不会重试；容器里需要 `bash`、`stat`、`readlink`、`base64`、`timeout`。
 - 新加的节点记得同时加进 `[hosts] allowed`。
 - 用密钥登录的机器（跳板机、目标机、direct+key 节点）都要把本机公钥追加到对方登录账号的 `~/.ssh/authorized_keys`（即 `<远端家目录>/.ssh/authorized_keys`），并设置 `chmod 700 ~/.ssh`、`chmod 600 ~/.ssh/authorized_keys`。
 

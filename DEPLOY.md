@@ -95,6 +95,14 @@ via         = "hop"
 user        = "<远端用户名>"          # 选填：跳板机 ssh 到 nmz01 时用的 -l；留空则用跳板机自己的 ~/.ssh/config
 port        = 22                    # 选填：跳板机 ssh 到 nmz01 时用的 -p；留空同上
 default_cwd = "<远端家目录>"
+# hop + 容器：命令在 nmz01 的 docker 容器里执行；段名 nmz01-ctr 是 MCP 里的节点名（也要写进 allowed）
+[host.nmz01-ctr]
+via            = "hop"
+node           = "nmz01"            # 选填：跳板机实际 ssh 的目标；省略则等于段名
+user           = "<远端用户名>"      # 跳板机 ssh 到 node 的 -l（不是容器内用户）
+container      = "<容器名>"          # 容器名或 ID 前缀
+container_user = "root"             # 选填：docker exec -u；省略则不传
+default_cwd    = "/workspace/proj"  # 容器内路径
 # 直连节点（密钥认证）：不经过跳板机，daemon 直接和这台机器的 sshd 建立连接
 [host.lab3]
 via         = "direct"
@@ -129,6 +137,9 @@ default_cwd = "<远端家目录>"
 | `host.<name>.user` | 该目标机上的登录用户名 |
 | `host.<name>.default_cwd` | 该目标机的默认工作目录；`exec` 的 `cwd` 参数、`read_file`/`grep`/`glob_files`/`write_file`/`edit_file` 的相对路径参数，都会以这个目录为基准解析 |
 | `host.<name>.via` | 省略或 `"bastion"`：通过跳板机连接（原有行为不变）。`"direct"`：daemon 直接连这台机器，不经过跳板机、不占用跳板机连接。`"hop"`：这台机器只有跳板机能免密登录，daemon 没有它的私钥；每次操作都是让跳板机自己执行 `ssh <节点名> '<命令>'`，命令实际跑在跳板机的 ssh 进程里 |
+| `host.<name>.node` | 仅 hop 节点，选填：跳板机实际 `ssh` 的目标主机名；省略则等于段名。缓存、锁、并发限制仍按段名区分，所以多个段可以共用同一个 `node`（各配不同容器） |
+| `host.<name>.container` | 仅 hop 节点，选填：容器名或 ID 前缀；设了就用 `docker exec -i` 在该容器里执行命令，`default_cwd` 变为容器内路径。字符集限字母、数字、`.`、`_`、`-` |
+| `host.<name>.container_user` | 仅 hop 节点且已配 `container`，选填：`docker exec -u` 的值；省略则不传 `-u`。与 `user`（跳板机 ssh 到 node 的 `-l`）是两个不同字段 |
 | `host.<name>.address` | **仅 direct 节点需要**：这台机器的地址（域名或 IP）。bastion / hop 路由的节点不需要这个字段（直接用节点名当主机名，交给跳板机或跳板机上的 ssh 解析），如果误填了会在启动时打印警告并忽略 |
 | `host.<name>.port` | direct 节点：SSH 端口，默认 22。hop 节点：选填，跳板机 ssh 到目标机时用的 `-p`；留空则由跳板机自己的 `~/.ssh/config` 或 ssh 默认值决定 |
 | `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion / hop 路由的节点固定用密钥登录（且密钥都不在本机——bastion 路由是跳板机隧道到目标机时用本机私钥，hop 路由是跳板机自己的私钥），不支持这个字段 |
@@ -139,6 +150,8 @@ default_cwd = "<远端家目录>"
 **注意**：`<远端家目录>` 因集群而异，不一定是 `/home/<远端用户名>`（有的集群是 `/public/home/<远端用户名>` 这类形式）。请在远端执行 `echo $HOME` 确认后原样填入 `default_cwd`，写错会导致所有相对路径解析到不存在的目录。
 
 `via = "hop"` 节点如果同时填了 `address`/`password`/`auth`/`key`/`cert`，daemon 启动时会打印警告并忽略这些字段——它们属于"daemon 直接连这台机器"的场景，hop 节点从头到尾都是跳板机在连，本机根本用不上这些字段。没有配置 `[bastion]` 却给某个节点写了 `via = "hop"` 是致命配置错误，daemon 会在启动时直接报错退出。
+
+**hop 容器模式**：hop 节点配了 `container` 后，所有工具的命令都改为在目标节点的 docker 容器里执行（跳板机上实际跑的是 `ssh <node> 'timeout ... docker exec -i [-u <容器用户>] <容器名> bash -c <命令>'`）。要求：跳板机上的 ssh 用户在 `<node>` 上能直接运行 `docker`（无需 sudo），容器里有 `bash`、`stat`、`readlink`、`base64`、`timeout`（coreutils）。此时 `default_cwd` 和所有路径参数都是**容器内**路径。`node`/`container`/`container_user` 只在 `via = "hop"` 时有效，其它路由配了会打印警告并忽略；`container_user` 没配 `container` 同样警告；`container`/`container_user` 含字母、数字、`.`、`_`、`-` 以外的字符（或以 `-` 开头）是致命配置错误。容器不存在或没运行时，docker 的报错（`No such container` / `is not running`，退出码 125/126/127）会作为普通命令失败原样返回，daemon 不重试；`exec` 超时只会终止跳板机上的 ssh/docker 客户端，容器里已起的前台进程不一定被杀。
 
 ## 4. 密钥部署
 

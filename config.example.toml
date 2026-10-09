@@ -47,6 +47,21 @@ default_cwd = "/home/yourname"    # 远端 Linux 路径，语义和其它节点�
 # hop 节点不支持 address/password/auth/key/cert——这些字段属于"daemon 直接连这台机器"
 # 的场景，hop 节点从头到尾都是跳板机在连，填了会在启动时打印警告并被忽略。
 
+# ── hop 路由 + docker 容器：命令在目标节点的容器里执行 ───────────────
+# 段名（nmz01-ctr）是 MCP 里使用的节点名，也是 [hosts] allowed 匹配的名字；
+# 跳板机实际 ssh 的目标由 node 决定，所以同一个 node 上可以有多个段对应不同容器。
+[host.nmz01-ctr]
+via            = "hop"
+node           = "nmz01"          # 可选：跳板机实际 ssh 的目标；省略则等于段名
+user           = "yourname"       # 仍然是跳板机 ssh 到 node 用的 -l（不是容器内用户）
+container      = "mycontainer"    # 容器名或 ID 前缀；设了就用 docker exec -i 在容器里执行
+                                   # 只允许字母、数字、. _ -（且不以 - 开头），否则启动报错
+# container_user = "root"         # 可选：docker exec -u 的值；省略则不传 -u（用镜像默认用户）
+default_cwd    = "/workspace/proj" # 注意：此时是【容器内】路径
+# 前提：跳板机上的 ssh 用户能在 node 上直接运行 docker（无需 sudo），且容器里有 bash、
+# coreutils（stat/readlink/base64/timeout）。container/node/container_user 只在 via="hop" 时有效，
+# 其它路由配了会打印警告并被忽略。别忘了把 nmz01-ctr 加进上面 [hosts] allowed。
+
 # ── 直连节点 + 密钥认证（可选 OpenSSH 用户证书） ───────────────────
 [host.lab3]
 via         = "direct"                      # 不经过跳板机，直接连 address:port

@@ -388,8 +388,25 @@ def hop_ssh_command(host: str, cmd: str, timeout: int) -> str:
     the hop handshake and the remote command together: if the node is
     unreachable the client-side wait_for (timeout + 15) fires and the
     process gets terminated, exactly as for a direct/bastion host.
+
+    Container mode ([host.x] container = "..."): `cmd` is first wrapped as
+    `docker exec -i [-u <container_user>] <container> bash -c <cmd>` and
+    *that* is what _timeout_wrap then wraps, so the timeout stays outermost
+    and covers the whole docker exec. -i (never -t) keeps stdin flowing for
+    write_file/edit_file's base64 payload and avoids a pty mangling output.
+    The ssh target is the `node` field (default: the section name), so
+    several sections can point at one node with different containers —
+    everything else (cache, locks, semaphores) stays keyed by section name.
     """
     hc = cfg.get("host", {}).get(host, {})
+    node = hc.get("node") or host
+    container = hc.get("container")
+    if container:
+        docker = "docker exec -i "
+        container_user = hc.get("container_user")
+        if container_user:
+            docker += "-u " + shlex.quote(str(container_user)) + " "
+        cmd = docker + shlex.quote(str(container)) + " bash -c " + shlex.quote(cmd)
     opts = ["-o", "BatchMode=yes", "-o", "ControlMaster=auto",
             "-o", f"ControlPath=~/.ssh/remote-mcp-%C",
             "-o", "ControlPersist=10m"]
@@ -400,7 +417,7 @@ def hop_ssh_command(host: str, cmd: str, timeout: int) -> str:
     if user:
         opts += ["-l", str(user)]
     payload = shlex.quote(_timeout_wrap(cmd, timeout))
-    return "ssh " + " ".join(opts) + " " + host + " " + payload
+    return "ssh " + " ".join(opts) + " " + node + " " + payload
 
 
 async def _run_hop(

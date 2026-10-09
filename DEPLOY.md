@@ -198,6 +198,18 @@ daemon 启动时会立即连接跳板机，并在**这个窗口**里提示输入
 
 **如果配置了 direct + `auth = "password"` 的节点，且对应的 `password` 字段留空，daemon 启动过程中还会额外弹出一次或多次密码提示**（提示文字里带节点名，比如 `[lab4] password:`），同样在这个窗口里输入，输入不回显。这一步和跳板机的 TOTP 提示是独立的、顺序发生的（先处理密码节点，再连跳板机），都发生在同一次 `uv run daemon.py` 启动过程中。如果交互输入的密码连续错误达到 3 次，或者配置文件里写的密码本身就是错的，daemon 会打印一条提示、跳过这台机器，不会阻塞其它节点或跳板机的启动；也不会因为个别 direct 节点一时连不上（网络不通/超时）而卡住启动——这种情况只打印警告，等第一次调用这个节点时再按需重连。
 
+### 配置热更（reload_config）
+
+`config.toml` 只在启动时读一次；运行中改了 `[host.*]` / `[hosts]`（加节点、改白名单、改字段），调用 MCP 工具 `reload_config`（无参数）即可生效，不用重启 daemon：
+
+- 重新读取并校验 `config.toml`。文件不存在、TOML 语法错、校验报错时，保留旧配置不变，返回错误信息。
+- 成功时返回摘要：新增的节点、删除的节点、配置变化的节点、白名单是否变化，以及校验产生的警告。
+- 被删除或有变化的节点，缓存的连接和状态会被关闭，下次调用按新配置重建；没变化的节点连接保持不动。跳板机连接不会因热更断开，也不会再要 TOTP。
+- `[bastion]` / `[daemon]` 不会被热更应用（继续沿用启动时的值），有变化时返回里会提示需要重启 daemon。
+- `password` 留空的 direct + `auth = "password"` 节点：热更时不会弹提示（工具调用里没有终端），返回里会点名“需要重启 daemon 后输入密码”；重启前调用该节点会以空密码认证并报 `PermissionDenied`。密码写在配置文件里的节点则直接生效。
+- `reset_connections` 只是断开重连，不会重新读配置。
+- 安全：`reload_config` 对客户端开放，客户端如果能编辑 `config.toml`，就能自行放宽 `[hosts] allowed`。
+
 ## 6. 接入 Claude Code / Codex
 
 **Claude Code：**
@@ -236,6 +248,7 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | 启动后 daemon 窗口没有 TOTP 提示，卡住不动 | 检查 `config.toml` 里 `bastion.host`/`port`/`user` 是否正确；也可能是网络不通，等到 `connect_timeout` 秒后会报错退出，而不是一直卡着——如果一直卡着超过这个时间还没反应，说明连接本身没有建立（比如端口被防火墙拦截），检查网络连通性 |
 | 连接超时（`connect_timeout` 报错） | 检查跳板机地址/端口是否可达（`Test-NetConnection <host> -Port 22`）；如果跳板机本身响应慢，适当调大 `config.toml` 里的 `connect_timeout` |
 | 报错提示 `MaxSessions` 相关，或者并发调用工具时偶尔失败 | sshd 默认限制单条连接最多 10 个并发 channel，daemon 对每台目标机限制了 8 个并发（留 2 个余量给 SFTP），如果还是触发，检查是不是有其它进程也在用同一条连接，或联系跳板机管理员确认 `MaxSessions` 配置 |
+| 改了 `config.toml` 但没生效 | 调用 `reload_config`（`[host.*]` / `[hosts]` 不用重启）；改 `[bastion]` / `[daemon]` 或需要交互输入密码的节点要重启 daemon |
 | 报错 `Host '...' is not in the allowed list` | `config.toml` 的 `[hosts] allowed` 白名单里没有这台机器，按需加上（支持 `fnmatch` 通配符），或者确认没有手滑写错主机名 |
 | daemon 启动报端口被占用 | `config.toml` 里的 `daemon.port` 和本机其它程序冲突，改成一个空闲端口，同时同步更新 `claude mcp add` / Codex 里配置的 URL |
 | TOTP 输错 / 认证失败 | 直接在 daemon 窗口按 Ctrl+C 退出重新 `uv run daemon.py`；不需要额外清理状态 |

@@ -156,7 +156,7 @@ default_cwd = "<远端家目录>"
   - 容器不存在/没运行时，docker 的错误（`No such container` / `is not running`，退出码 125/126/127）会作为普通命令失败返回，不会重试；容器里需要 `bash`、`stat`、`readlink`、`base64`、`timeout`。
   - 容器属于某一台节点：`node` 必须填容器所在的那台，`docker ps -a` 要在对应节点上查（先对宿主机节点 `exec` 一次 `docker ps -a --format '{{.ID}}|{{.Names}}|{{.Status}}'` 确认）。已退出的容器不能 `docker exec`，需用户自己 `docker start`，不要替用户启动。`container` 优先填容器名，ID 在重建后会变。
 - 跳板机本身不能配成 hop 节点：hop 是让跳板机再 `ssh` 一跳，而跳板机通常只接受密码/验证码，不接受密钥，BatchMode 下会失败。需要在跳板机上执行命令时目前没有对应路由，不要用 `ssh localhost` 凑。
-- 新加的节点记得同时加进 `[hosts] allowed`。
+- 新加的节点记得同时加进 `[hosts] allowed`；改完 `config.toml` 后调用 `reload_config` 即可生效，不用重启 daemon（见第 6 节）。
 - 用密钥登录的机器（跳板机、目标机、direct+key 节点）都要把本机公钥追加到对方登录账号的 `~/.ssh/authorized_keys`（即 `<远端家目录>/.ssh/authorized_keys`），并设置 `chmod 700 ~/.ssh`、`chmod 600 ~/.ssh/authorized_keys`。
 
 填完校验语法（不会打印内容）：
@@ -176,7 +176,7 @@ uv run daemon.py
 
 启动顺序：
 
-1. 校验配置，有错直接退出并列出问题。
+1. 校验配置，有错直接退出并列出问题（启动时读取一次；运行中改 `[host.*]` / `[hosts]` 用 `reload_config`，见第 6 节）。
 2. 对 `password` 留空的密码节点提示 `[lab4] password:`（不回显，最多试 3 次）；配置文件里写的密码只试 1 次，错了跳过该节点。网络不通只警告，不阻塞启动。
 3. 有 `[bastion]` 时连跳板机，提示输入 TOTP。
 4. 出现 `remote-mcp listening on http://127.0.0.1:8765/mcp` 即就绪。
@@ -230,7 +230,16 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | `edit_file` | `host, path, old_str, new_str, replace_all=False` | 精确字符串替换；多处匹配需 `replace_all=True` |
 | `grep` | `host, pattern, path=".", glob="", context=0` | 优先用 rg，否则 `grep -rnE` |
 | `glob_files` | `host, pattern, base="."` | `**` 匹配任意层目录，最多返回 200 条 |
-| `reset_connections` | 无 | 断开所有连接，下次调用重连（跳板机会重新要 TOTP） |
+| `reload_config` | 无 | 重新读取 `config.toml`，整体替换 `[host.*]` / `[hosts]`，不用重启；返回新增/删除/变化的节点、白名单是否变化和警告 |
+| `reset_connections` | 无 | 断开所有连接，下次调用重连（跳板机会重新要 TOTP）；不会重新读配置 |
+
+配置热更（`reload_config`）：
+
+- 改了 `[host.*]` / `[hosts]`（加节点、改白名单、改字段）后调用 `reload_config` 即可，不用重启 daemon。读取或校验失败（文件不存在、TOML 语法错、校验报错）时保留旧配置，返回错误。
+- 被删除或有变化的节点会关闭缓存连接，下次调用按新配置重建；没变化的节点连接不动。`reload_config` 不会断开跳板机，也不会再要 TOTP。
+- 仍需重启 daemon 的情况：改了 `[bastion]` / `[daemon]`（热更不应用，返回里会提示）；新增或改动了 `password` 留空、需要交互输入密码的 direct+password 节点（热更不会提示输入，返回里会点名；重启前调用该节点会以空密码认证并报 `PermissionDenied`）。
+- `reset_connections` 只是断开重连，不会重新读 `config.toml`。
+- `reload_config` 对 Claude 开放：如果 Claude 能编辑 `config.toml`，就能自己放宽 `[hosts] allowed`。这是已知并接受的取舍。
 
 ## 7. 排障
 

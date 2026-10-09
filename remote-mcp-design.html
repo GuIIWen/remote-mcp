@@ -247,8 +247,8 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
 <!-- ════════════════════════════════════════════════════════ -->
 <h1>Remote Linux MCP Gateway</h1>
 <div class="doc-meta">
-  <span>设计文档 v1.3</span>
-  <span>2026-09-30（新增 hop 路由）</span>
+  <span>设计文档 v1.4</span>
+  <span>2026-10-09（新增 reload_config 热更）</span>
   <span>状态：设计完成，待开发</span>
 </div>
 
@@ -260,6 +260,7 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
     <li><a href="#bastion">连接方案：跳板机、直连与 hop</a></li>
     <li><a href="#tools">MCP 工具 API</a></li>
     <li><a href="#lifecycle">连接生命周期</a></li>
+    <li><a href="#reload">配置热更 reload_config</a></li>
     <li><a href="#security">安全策略</a></li>
     <li><a href="#files">文件结构</a></li>
     <li><a href="#deploy">部署与接入</a></li>
@@ -728,6 +729,10 @@ async def get_target(host):
     <div class="tool-desc">用 <code>find</code> 实现，返回最多 200 条路径。</div>
   </div>
   <div class="tool-card">
+    <div class="tool-name">reload_config</div>
+    <div class="tool-desc">重新读取 <code>config.toml</code>，整体替换 <code>[host.*]</code> 与 <code>[hosts]</code>，不用重启。无参数，详见第 5 节。</div>
+  </div>
+  <div class="tool-card">
     <div class="tool-name">reset_connections</div>
     <div class="tool-desc">清空连接池，触发跳板机重连。跳板机重启或 TOTP 过期后使用。</div>
   </div>
@@ -783,6 +788,20 @@ _host_locks:   dict[str, asyncio.Lock]         # host → 该目标机建连时�
 
 <h3>Daemon 崩溃或重启</h3>
 <p>CC 的 MCP 客户端会在工具调用失败后自动重试连接。Daemon 重启后，daemon 启动时会立即触发跳板机重连（再次输 TOTP），目标机连接随后在首次调用时按需重建。</p>
+<h3 id="reload">配置热更：reload_config</h3>
+<p>config.toml 启动时读取一次；运行中改了配置，可由客户端手动调用 <code>reload_config</code>（无参数）生效。只做手动调用，不监视文件。所有工具每次调用都读 <code>pool.cfg</code>，所以整体替换它就能让新节点、新白名单对下一次调用生效。读文件、TOML 解析和 <code>_validate_config</code> 校验抽成 <code>pool.load_config()</code>，启动和热更共用；启动路径的报错格式、退出码和交互输入密码流程不变。</p>
+<ul>
+  <li><strong>范围</strong>：只应用 <code>[host.*]</code> 和 <code>[hosts]</code>。<code>[bastion]</code> / <code>[daemon]</code> 有变化时不应用（沿用启动时的值），返回里提示“需要重启 daemon 才生效”。若沿用旧 <code>[bastion]</code> 会让合并后的配置校验失败（例如新增了 hop 节点而旧配置没有 bastion），整次热更被拒绝。</li>
+  <li><strong>失败保留旧配置</strong>：文件不存在、TOML 语法错、校验报错都不改动 <code>pool.cfg</code>，返回经 <code>_scrub</code> 处理的错误信息。</li>
+  <li><strong>摘要</strong>：返回新增、删除、配置变化的节点，白名单是否变化，以及校验警告；调用同样写入审计日志（只含摘要，不含密码）。</li>
+  <li><strong>缓存与并发</strong>：<code>pool.cfg</code> 用一次赋值整体替换（中间没有 await），并发调用只会看到旧配置或新配置。被删除或变化的节点关闭并移除缓存连接，下次调用按新配置重建；没变化的节点连接不动。跳板机连接和 <code>_hop_sem</code> 不受影响，所以不会再要 TOTP；hop 节点本来就没有自己的连接。</li>
+  <li><strong>密码节点限制</strong>：新增或变化的 direct + <code>auth="password"</code> 节点，配置里写了 <code>password</code> 就直接生效。<code>password</code> 留空时热更无法交互输入（工具调用里没有终端），只在返回里点名“需要重启 daemon 后输入密码”；重启前调用该节点，会以空密码发起认证并得到 <code>PermissionDenied</code>（不会卡住、不重试）。登录字段没变的节点保留启动时输入的密码。</li>
+  <li><code>reset_connections</code> 只断开重连，不会重新读配置。</li>
+</ul>
+<div class="callout warn">
+  <span class="callout-icon">⚠</span>
+  <div><strong>安全：</strong><code>reload_config</code> 对客户端开放，白名单（<code>[hosts] allowed</code>）和节点定义都可以被热更。这意味着客户端如果能编辑 <code>config.toml</code>（例如通过本机文件工具），就能自行放宽白名单后再热更生效。这是有意接受的取舍；需要严格限制时，应限制客户端对 <code>config.toml</code> 的写权限。</div>
+</div>
 </section>
 
 <!-- ════════════════════════════════════════════════════════ -->

@@ -1,9 +1,23 @@
 import asyncio
 import fnmatch
 import getpass
+import re
 import shlex
+import sys
+from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 import asyncssh
+
+CONFIG_PATH = Path(__file__).parent / "config.toml"
+
+# container / container_user charset (docker names, plus a numeric uid is fine);
+# no leading "-" so the value can never be parsed as a docker option.
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
 
 _bastion_conn: asyncssh.SSHClientConnection | None = None
 _target_conns: dict[str, asyncssh.SSHClientConnection] = {}
@@ -29,6 +43,81 @@ class ConfigError(ValueError):
     """Raised for a configuration problem that should abort startup, or (for
     a route/auth mixup discovered later) surface as a clear tool error
     instead of a raw KeyError/AttributeError."""
+
+
+class ConfigLoadError(ConfigError):
+    """config.toml parsed but failed validation. .errors has one string per
+    fatal problem, .warnings the non-fatal notes collected on the way — the
+    caller decides how to report them (startup prints and exits; reload_config
+    returns them and keeps the old config)."""
+
+    def __init__(self, errors: list[str], warnings: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+        self.warnings = warnings
+
+
+def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
+    """Check [host.x] fields that must be right before anything connects.
+    Returns (errors, warnings). A bastion-routed node carrying direct-only
+    fields is just a warning, since those fields are simply ignored rather
+    than causing wrong behavior."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    for host, hc in cfg.get("host", {}).items():
+        via = hc.get("via", "bastion")
+        if via != "hop":
+            hop_only = [f for f in ("node", "container", "container_user") if hc.get(f)]
+            if hop_only:
+                warnings.append(
+                    f"warning: [host.{host}] 只有 via=\"hop\" 才支持 {', '.join(hop_only)} 字段，将被忽略"
+                )
+        if via == "direct":
+            if not hc.get("address"):
+                errors.append(f"[host.{host}] via=\"direct\" 需要配置 address")
+            auth = hc.get("auth", "key")
+            if auth not in ("key", "password"):
+                errors.append(f"[host.{host}] auth 必须是 \"key\" 或 \"password\"，当前是 {auth!r}")
+        elif via == "hop":
+            if not cfg.get("bastion"):
+                errors.append(f"[host.{host}] via=\"hop\" 需要配置 [bastion] 段")
+            ignored = [f for f in ("address", "password", "auth", "key", "cert") if hc.get(f)]
+            if ignored:
+                warnings.append(
+                    f"warning: [host.{host}] via=\"hop\" 时 {', '.join(ignored)} 字段会被忽略"
+                    "（命令直接由跳板机上的 ssh 发起，用的是跳板机自己的密钥和 known_hosts）"
+                )
+            for f in ("container", "container_user"):
+                # These end up inside a shlex.quote()d docker command, but
+                # restrict the charset anyway (docker names are [A-Za-z0-9_.-]).
+                v = hc.get(f)
+                if v and not (isinstance(v, str) and _SAFE_NAME_RE.match(v)):
+                    errors.append(
+                        f"[host.{host}] {f} 只能包含字母、数字、. _ -（且不能以 - 开头），当前是 {v!r}"
+                    )
+            if hc.get("container_user") and not hc.get("container"):
+                warnings.append(
+                    f"warning: [host.{host}] 配置了 container_user 但没有 container，将被忽略"
+                )
+        else:
+            if hc.get("password") or hc.get("address"):
+                warnings.append(
+                    f"warning: [host.{host}] 走 bastion 路由，但配置了 password/address 字段，将被忽略"
+                )
+    return errors, warnings
+
+
+def load_config(path: Path | None = None) -> tuple[dict, list[str]]:
+    """Read, parse and validate config.toml; shared by startup and
+    reload_config. A missing file (OSError) or TOML syntax error
+    (tomllib.TOMLDecodeError) propagates as-is; validation errors raise
+    ConfigLoadError. Returns (cfg, warnings)."""
+    with open(path or CONFIG_PATH, "rb") as f:
+        cfg = tomllib.load(f)
+    errors, warnings = validate_config(cfg)
+    if errors:
+        raise ConfigLoadError(errors, warnings)
+    return cfg, warnings
 
 
 class RemoteTimeout(RuntimeError):
@@ -560,3 +649,76 @@ async def reset_all() -> None:
             except Exception:
                 pass
             _bastion_conn = None
+
+
+_RESTART_SECTIONS = ("bastion", "daemon")
+
+
+def apply_config(new_cfg: dict) -> dict:
+    """Swap cfg for new_cfg (reload_config) and drop the cached state of
+    removed/changed nodes so the next call rebuilds them from the new config.
+
+    [bastion] and [daemon] are only read at startup, so they keep their old
+    values here and are reported in "restart" instead. The swap is a single
+    assignment with no await anywhere in this function, so a concurrent tool
+    call sees either the old cfg or the new one, never a half-filled one.
+    The bastion connection and _hop_sem are never touched (no new TOTP).
+    Raises ConfigLoadError, cfg untouched, if keeping the old [bastion]
+    leaves the merged config invalid (e.g. a new hop node, no bastion)."""
+    global cfg
+    old = cfg
+    merged = dict(new_cfg)
+    restart: list[str] = []
+    for sec in _RESTART_SECTIONS:
+        if old.get(sec) != new_cfg.get(sec):
+            restart.append(sec)
+        if sec in old:
+            merged[sec] = old[sec]
+        else:
+            merged.pop(sec, None)
+    if restart:
+        errors, warnings = validate_config(merged)
+        if errors:
+            raise ConfigLoadError(errors, warnings)
+
+    old_hosts = old.get("host", {})
+    new_hosts = merged.get("host", {})
+    added = sorted(new_hosts.keys() - old_hosts.keys())
+    removed = sorted(old_hosts.keys() - new_hosts.keys())
+    changed = sorted(h for h in new_hosts.keys() & old_hosts.keys() if new_hosts[h] != old_hosts[h])
+    allowed_changed = (
+        old.get("hosts", {}).get("allowed", []) != merged.get("hosts", {}).get("allowed", [])
+    )
+
+    cfg = merged
+    for h in removed + changed:
+        _invalidate_target(h)  # no-op for hop nodes (no entry); never closes the bastion
+    for h in removed:
+        _passwords.pop(h, None)
+    need_password: list[str] = []
+    for h in added + changed:
+        hc = new_hosts[h]
+        if hc.get("via", "bastion") != "direct" or hc.get("auth", "key") != "password":
+            _passwords.pop(h, None)
+        elif hc.get("password"):
+            _passwords[h] = hc["password"]
+        elif (
+            h in changed
+            and h in _passwords
+            and all(old_hosts[h].get(k) == hc.get(k) for k in ("via", "address", "port", "user", "auth"))
+        ):
+            pass  # same login, keep the password typed at startup
+        else:
+            # No terminal inside a tool call, so never prompt here. get_target
+            # will connect with an empty password and get PermissionDenied
+            # (not retried, never blocks); a daemon restart is what fixes it.
+            _passwords.pop(h, None)
+            need_password.append(h)
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "allowed_changed": allowed_changed,
+        "restart": restart,
+        "need_password": need_password,
+    }

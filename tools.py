@@ -578,3 +578,43 @@ async def reset_connections() -> str:
     """Close all SSH connections so they reconnect on next use."""
     await pool.reset_all()
     return "ok: all connections reset"
+
+
+@mcp.tool()
+async def reload_config() -> str:
+    """Re-read config.toml and swap in its [host.*] and [hosts] sections
+    without restarting. [bastion] / [daemon] changes are not applied (restart
+    needed); the bastion connection is untouched. On any read/parse/validation
+    error the old config stays in effect."""
+    try:
+        new_cfg, warnings = pool.load_config()
+        s = pool.apply_config(new_cfg)
+    except pool.ConfigLoadError as e:
+        out = _scrub("error: " + "; ".join(e.errors) + "\n配置未改动，仍在使用旧配置")
+        _audit("-", "reload_config", out.replace("\n", " | "))
+        return out
+    except (OSError, ValueError) as e:  # missing file, tomllib.TOMLDecodeError
+        out = _fmt_error(e) + "\n配置未改动，仍在使用旧配置"
+        _audit("-", "reload_config", out.replace("\n", " | "))
+        return out
+
+    def names(xs: list[str]) -> str:
+        return ", ".join(xs) if xs else "(none)"
+
+    lines = [
+        "ok: config reloaded",
+        f"added: {names(s['added'])}",
+        f"removed: {names(s['removed'])}",
+        f"changed: {names(s['changed'])}",
+        f"allowed: {'changed' if s['allowed_changed'] else 'unchanged'}",
+    ]
+    for sec in s["restart"]:
+        lines.append(f"[{sec}] 有变化，未应用，需要重启 daemon 才生效")
+    for h in s["need_password"]:
+        lines.append(
+            f"[host.{h}] 需要重启 daemon 后输入密码（热更无法交互输入）；在此之前调用该节点会因密码为空而认证失败"
+        )
+    lines += warnings
+    out = _scrub("\n".join(lines))
+    _audit("-", "reload_config", out.replace("\n", " | "))
+    return out

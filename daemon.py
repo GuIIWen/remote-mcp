@@ -1,82 +1,32 @@
 import asyncio
 import getpass
-import re
 import sys
-from pathlib import Path
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 import asyncssh
 
 import pool
 import tools
 
-CONFIG_PATH = Path(__file__).parent / "config.toml"
+CONFIG_PATH = pool.CONFIG_PATH
 
 PASSWORD_RETRIES = 3
 
-# container / container_user charset (docker names, plus a numeric uid is fine);
-# no leading "-" so the value can never be parsed as a docker option.
-_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
 
-
-def _validate_config(cfg: dict) -> None:
-    """Check [host.x] fields that must be right before anything connects.
-    Fatal problems abort startup (non-zero exit); a bastion-routed node
-    carrying direct-only fields is just a warning, since those fields are
-    simply ignored rather than causing wrong behavior."""
-    errors: list[str] = []
-    for host, hc in cfg.get("host", {}).items():
-        via = hc.get("via", "bastion")
-        if via != "hop":
-            hop_only = [f for f in ("node", "container", "container_user") if hc.get(f)]
-            if hop_only:
-                print(
-                    f"warning: [host.{host}] 只有 via=\"hop\" 才支持 {', '.join(hop_only)} 字段，将被忽略",
-                    flush=True,
-                )
-        if via == "direct":
-            if not hc.get("address"):
-                errors.append(f"[host.{host}] via=\"direct\" 需要配置 address")
-            auth = hc.get("auth", "key")
-            if auth not in ("key", "password"):
-                errors.append(f"[host.{host}] auth 必须是 \"key\" 或 \"password\"，当前是 {auth!r}")
-        elif via == "hop":
-            if not cfg.get("bastion"):
-                errors.append(f"[host.{host}] via=\"hop\" 需要配置 [bastion] 段")
-            ignored = [f for f in ("address", "password", "auth", "key", "cert") if hc.get(f)]
-            if ignored:
-                print(
-                    f"warning: [host.{host}] via=\"hop\" 时 {', '.join(ignored)} 字段会被忽略"
-                    "（命令直接由跳板机上的 ssh 发起，用的是跳板机自己的密钥和 known_hosts）",
-                    flush=True,
-                )
-            for f in ("container", "container_user"):
-                # These end up inside a shlex.quote()d docker command, but
-                # restrict the charset anyway (docker names are [A-Za-z0-9_.-]).
-                v = hc.get(f)
-                if v and not (isinstance(v, str) and _SAFE_NAME_RE.match(v)):
-                    errors.append(
-                        f"[host.{host}] {f} 只能包含字母、数字、. _ -（且不能以 - 开头），当前是 {v!r}"
-                    )
-            if hc.get("container_user") and not hc.get("container"):
-                print(
-                    f"warning: [host.{host}] 配置了 container_user 但没有 container，将被忽略",
-                    flush=True,
-                )
-        else:
-            if hc.get("password") or hc.get("address"):
-                print(
-                    f"warning: [host.{host}] 走 bastion 路由，但配置了 password/address 字段，将被忽略",
-                    flush=True,
-                )
+def _report_config(warnings: list[str], errors: list[str]) -> None:
+    """Startup-side reporting of pool.validate_config's result: warnings to
+    stdout, fatal problems to stderr plus a non-zero exit (same output the
+    old in-place validator produced)."""
+    for w in warnings:
+        print(w, flush=True)
     if errors:
         for e in errors:
             print(f"config error: {e}", file=sys.stderr, flush=True)
         sys.exit(1)
+
+
+def _validate_config(cfg: dict) -> None:
+    errors, warnings = pool.validate_config(cfg)
+    _report_config(warnings, errors)
 
 
 async def _prompt_password(loop: asyncio.AbstractEventLoop, host: str) -> str:
@@ -149,10 +99,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    with open(CONFIG_PATH, "rb") as f:
-        cfg = tomllib.load(f)
-
-    _validate_config(cfg)
+    try:
+        cfg, warnings = pool.load_config(CONFIG_PATH)
+    except pool.ConfigLoadError as e:
+        _report_config(e.warnings, e.errors)
+    _report_config(warnings, [])
 
     pool.cfg = cfg
 

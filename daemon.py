@@ -11,6 +11,7 @@ import tools
 CONFIG_PATH = pool.CONFIG_PATH
 
 PASSWORD_RETRIES = 3
+BASTION_RETRIES = 3
 
 
 def _report_config(warnings: list[str], errors: list[str]) -> None:
@@ -91,6 +92,29 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
                 break
 
 
+async def _login_bastion() -> bool:
+    """Startup login to the bastion. A rejected TOTP/password gets retried
+    (up to BASTION_RETRIES total attempts, each one prompting again); any
+    other failure is reported once and not retried. Either way, failure
+    doesn't stop the daemon — the pool reconnects lazily, so the first call
+    that needs the bastion prompts for a code in this terminal."""
+    attempts_left = BASTION_RETRIES
+    while True:
+        try:
+            await pool.get_bastion()
+            return True
+        except asyncssh.PermissionDenied as e:
+            attempts_left -= 1
+            reason = getattr(e, "reason", "") or str(e)
+            if attempts_left <= 0:
+                print(f"[bastion] 认证失败（{reason}），次数已用完，放弃启动时登录", flush=True)
+                return False
+            print(f"[bastion] 认证失败（{reason}），请重新输入，还剩 {attempts_left} 次", flush=True)
+        except Exception as e:
+            print(f"[bastion] 登录失败（{type(e).__name__}: {e}），放弃启动时登录", flush=True)
+            return False
+
+
 def main() -> None:
     if not CONFIG_PATH.exists():
         print(
@@ -126,12 +150,14 @@ def main() -> None:
         await _prepare_password_hosts(cfg, loop)
 
         if b:
-            await pool.get_bastion()
+            logged_in = await _login_bastion()
             print(
                 f"remote-mcp listening on http://127.0.0.1:{port}/mcp\n"
                 f"bastion: {b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}",
                 flush=True,
             )
+            if not logged_in:
+                print("尚未登录，首次需要堡垒机的调用会在此终端要求输入验证码", flush=True)
         else:
             print(
                 f"remote-mcp listening on http://127.0.0.1:{port}/mcp\n"

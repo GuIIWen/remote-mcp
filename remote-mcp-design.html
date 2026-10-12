@@ -544,9 +544,10 @@ async def kbdint_challenge_received(self, name, instructions, lang, prompts):
 <h3>3.3 keepalive 与断线重连</h3>
 <p>跳板机通常会踢掉空闲连接，须在 SSH 层设置保活：</p>
 <pre><code>asyncssh.connect(host,
-    keepalive_interval=30,     # 每 30 秒发一次 keepalive
-    keepalive_count_max=3,     # 连续 3 次不响应才判定断线
+    keepalive_interval=15,     # 每 15 秒发一次 keepalive（[bastion] keepalive_interval，默认值）
+    keepalive_count_max=8,     # 连续 8 次不响应才判定断线（[bastion] keepalive_count_max，默认值）
 )</code></pre>
+<p>SSH 层 keepalive 不算 channel 活动。若跳板机按“channel 无活动”踢人，靠后台心跳（<code>[daemon] heartbeat_interval</code>，默认 60 秒）在已有跳板机连接上开 channel 跑 <code>true</code>；心跳绝不重连，因此不会凭空弹 TOTP。连接断开时 daemon 窗口打印异常、存活时长、空闲时长和分类提示（固定时长上限 / 空闲策略 / 对端主动关闭 / 网络）。</p>
 <p>当工具调用捕获到 <code>ConnectionLost</code> 或 <code>DisconnectError</code> 时，连接池清空所有目标机连接并重试一次。若跳板机本身也断了，Daemon 窗口会再次提示输入 TOTP，也提供一个 <code>reset_connections</code> 工具手动触发。</p>
 
 <h3>3.4 直连节点（不经过跳板机）</h3>
@@ -618,9 +619,8 @@ async def get_target(host):
     if _route(host) == "direct":
         hc = cfg["host"][host]            # 直连节点必须在配置里，且必须有 address
         kwargs = dict(port=hc.get("port", 22), username=hc["user"],
-            known_hosts=hc.get("known_hosts"), keepalive_interval=30,
-            keepalive_count_max=3, connect_timeout=_connect_timeout(),
-            client_factory=lambda: _TargetClient(host))
+            known_hosts=hc.get("known_hosts"), connect_timeout=_connect_timeout(),
+            client_factory=lambda: _TargetClient(host), **_keepalive_kwargs())
         if hc.get("auth", "key") == "password":
             kwargs["password"] = _passwords.get(host, "")
         else:
@@ -1025,7 +1025,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
     <tr>
       <td>跳板机长时间空闲被踢</td>
       <td>连接断开，下次调用触发重连，需再输 TOTP</td>
-      <td><code>keepalive_interval=30</code>；如跳板机仍会踢，可在 Daemon 里加一个后台任务每 5 分钟跑一次无害的 <code>echo keepalive</code></td>
+      <td><code>keepalive_interval=15</code>（默认，可配）；另有后台心跳每 60 秒在已有跳板机连接上开 channel 跑 <code>true</code>（<code>[daemon] heartbeat_interval</code>），断线原因会打印到 daemon 窗口</td>
     </tr>
     <tr>
       <td><code>edit_file</code> 写到一半进程崩溃</td>

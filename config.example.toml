@@ -6,6 +6,8 @@ host = "bastion.example.com"   # 跳板机地址（域名或 IP）
 port = 22
 user = "yourname"              # 你在跳板机上的登录用户名
 key  = ""                      # 私钥路径；留空则用默认密钥对（~/.ssh/id_*）
+# keepalive_interval  = 15     # 可选：SSH 层保活间隔（秒），0 关闭；也用于所有目标机连接。默认 15
+# keepalive_count_max = 8      # 可选：连续多少次保活无响应才判定断线。默认 8
 # 跳板机只支持密钥认证（配合 keyboard-interactive 做 TOTP），不要在这里写 password/address——
 # 写了会在启动时被忽略并打印警告。
 
@@ -13,6 +15,9 @@ key  = ""                      # 私钥路径；留空则用默认密钥对（~/
 port            = 8765   # daemon 监听的本地端口，仅绑定 127.0.0.1
 audit_log       = ""      # 留空则不记录；填绝对路径则写 JSONL 审计日志（不含密码）
 connect_timeout = 20      # 跳板机 / 目标机建连超时（秒）
+# heartbeat_interval = 60 # 可选：每隔多少秒在已有的跳板机连接上开一个真实 channel 跑 `true`，防止跳板机按
+                          # “channel 无活动”踢掉会话（SSH 层保活不算 channel 活动）。0 关闭，默认 60。
+                          # 心跳只用现有连接，绝不会自己重连，所以不会凭空弹出 TOTP。
 
 [hosts]
 # 允许访问的目标机白名单，支持 fnmatch 通配符；留空表示不限制（生产环境建议显式配置）

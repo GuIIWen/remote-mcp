@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import getpass
 import sys
 
@@ -137,7 +138,15 @@ def main() -> None:
                 "no [bastion] configured; every host must use via=\"direct\"",
                 flush=True,
             )
-        await tools.mcp.run_streamable_http_async()
+        # Started only after the initial login (so it can't race the first
+        # TOTP prompt); it never reconnects, see pool.heartbeat_once().
+        heartbeat = asyncio.create_task(pool.heartbeat_loop())
+        try:
+            await tools.mcp.run_streamable_http_async()
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
 
     asyncio.run(_serve())
 

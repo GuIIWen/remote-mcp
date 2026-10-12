@@ -84,6 +84,8 @@ Copy-Item config.example.toml config.toml
 | `[daemon] port` | 本地监听端口，默认 8765，只绑 127.0.0.1 |
 | `[daemon] audit_log` | 审计日志 JSONL 路径，留空不记录 |
 | `[daemon] connect_timeout` | 建连超时（秒），默认 20 |
+| `[daemon] heartbeat_interval` | 选填，默认 60，0 关闭：每隔这么多秒在已有的跳板机连接上开真实 channel 跑 `true`，防“channel 无活动被踢”；只用现有连接，绝不自己重连（不会凭空弹 TOTP） |
+| `[bastion] keepalive_interval` / `keepalive_count_max` | 选填，默认 15 / 8：SSH 层保活间隔（秒，0 关闭）和判定断线的连续无响应次数；跳板机和所有目标机连接共用 |
 | `[hosts] allowed` | 节点白名单，支持 fnmatch 通配符；`[]` 表示不限制（建议填写） |
 | `[host.<名字>] user` | 目标机登录用户名 |
 | `[host.<名字>] default_cwd` | 远端默认工作目录，相对路径都以它为基准 |
@@ -181,7 +183,7 @@ uv run daemon.py
 3. 有 `[bastion]` 时连跳板机，提示输入 TOTP。
 4. 出现 `remote-mcp listening on http://127.0.0.1:8765/mcp` 即就绪。
 
-之后调用 `reset_connections` 或跳板机断线，下一次工具调用会在**这个窗口**再次要求 TOTP，并一直阻塞到输入为止。
+之后调用 `reset_connections` 或跳板机断线，下一次工具调用会在**这个窗口**再次要求 TOTP，并一直阻塞到输入为止。断线时窗口会立即打印原因（`[bastion] connection lost: ...`）并提示下次调用需要验证码；后台心跳只用现有连接，不会自己触发 TOTP 提示。
 
 ## 4. 接入客户端
 
@@ -256,6 +258,7 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | 在跳板机上手动 ssh 报 `Permission denied (gssapi...,password,keyboard-interactive)`，列表里没有 `publickey` | 该主机不接受密钥登录，hop 路由走不通（跳板机自己就是这种情况） |
 | 容器节点报 `No such container: <名>` | 容器不在 `node` 指向的这台机器上，或已重建换了 ID；对宿主机节点跑 `docker ps -a` 核对，改 `container`/`node` 后重启 daemon |
 | `PermissionDenied` | 密钥没加进对方 `authorized_keys`、权限不对，或密码错误；认证失败不会重试，改好后 `reset_connections` 或重启 daemon |
+| 空闲一阵后又要 TOTP | 看 daemon 窗口里的 `[bastion] connection lost: ...` 行（含存活时长、空闲时长和 `hint:`）判断原因：age 是整数时长 = 固定会话上限（心跳无效，只能重登）；idle 是整数时长 = 空闲策略；`exc=None` = 对端主动断开；keepalive/`without a DISCONNECT` = 网络。这些参数只能改 `config.toml` 后重启 daemon |
 | 连接超时 | `Test-NetConnection <地址> -Port <端口>` 检查可达性，必要时调大 `connect_timeout` |
 | 端口被占用 | 改 `[daemon] port`，同步更新客户端 URL |
 

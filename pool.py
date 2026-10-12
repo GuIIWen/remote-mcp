@@ -1,9 +1,12 @@
 import asyncio
+import contextlib
 import fnmatch
 import getpass
 import re
 import shlex
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -64,6 +67,21 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
     than causing wrong behavior."""
     errors: list[str] = []
     warnings: list[str] = []
+    # Optional numeric knobs: absent is fine (defaults apply), present must be
+    # a sane number — a string here would otherwise only blow up at connect time.
+    for sec, key, lo, integer in (
+        ("bastion", "keepalive_interval", 0, False),
+        ("bastion", "keepalive_count_max", 1, True),
+        ("daemon", "heartbeat_interval", 0, False),
+    ):
+        v = cfg.get(sec, {}).get(key)
+        if v is None:
+            continue
+        ok_type = isinstance(v, int) if integer else isinstance(v, (int, float))
+        if isinstance(v, bool) or not ok_type or v < lo:
+            errors.append(
+                f"[{sec}] {key} 必须是 >= {lo} 的{'整数' if integer else '数字'}，当前是 {v!r}"
+            )
     for host, hc in cfg.get("host", {}).items():
         via = hc.get("via", "bastion")
         if via != "hop":
@@ -147,6 +165,201 @@ def _connect_timeout() -> float:
     return cfg.get("daemon", {}).get("connect_timeout", 20)
 
 
+# Keepalive is SSH-layer only (a global request, no channel), so it keeps NAT
+# / firewall state and detects a dead peer but does NOT count as channel
+# activity for a bastion that kicks idle sessions — that's what the
+# application-layer heartbeat below is for. Same knobs for the bastion and
+# every target connection, read from [bastion] (restart-only).
+KEEPALIVE_INTERVAL_DEFAULT = 15
+KEEPALIVE_COUNT_MAX_DEFAULT = 8
+HEARTBEAT_INTERVAL_DEFAULT = 60
+HEARTBEAT_TIMEOUT = 10  # s: one `true` over a fresh channel
+_PROBE_IDLE_AFTER = 120  # s of no channel use before a reused conn is probed
+_PROBE_TIMEOUT = 5  # s
+
+
+def _keepalive_kwargs() -> dict:
+    # tcp_keepalive is deliberately not passed: asyncssh already defaults it
+    # to True (unless ~/.ssh/config says TCPKeepAlive no).
+    b = cfg.get("bastion", {})
+    return dict(
+        keepalive_interval=b.get("keepalive_interval", KEEPALIVE_INTERVAL_DEFAULT),
+        keepalive_count_max=b.get("keepalive_count_max", KEEPALIVE_COUNT_MAX_DEFAULT),
+    )
+
+
+def _heartbeat_interval() -> float:
+    return cfg.get("daemon", {}).get("heartbeat_interval", HEARTBEAT_INTERVAL_DEFAULT)
+
+
+def _log(msg: str) -> None:
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(round(seconds))
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+_ROUND_MINUTES = (5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 1440)
+
+
+def _near_round(seconds: float) -> str | None:
+    """"1h00m00s" if seconds is within a small tolerance of a round number
+    typical for session/idle policies (5m ... 24h), else None."""
+    for m in _ROUND_MINUTES:
+        t = m * 60
+        if abs(seconds - t) <= max(45, t * 0.03):
+            return _fmt_dur(t)
+    return None
+
+
+def _fmt_exc(exc: BaseException | None) -> str:
+    if exc is None:
+        return "clean close (exc=None)"
+    code = getattr(exc, "code", None)
+    detail = f"{type(exc).__name__}" + (f"(code={code})" if code is not None else "")
+    return f"{detail}: {exc}"
+
+
+def classify_drop(
+    exc: BaseException | None,
+    age: float,
+    idle: float,
+    idle_real: float | None = None,
+    local: bool = False,
+) -> list[str]:
+    """Hint lines for a dropped connection, so a fixed-lifetime kick, an idle
+    kick and a plain network drop can be told apart from the log alone.
+    age = seconds since login completed; idle = since the last channel
+    activity of any kind (heartbeat/probe included); idle_real = since the
+    last real tool call (defaults to idle)."""
+    if idle_real is None:
+        idle_real = idle
+    if local:
+        return ["closed by this daemon (reset/invalidate), not a remote drop"]
+    hints: list[str] = []
+    if isinstance(exc, asyncssh.ConnectionLost) and "keepalive" in str(exc).lower():
+        hints.append("keepalive failure: peer/network stopped answering (half-dead link, network drop or silent middlebox drop)")
+    elif exc is None:
+        # asyncssh passes None both for our own close() and for a peer
+        # SSH_MSG_DISCONNECT with code 11 (by application); local closes are
+        # flagged separately, so this is the peer closing on purpose.
+        hints.append("exc=None: peer sent a clean DISCONNECT (by application) — deliberate server-side close, e.g. policy/idle kick, not a network failure")
+    elif isinstance(exc, asyncssh.ConnectionLost):
+        hints.append("connection lost without a DISCONNECT message: TCP closed/reset mid-stream (network, firewall or server dropped the socket)")
+    elif isinstance(exc, asyncssh.DisconnectError):
+        hints.append("server sent DISCONNECT with an error code: deliberate server-side close (see reason)")
+    elif isinstance(exc, OSError):
+        hints.append("OS-level socket error: network or middlebox dropped the TCP flow")
+    r = _near_round(age)
+    if r:
+        hints.append(f"age ~{r} is a round number: looks like a fixed session lifetime limit")
+    r = _near_round(idle_real)
+    if r:
+        hints.append(f"idle since last tool call ~{r} is a round number: looks like an idle-timeout policy")
+        if idle < idle_real / 2:
+            hints.append(f"but channel activity (heartbeat) was only {_fmt_dur(idle)} ago: the policy is not counting heartbeat channels")
+    return hints
+
+
+class _ConnStats:
+    """Per-connection bookkeeping for drop diagnostics (monotonic seconds).
+    last_used: any channel activity (tool calls, heartbeat, probe);
+    last_real: tool calls only."""
+
+    def __init__(self) -> None:
+        self.mark_ready()
+        self.closed_locally = False
+
+    def mark_ready(self) -> None:
+        now = time.monotonic()
+        self.connected_at = self.last_used = self.last_real = now
+        self.connected_wall = datetime.now()
+
+
+_conn_stats: dict = {}  # SSHClientConnection -> _ConnStats; dropped in connection_lost
+
+
+def _touch(*conns, real: bool = True) -> None:
+    """Record channel activity on these connections (None / unknown ones are
+    skipped, so callers don't need to guard)."""
+    now = time.monotonic()
+    for c in conns:
+        s = _conn_stats.get(c)
+        if s is not None:
+            s.last_used = now
+            if real:
+                s.last_real = now
+
+
+@contextlib.contextmanager
+def _in_use(*conns):
+    # Touch on entry and exit: a long-running command keeps the channel busy
+    # in between, so the idle gap must be measured from its end, not start.
+    _touch(*conns)
+    try:
+        yield
+    finally:
+        _touch(*conns)
+
+
+def _in_use_host(host: str, conn):
+    """_in_use for a target; bastion-routed targets are tunneled through the
+    bastion connection, so that one counts as used too."""
+    if _route(host) == "direct":
+        return _in_use(conn)
+    return _in_use(conn, _bastion_conn)
+
+
+def _close_local(conn) -> None:
+    """close() a pooled connection and flag it so connection_lost() doesn't
+    report our own close as a remote drop."""
+    s = _conn_stats.get(conn)
+    if s is not None:
+        s.closed_locally = True
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+async def _ping(conn, timeout: float) -> None:
+    """Open a real channel on conn, run `true`, close it. Raises on any
+    failure (including timeout)."""
+    await asyncio.wait_for(conn.run("true", check=False), timeout)
+
+
+async def _idle_probe_ok(conn, label: str) -> bool:
+    """Before reusing a conn that has sat idle for > _PROBE_IDLE_AFTER, check
+    it is really alive (channel + `true`, _PROBE_TIMEOUT). False means it is
+    half-dead and the caller should invalidate it. Never reconnects itself,
+    and a failure here is swallowed — the caller's normal (re)connect path
+    runs once, so no extra TOTP prompt beyond the one a dead bastion costs
+    anyway."""
+    s = _conn_stats.get(conn)
+    if s is None:
+        return True
+    idle = time.monotonic() - s.last_used
+    if idle < _PROBE_IDLE_AFTER:
+        return True
+    try:
+        await _ping(conn, _PROBE_TIMEOUT)
+    except asyncssh.ChannelOpenError:
+        pass  # the server answered (e.g. MaxSessions full): alive, just busy
+    except Exception as e:
+        _log(f"[{label}] liveness probe after {_fmt_dur(idle)} idle failed ({_fmt_exc(e)}); reconnecting")
+        return False
+    _touch(conn, real=False)
+    return True
+
+
 def _route(host: str) -> str:
     """"bastion" (default) tunnels through the jump host; "direct" connects
     straight to [host.<name>].address and owns its own connection; "hop"
@@ -190,12 +403,39 @@ def _host_client_keys(host: str) -> list:
     return _default_keypairs()
 
 
-class _BastionClient(asyncssh.SSHClient):
+class _TrackedClient(asyncssh.SSHClient):
+    """Shared connect/drop bookkeeping for the bastion and target clients."""
+
+    _label = "?"
+
     def __init__(self):
         self._conn: asyncssh.SSHClientConnection | None = None
+        self._stats = _ConnStats()
 
     def connection_made(self, conn: asyncssh.SSHClientConnection) -> None:
         self._conn = conn
+        _conn_stats[conn] = self._stats
+
+    def auth_completed(self) -> None:
+        # Age counts from a finished login, not from the TCP connect — the
+        # TOTP prompt can take minutes and would skew round-number detection.
+        self._stats.mark_ready()
+
+    def _report_lost(self, exc: Exception | None) -> None:
+        s = _conn_stats.pop(self._conn, None) or self._stats
+        now = time.monotonic()
+        age, idle, idle_real = now - s.connected_at, now - s.last_used, now - s.last_real
+        _log(
+            f"[{self._label}] connection lost: {_fmt_exc(exc)}; "
+            f"connected {s.connected_wall:%H:%M:%S}, alive {_fmt_dur(age)}, "
+            f"idle {_fmt_dur(idle)} (last tool call {_fmt_dur(idle_real)} ago)"
+        )
+        for h in classify_drop(exc, age, idle, idle_real, s.closed_locally):
+            _log(f"[{self._label}]   hint: {h}")
+
+
+class _BastionClient(_TrackedClient):
+    _label = "bastion"
 
     def auth_banner_received(self, msg: str, lang: str) -> None:
         print(msg, end="", flush=True)
@@ -227,12 +467,14 @@ class _BastionClient(asyncssh.SSHClient):
 
     def connection_lost(self, exc: Exception | None) -> None:
         global _bastion_conn
+        self._report_lost(exc)
         # A stale client's callback can arrive after a newer connection has
         # already replaced it in the pool (e.g. this client was pop()'d and
         # reconnected while the old socket's close was still in flight) —
         # only clear the pool entry if it's still this client's connection.
         if _bastion_conn is self._conn:
             _bastion_conn = None
+            _log("[bastion] next call will require a new verification code (TOTP) in this terminal")
             # Only bastion-routed targets are tunneled through this
             # connection — direct nodes have their own socket and must not
             # be dropped just because the bastion went away.
@@ -240,15 +482,14 @@ class _BastionClient(asyncssh.SSHClient):
                 _target_conns.pop(h, None)
 
 
-class _TargetClient(asyncssh.SSHClient):
+class _TargetClient(_TrackedClient):
     def __init__(self, host: str):
+        super().__init__()
         self._host = host
-        self._conn: asyncssh.SSHClientConnection | None = None
-
-    def connection_made(self, conn: asyncssh.SSHClientConnection) -> None:
-        self._conn = conn
+        self._label = f"target {host}"
 
     def connection_lost(self, exc: Exception | None) -> None:
+        self._report_lost(exc)
         if _target_conns.get(self._host) is self._conn:
             _target_conns.pop(self._host, None)
 
@@ -282,10 +523,10 @@ async def _connect_bastion() -> asyncssh.SSHClientConnection:
         username=b["user"],
         client_keys=_bastion_client_keys(),
         known_hosts=None,
-        keepalive_interval=30,
-        keepalive_count_max=3,
         connect_timeout=_connect_timeout(),
+        **_keepalive_kwargs(),
     )
+    _log(f"[bastion] connected {b['user']}@{b['host']}:{b['port']}")
     return conn
 
 
@@ -298,6 +539,10 @@ def _is_closed(conn: asyncssh.SSHClientConnection | None) -> bool:
 async def _ensure_bastion() -> asyncssh.SSHClientConnection:
     """Must be called with _bastion_lock already held."""
     global _bastion_conn
+    if _bastion_conn is not None and not await _idle_probe_ok(_bastion_conn, "bastion"):
+        # Half-dead after a long idle gap: drop it now and reconnect once
+        # below, instead of failing a real command on it first.
+        _invalidate_bastion()
     if _bastion_conn is None:
         _bastion_conn = await _connect_bastion()
     return _bastion_conn
@@ -328,7 +573,9 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
     async with _host_lock(host):
         conn = _target_conns.get(host)
         if conn is not None:
-            return conn
+            if await _idle_probe_ok(conn, f"target {host}"):
+                return conn
+            _invalidate_target(host)
 
         host_cfg = cfg.get("host", {}).get(host, {})
 
@@ -346,10 +593,9 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
                 # "" in config means "don't verify"; asyncssh would treat
                 # an empty string as a file path, so map it to None.
                 known_hosts=host_cfg.get("known_hosts") or None,
-                keepalive_interval=30,
-                keepalive_count_max=3,
                 connect_timeout=_connect_timeout(),
                 client_factory=lambda: _TargetClient(host),
+                **_keepalive_kwargs(),
             )
             if auth == "password":
                 kwargs["password"] = _passwords.get(host, "")
@@ -372,10 +618,9 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
                 tunnel=bastion,
                 client_keys=_host_client_keys(host),
                 known_hosts=None,
-                keepalive_interval=30,
-                keepalive_count_max=3,
                 connect_timeout=_connect_timeout(),
                 client_factory=lambda: _TargetClient(host),
+                **_keepalive_kwargs(),
             )
         _target_conns[host] = conn
         if host not in _sems:
@@ -405,10 +650,7 @@ def _invalidate_target(host: str) -> None:
     dead but hasn't run its connection_lost() callback yet."""
     conn = _target_conns.pop(host, None)
     if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _close_local(conn)
 
 
 def _invalidate_bastion() -> None:
@@ -421,10 +663,7 @@ def _invalidate_bastion() -> None:
     conn = _bastion_conn
     _bastion_conn = None
     if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _close_local(conn)
     for h in [h for h in _target_conns if _route(h) != "direct"]:
         _target_conns.pop(h, None)
 
@@ -529,14 +768,15 @@ async def _run_hop(
     async with _bastion_lock:
         bastion = await _ensure_bastion()
     async with _hop_sem:
-        process = await bastion.create_process(
-            hop_ssh_command(host, cmd, timeout), input=stdin, errors="replace"
-        )
-        try:
-            result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
-        except asyncio.TimeoutError:
-            await _kill_process(process)
-            raise RemoteTimeout(timeout) from None
+        with _in_use(bastion):
+            process = await bastion.create_process(
+                hop_ssh_command(host, cmd, timeout), input=stdin, errors="replace"
+            )
+            try:
+                result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
+            except asyncio.TimeoutError:
+                await _kill_process(process)
+                raise RemoteTimeout(timeout) from None
     if result.returncode == 255:
         detail = (result.stderr or "").strip() or "(no stderr)"
         raise HopSSHError(
@@ -557,17 +797,18 @@ async def run(
         conn = await get_target(host)
         sem = _sems.setdefault(host, asyncio.Semaphore(8))
         async with sem:
-            process = await conn.create_process(
-                _timeout_wrap(cmd, timeout), input=stdin, errors="replace"
-            )
-            try:
-                # The remote `timeout` above is the real enforcement; this is
-                # only a backstop in case the channel itself wedges, so it's
-                # given extra slack (+15s) to let `timeout -k 5` finish first.
-                result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
-            except asyncio.TimeoutError:
-                await _kill_process(process)
-                raise RemoteTimeout(timeout) from None
+            with _in_use_host(host, conn):
+                process = await conn.create_process(
+                    _timeout_wrap(cmd, timeout), input=stdin, errors="replace"
+                )
+                try:
+                    # The remote `timeout` above is the real enforcement; this is
+                    # only a backstop in case the channel itself wedges, so it's
+                    # given extra slack (+15s) to let `timeout -k 5` finish first.
+                    result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
+                except asyncio.TimeoutError:
+                    await _kill_process(process)
+                    raise RemoteTimeout(timeout) from None
             if result.returncode in (124, 137):
                 raise RemoteTimeout(timeout)
             return result
@@ -620,8 +861,9 @@ async def with_sftp(host: str, func):
     async def _attempt():
         conn = await get_target(host)
         async with sem:
-            async with conn.start_sftp_client() as sftp:
-                return await func(sftp)
+            with _in_use_host(host, conn):
+                async with conn.start_sftp_client() as sftp:
+                    return await func(sftp)
 
     try:
         return await _attempt()
@@ -638,17 +880,64 @@ async def reset_all() -> None:
     global _bastion_conn
     async with _bastion_lock:
         for conn in list(_target_conns.values()):
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_local(conn)
         _target_conns.clear()
         if _bastion_conn is not None:
-            try:
-                _bastion_conn.close()
-            except Exception:
-                pass
+            _close_local(_bastion_conn)
             _bastion_conn = None
+
+
+async def heartbeat_once() -> bool | None:
+    """One heartbeat: a real channel (`true`) on the *existing* bastion
+    connection, to count as channel activity for a bastion that kicks
+    sessions idle on channels (SSH keepalives don't). Returns True/False for
+    ok/failed, None if there was no bastion to ping.
+
+    Never reconnects: a new bastion login means a TOTP prompt, which must
+    only ever happen because a user call needed it. Uses the connection
+    object directly and not _bastion_lock, so it can neither queue behind
+    nor starve a real call (a login in progress isn't in _bastion_conn yet,
+    so it is skipped too). A failed ping is only logged — not invalidated —
+    since a slow link or a full MaxSessions must not cost a TOTP re-login;
+    keepalive / the idle probe handle genuinely dead sockets."""
+    conn = _bastion_conn
+    if conn is None:
+        return None
+    try:
+        await _ping(conn, HEARTBEAT_TIMEOUT)
+    except Exception as e:
+        _log(f"[bastion] heartbeat failed: {_fmt_exc(e)}")
+        return False
+    _touch(conn, real=False)
+    return True
+
+
+async def heartbeat_loop(interval: float | None = None) -> None:
+    """Background task started by the daemon; 0 disables. Why open/close a
+    channel per beat rather than hold one long-lived channel: it is
+    stateless (no MaxSessions slot held for hours, nothing to re-establish
+    or leak on the bastion if we die) and every beat is genuine channel
+    open/data/close activity, whereas an idle held channel carries no
+    traffic and may not count either. If drop logs show the bastion still
+    kicks despite this, a periodically-emitting held channel is the next
+    thing to try."""
+    if interval is None:
+        interval = _heartbeat_interval()
+    if interval <= 0:
+        return
+    _log(f"heartbeat: bastion channel ping every {interval:g}s (timeout {HEARTBEAT_TIMEOUT}s)")
+    beats = 0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            ok = await heartbeat_once()
+        except Exception as e:  # never let the task die
+            _log(f"[bastion] heartbeat error: {_fmt_exc(e)}")
+            continue
+        if ok:
+            beats += 1
+            if beats % 60 == 1:  # first beat, then roughly hourly at 60s
+                _log(f"[bastion] heartbeat ok (#{beats})")
 
 
 _RESTART_SECTIONS = ("bastion", "daemon")

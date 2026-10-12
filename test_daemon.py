@@ -45,6 +45,23 @@ class LoginBastionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get.await_count, 3)
         self.assertIn("放弃启动时登录", out.getvalue())
 
+    async def test_retry_after_one_timeout(self):
+        get = mock.AsyncMock(side_effect=[asyncio.TimeoutError(), object()])
+        with mock.patch.object(pool, "get_bastion", get), capture() as out:
+            ok = await daemon._login_bastion()
+        self.assertTrue(ok)
+        self.assertEqual(get.await_count, 2)
+        self.assertIn("登录超时", out.getvalue())
+        self.assertIn("还剩 2 次", out.getvalue())
+
+    async def test_gives_up_after_three_timeouts(self):
+        get = mock.AsyncMock(side_effect=asyncio.TimeoutError())
+        with mock.patch.object(pool, "get_bastion", get), capture() as out:
+            ok = await daemon._login_bastion()
+        self.assertFalse(ok)
+        self.assertEqual(get.await_count, 3)
+        self.assertIn("放弃启动时登录", out.getvalue())
+
     async def test_other_error_is_not_retried(self):
         get = mock.AsyncMock(side_effect=OSError("unreachable"))
         with mock.patch.object(pool, "get_bastion", get), capture() as out:

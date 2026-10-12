@@ -83,7 +83,7 @@ Copy-Item config.example.toml config.toml
 | `[bastion] key` | 本机私钥路径；留空用默认密钥对（`~/.ssh/id_*`） |
 | `[daemon] port` | 本地监听端口，默认 8765，只绑 127.0.0.1 |
 | `[daemon] audit_log` | 审计日志 JSONL 路径，留空不记录 |
-| `[daemon] connect_timeout` | 建连超时（秒），默认 20 |
+| `[daemon] connect_timeout` | 建连超时（秒），默认 20；只对目标机生效，跳板机固定 120 秒 |
 | `[daemon] heartbeat_interval` | 选填，默认 60，0 关闭：每隔这么多秒在已有的跳板机连接上开真实 channel 跑 `true`，防“channel 无活动被踢”；只用现有连接，绝不自己重连（不会凭空弹 TOTP） |
 | `[bastion] keepalive_interval` / `keepalive_count_max` | 选填，默认 15 / 8：SSH 层保活间隔（秒，0 关闭）和判定断线的连续无响应次数；跳板机和所有目标机连接共用 |
 | `[hosts] allowed` | 节点白名单，支持 fnmatch 通配符；`[]` 表示不限制（建议填写） |

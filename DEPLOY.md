@@ -80,7 +80,7 @@ key  = ""                      # 私钥路径；留空则用默认密钥对 (~/.
 [daemon]
 port            = 8765         # daemon 监听的本地端口，仅 127.0.0.1
 audit_log       = ""           # 留空不记录；填绝对路径（如 "D:/tools/remote-mcp/audit.jsonl"）则写 JSONL 审计日志
-connect_timeout = 20           # 跳板机 / 目标机建连超时（秒），超时不重试，直接报错
+connect_timeout = 20           # 目标机建连超时（秒）；跳板机固定 120 秒（含输入 TOTP 的时间）
 # heartbeat_interval = 60      # 可选：跳板机心跳间隔（秒），0 关闭。默认 60
 
 [hosts]
@@ -135,7 +135,7 @@ default_cwd = "<远端家目录>"
 | `bastion.host`/`port`/`user` | 跳板机地址和你的登录账号 |
 | `bastion.key` | 留空则用 `~/.ssh/id_*` 默认密钥对；如果专门为这个 daemon 生成了一对独立的密钥，填这个私钥的绝对路径 |
 | `daemon.port` | daemon 的 HTTP 端口，只监听 `127.0.0.1`，不会暴露到局域网 |
-| `daemon.connect_timeout` | 建立 SSH 连接（跳板机或目标机）的超时时间；命令执行超时是单独在每次工具调用里指定的，与这个字段无关 |
+| `daemon.connect_timeout` | 建立 SSH 连接（目标机）的超时时间，跳板机不受这个字段约束，固定 120 秒；命令执行超时是单独在每次工具调用里指定的，与这个字段无关 |
 | `bastion.keepalive_interval` / `keepalive_count_max` | 选填，默认 15 / 8：SSH 层保活（每 15 秒一次，连续 8 次无响应判定断线）。跳板机和所有目标机连接共用这两个值。SSH 保活不算 channel 活动，防“空闲被踢”靠下面的心跳 |
 | `daemon.heartbeat_interval` | 选填，默认 60，0 关闭：每隔这么多秒，在**已有**的跳板机连接上开一个真实 channel 跑 `true` 再关掉，制造 channel 活动。跳板机没连上时跳过，绝不会自己重连（不会凭空弹 TOTP）；失败只打印 `heartbeat failed`，不会断开连接。成功时只在第 1 次和之后约每小时各打印一行 |
 | `hosts.allowed` | 目标机白名单，防止误操作连到没打算连的机器 |
@@ -250,8 +250,8 @@ daemon 启动、TOTP 输入完成后，依次验证：
 
 | 现象 | 可能原因 / 处理 |
 |---|---|
-| 启动后 daemon 窗口没有 TOTP 提示，卡住不动 | 检查 `config.toml` 里 `bastion.host`/`port`/`user` 是否正确；也可能是网络不通，等到 `connect_timeout` 秒后会报错退出，而不是一直卡着——如果一直卡着超过这个时间还没反应，说明连接本身没有建立（比如端口被防火墙拦截），检查网络连通性 |
-| 连接超时（`connect_timeout` 报错） | 检查跳板机地址/端口是否可达（`Test-NetConnection <host> -Port 22`）；如果跳板机本身响应慢，适当调大 `config.toml` 里的 `connect_timeout` |
+| 启动后 daemon 窗口没有 TOTP 提示，卡住不动 | 检查 `config.toml` 里 `bastion.host`/`port`/`user` 是否正确；也可能是网络不通，等 120 秒后超时；启动时会重试 3 次，之后 daemon 照常运行，而不是一直卡着——如果一直卡着超过这个时间还没反应，说明连接本身没有建立（比如端口被防火墙拦截），检查网络连通性 |
+| 连接超时（`connect_timeout` 报错） | 检查跳板机地址/端口是否可达（`Test-NetConnection <host> -Port 22`）；如果跳板机本身响应慢，适当调大 `config.toml` 里的 `connect_timeout`（只适用于目标机，跳板机固定 120 秒） |
 | 报错提示 `MaxSessions` 相关，或者并发调用工具时偶尔失败 | sshd 默认限制单条连接最多 10 个并发 channel，daemon 对每台目标机限制了 8 个并发（留 2 个余量给 SFTP），如果还是触发，检查是不是有其它进程也在用同一条连接，或联系跳板机管理员确认 `MaxSessions` 配置 |
 | 空闲一阵后 daemon 又要 TOTP | 跳板机连接被断了。daemon 窗口会打印一行 `[bastion] connection lost: ...`，带上连接存活时长、距上次使用的空闲时长，以及若干 `hint:` 行：`age ~1h` 之类整数时长 = 固定会话时长上限；`idle ... 整数` = 空闲超时策略；`exc=None` = 对端主动关闭（策略踢人）；`keepalive failure` / `connection lost without a DISCONNECT` = 网络问题。心跳（`heartbeat_interval`）防的是“channel 无活动被踢”，对固定时长上限无效 |
 | 改了 `config.toml` 但没生效 | 调用 `reload_config`（`[host.*]` / `[hosts]` 不用重启）；改 `[bastion]` / `[daemon]` 或需要交互输入密码的节点要重启 daemon |

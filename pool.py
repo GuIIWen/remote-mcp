@@ -18,6 +18,11 @@ import asyncssh
 
 CONFIG_PATH = Path(__file__).parent / "config.toml"
 
+# asyncssh's connect_timeout covers auth too, and bastion auth includes a
+# human typing a TOTP code — so the bastion gets a much longer budget than
+# [daemon] connect_timeout (which still applies to every target).
+BASTION_CONNECT_TIMEOUT = 120
+
 # container / container_user charset (docker names, plus a numeric uid is fine);
 # no leading "-" so the value can never be parsed as a docker option.
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
@@ -523,7 +528,7 @@ async def _connect_bastion() -> asyncssh.SSHClientConnection:
         username=b["user"],
         client_keys=_bastion_client_keys(),
         known_hosts=None,
-        connect_timeout=_connect_timeout(),
+        connect_timeout=BASTION_CONNECT_TIMEOUT,
         **_keepalive_kwargs(),
     )
     _log(f"[bastion] connected {b['user']}@{b['host']}:{b['port']}")

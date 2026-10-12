@@ -93,9 +93,10 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
 
 
 async def _login_bastion() -> bool:
-    """Startup login to the bastion. A rejected TOTP/password gets retried
-    (up to BASTION_RETRIES total attempts, each one prompting again); any
-    other failure is reported once and not retried. Either way, failure
+    """Startup login to the bastion. A rejected TOTP/password or a timeout
+    (e.g. the code wasn't typed within pool.BASTION_CONNECT_TIMEOUT) gets
+    retried (up to BASTION_RETRIES total attempts, each one prompting
+    again); any other failure is reported once and not retried. Either way, failure
     doesn't stop the daemon — the pool reconnects lazily, so the first call
     that needs the bastion prompts for a code in this terminal."""
     attempts_left = BASTION_RETRIES
@@ -110,6 +111,12 @@ async def _login_bastion() -> bool:
                 print(f"[bastion] 认证失败（{reason}），次数已用完，放弃启动时登录", flush=True)
                 return False
             print(f"[bastion] 认证失败（{reason}），请重新输入，还剩 {attempts_left} 次", flush=True)
+        except asyncio.TimeoutError:
+            attempts_left -= 1
+            if attempts_left <= 0:
+                print("[bastion] 登录超时，次数已用完，放弃启动时登录", flush=True)
+                return False
+            print(f"[bastion] 登录超时，请重新输入，还剩 {attempts_left} 次", flush=True)
         except Exception as e:
             print(f"[bastion] 登录失败（{type(e).__name__}: {e}），放弃启动时登录", flush=True)
             return False

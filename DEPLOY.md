@@ -257,7 +257,7 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | 改了 `config.toml` 但没生效 | 调用 `reload_config`（`[host.*]` / `[hosts]` 不用重启）；改 `[bastion]` / `[daemon]` 或需要交互输入密码的节点要重启 daemon |
 | 报错 `Host '...' is not in the allowed list` | `config.toml` 的 `[hosts] allowed` 白名单里没有这台机器，按需加上（支持 `fnmatch` 通配符），或者确认没有手滑写错主机名 |
 | daemon 启动报端口被占用 | `config.toml` 里的 `daemon.port` 和本机其它程序冲突，改成一个空闲端口，同时同步更新 `claude mcp add` / Codex 里配置的 URL |
-| TOTP 输错 / 认证失败 | 直接在 daemon 窗口按 Ctrl+C 退出重新 `uv run daemon.py`；不需要额外清理状态 |
+| TOTP 输错 / 认证失败 | 启动时最多可重试 3 次；仍失败时 daemon 照常运行并打印“尚未登录”，第一次需要跳板机的调用会在 daemon 窗口再次要求验证码，无需重启 |
 | 直连密码错误或被锁 | 交互输入的密码连续错 3 次，或配置文件里 `password` 字段本身就是错的，daemon 会打印提示并跳过这台机器，不阻塞启动；确认密码正确后重新 `uv run daemon.py`，或者手动调用 `reset_connections` 后重试该节点。如果远端账号已经因为多次失败被锁，需要先在目标机上解锁（这不是本工具能处理的） |
 | direct 节点连不上 | 先确认 `config.toml` 里这个节点的 `address`/`port` 正确、网络可达（`Test-NetConnection <address> -Port <port>`）；direct 节点不经过跳板机，所以跳板机状态正常不代表 direct 节点能连上。密钥认证失败会报 `PermissionDenied`，检查公钥是否已经放到这台机器的 `authorized_keys`（见第 4 节）；网络不可达或超时只在启动时打印警告，不影响其它节点，下一次调用这个节点时会按需重连并把真正的错误返回 |
 | hop 节点报 `ssh to <节点> on the bastion failed: ...`（对应 ssh 退出码 255） | 说明跳板机上的 `ssh <节点名>` 本身失败了，跟 daemon/本机配置无关，daemon 也不会重试这类失败。先登录跳板机手动跑 `ssh -o BatchMode=yes <节点名> hostname` 复现：常见原因是跳板机上没有这台机器的私钥、这台机器的 `authorized_keys` 没加跳板机的公钥、host key 变了，或者 `user`/`port` 填得跟跳板机 `~/.ssh/config` 里的不一致 |

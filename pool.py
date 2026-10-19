@@ -46,6 +46,10 @@ _hop_sem = asyncio.Semaphore(8)
 # and reused silently on reconnect. Never written to disk, never logged.
 _passwords: dict[str, str] = {}
 
+# _passwords key for [bastion] password; brackets keep it from colliding with
+# a [host.x] section name.
+BASTION_PASSWORD_KEY = "[bastion]"
+
 
 class ConfigError(ValueError):
     """Raised for a configuration problem that should abort startup, or (for
@@ -72,6 +76,23 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
     than causing wrong behavior."""
     errors: list[str] = []
     warnings: list[str] = []
+    # [bastion] always authenticates with a key first; password only answers
+    # keyboard-interactive password prompts, so there is no auth switch here.
+    b = cfg.get("bastion", {})
+    if "auth" in b:
+        warnings.append(
+            "warning: [bastion] 不支持 auth 字段，将被忽略（跳板机总是先发密钥，"
+            "password 只用来自动回答 keyboard-interactive 里的密码提示）"
+        )
+    if b.get("password") is not None and not isinstance(b["password"], str):
+        errors.append(f"[bastion] password 必须是字符串，当前是 {type(b['password']).__name__}")
+    bastion_key = b.get("key", "")
+    if bastion_key and not Path(str(bastion_key)).expanduser().is_file():
+        errors.append(
+            f"[bastion] key 应该是私钥文件路径，但 {bastion_key!r} 不存在；"
+            "留空则使用默认密钥对（~/.ssh/id_*）"
+        )
+
     # Optional numeric knobs: absent is fine (defaults apply), present must be
     # a sane number — a string here would otherwise only blow up at connect time.
     for sec, key, lo, integer in (
@@ -439,8 +460,29 @@ class _TrackedClient(asyncssh.SSHClient):
             _log(f"[{self._label}]   hint: {h}")
 
 
+# A keyboard-interactive prompt is answered from [bastion] password only if it
+# looks like a password prompt and not like a one-time code ("One-time
+# password:", "OTP password:" and the like contain "password" too).
+_PASSWORD_PROMPT_RE = re.compile(r"password|passwd|密码|口令", re.IGNORECASE)
+_OTP_PROMPT_RE = re.compile(
+    r"one[- ]?time|otp|totp|token|code|verif|passcode|2fa|mfa|验证码|动态",
+    re.IGNORECASE,
+)
+
+
+def is_password_prompt(prompt: str) -> bool:
+    return bool(_PASSWORD_PROMPT_RE.search(prompt)) and not _OTP_PROMPT_RE.search(prompt)
+
+
 class _BastionClient(_TrackedClient):
     _label = "bastion"
+
+    def __init__(self):
+        super().__init__()
+        # [bastion] password is offered at most once per connection: if the
+        # server asks again it was rejected, and resending it would only burn
+        # attempts toward a lockout — the terminal takes over instead.
+        self._password_sent = False
 
     def auth_banner_received(self, msg: str, lang: str) -> None:
         print(msg, end="", flush=True)
@@ -458,12 +500,21 @@ class _BastionClient(_TrackedClient):
         lang: str,
         prompts: list[tuple[str, bool]],
     ) -> list[str]:
+        # Each prompt is answered on its own, in the order the server sends
+        # them, so "code then password" and "password then code" (in one
+        # challenge or across several) both work: a password-looking prompt
+        # gets [bastion] password, everything else is typed in the terminal.
         if instructions:
             print(instructions, flush=True)
         loop = asyncio.get_event_loop()
+        saved = _passwords.get(BASTION_PASSWORD_KEY)
         responses = []
         for prompt, echo in prompts:
-            if echo:
+            if saved and not self._password_sent and is_password_prompt(prompt):
+                self._password_sent = True
+                print(f"{prompt.rstrip()} (using [bastion] password from config)", flush=True)
+                answer = saved
+            elif echo:
                 answer = await loop.run_in_executor(None, input, prompt)
             else:
                 answer = await loop.run_in_executor(None, getpass.getpass, prompt)
@@ -527,6 +578,10 @@ async def _connect_bastion() -> asyncssh.SSHClientConnection:
         port=b["port"],
         username=b["user"],
         client_keys=_bastion_client_keys(),
+        # Only consulted if the server offers the plain "password" method;
+        # the usual keyboard-interactive case is answered in
+        # _BastionClient.kbdint_challenge_received.
+        password=_passwords.get(BASTION_PASSWORD_KEY) or None,
         known_hosts=None,
         connect_timeout=BASTION_CONNECT_TIMEOUT,
         **_keepalive_kwargs(),

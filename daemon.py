@@ -138,6 +138,11 @@ def main() -> None:
     _report_config(warnings, [])
 
     pool.cfg = cfg
+    # Not prompted for when empty: the bastion's own keyboard-interactive
+    # prompt in this terminal already asks for it, exactly as before.
+    bastion_password = cfg.get("bastion", {}).get("password", "")
+    if bastion_password:
+        pool._passwords[pool.BASTION_PASSWORD_KEY] = bastion_password
 
     audit_log = cfg.get("daemon", {}).get("audit_log", "")
     tools.AUDIT_LOG = audit_log

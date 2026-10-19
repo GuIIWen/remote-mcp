@@ -76,6 +76,7 @@ host = "bastion.example.com"   # 跳板机地址，换成你实际的跳板机�
 port = 22
 user = "<跳板机用户名>"            # 你在跳板机上的登录用户名
 key  = ""                      # 私钥路径；留空则用默认密钥对 (~/.ssh/id_*)
+password = ""                  # 可选：填了就自动回答 keyboard-interactive 里的“密码”提示，验证码仍在终端输入；留空则全部手动输入
 # keepalive_interval  = 15     # 可选：SSH 层保活间隔（秒），0 关闭；所有连接共用。默认 15
 # keepalive_count_max = 8      # 可选：连续多少次保活无响应才判定断线。默认 8
 
@@ -136,6 +137,7 @@ default_cwd = "<远端家目录>"
 |---|---|
 | `bastion.host`/`port`/`user` | 跳板机地址和你的登录账号 |
 | `bastion.key` | 留空则用 `~/.ssh/id_*` 默认密钥对；如果专门为这个 daemon 生成了一对独立的密钥，填这个私钥的绝对路径 |
+| `bastion.password` | 选填，跳板机登录密码。跳板机总是先发密钥，然后在 keyboard-interactive 里逐条提示；填了这个字段后，提示文字像“密码”（含 password / passwd / 密码 / 口令，且不含 code / OTP / token / 验证码 / 动态 等字样）的那一条自动用它回答，其余（TOTP 验证码等）仍在 daemon 窗口输入，先问验证码还是先问密码都行。每次连接只自动发一次，服务端再问就说明密码错了，转为在窗口手动输入，不会反复用错密码去撞锁定策略。留空则和以前一样全部手动输入。改了要重启 daemon |
 | `daemon.port` | daemon 的 HTTP 端口，只监听 `127.0.0.1`，不会暴露到局域网 |
 | `daemon.connect_timeout` | 建立 SSH 连接（目标机）的超时时间，跳板机不受这个字段约束，固定 120 秒；命令执行超时是单独在每次工具调用里指定的，与这个字段无关 |
 | `bastion.keepalive_interval` / `keepalive_count_max` | 选填，默认 15 / 8：SSH 层保活（每 15 秒一次，连续 8 次无响应判定断线）。跳板机和所有目标机连接共用这两个值。SSH 保活不算 channel 活动，防“空闲被踢”靠下面的心跳 |
@@ -265,7 +267,7 @@ cd <REMOTE_MCP_DIR>
 uv run daemon.py
 ```
 
-daemon 启动时会立即连接跳板机，并在**这个窗口**里提示输入 TOTP 验证码（或密码，取决于跳板机的 keyboard-interactive 挑战内容）。输入一次后，这次进程运行期间不需要再输入，除非：
+daemon 启动时会立即连接跳板机，并在**这个窗口**里提示输入 TOTP 验证码（或密码，取决于跳板机的 keyboard-interactive 挑战内容；配置了 `bastion.password` 时密码提示会自动回答，只剩验证码要输）。输入一次后，这次进程运行期间不需要再输入，除非：
 
 - 手动调用了 `reset_connections` 工具，或
 - 跳板机连接因为网络问题 / 空闲超时被断开，下一次工具调用触发重连时。
@@ -331,6 +333,7 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | 报错 `Host '...' is not in the allowed list` | `config.toml` 的 `[hosts] allowed` 白名单里没有这台机器，按需加上（支持 `fnmatch` 通配符），或者确认没有手滑写错主机名 |
 | daemon 启动报端口被占用 | `config.toml` 里的 `daemon.port` 和本机其它程序冲突，改成一个空闲端口，同时同步更新 `claude mcp add` / Codex 里配置的 URL |
 | TOTP 输错 / 认证失败 | 启动时最多可重试 3 次；仍失败时 daemon 照常运行并打印“尚未登录”，第一次需要跳板机的调用会在 daemon 窗口再次要求验证码，无需重启 |
+| 配了 `bastion.password` 还是让手动输密码 | 说明那条提示的文字没被识别成密码提示（比如不含 password/密码，或者同时含 code/OTP 等字样），或者自动发送的密码被拒、服务端又问了一次。看窗口里的提示原文：自动回答时会打印 `... (using [bastion] password from config)`；没有这行就是没识别，有这行之后又被问，就是密码写错了 |
 | 直连密码错误或被锁 | 交互输入的密码连续错 3 次，或配置文件里 `password` 字段本身就是错的，daemon 会打印提示并跳过这台机器，不阻塞启动；确认密码正确后重新 `uv run daemon.py`，或者手动调用 `reset_connections` 后重试该节点。如果远端账号已经因为多次失败被锁，需要先在目标机上解锁（这不是本工具能处理的） |
 | direct 节点连不上 | 先确认 `config.toml` 里这个节点的 `address`/`port` 正确、网络可达（`Test-NetConnection <address> -Port <port>`）；direct 节点不经过跳板机，所以跳板机状态正常不代表 direct 节点能连上。密钥认证失败会报 `PermissionDenied`，检查公钥是否已经放到这台机器的 `authorized_keys`（见第 4 节）；网络不可达或超时只在启动时打印警告，不影响其它节点，下一次调用这个节点时会按需重连并把真正的错误返回 |
 | `setup_ssh_keys.py` 报“免密验证失败” | 前三步都成功、只有最后的纯密钥登录失败：多半是远端 sshd 的 StrictModes 嫌家目录权限过松（家目录本身不能是 group/other 可写，`chmod go-w ~`），或 `sshd_config` 里 `PubkeyAuthentication no` / `AuthorizedKeysFile` 指向了别的路径，需要在目标机上处理；如果报的是 host key 不匹配，检查本机 `known_hosts` 是否被别的工具改过 |

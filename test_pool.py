@@ -402,5 +402,77 @@ def _bc():
     return c
 
 
+class BastionPasswordTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = dict(pool._passwords)
+        pool._passwords.clear()
+
+    def tearDown(self):
+        pool._passwords.clear()
+        pool._passwords.update(self._saved)
+
+    async def answer(self, client, prompts, typed=()):
+        typed = iter(typed)
+        asked: list[str] = []
+
+        def fake_input(prompt):
+            asked.append(prompt)
+            return next(typed)
+
+        with mock.patch("builtins.input", fake_input), \
+                mock.patch.object(pool.getpass, "getpass", fake_input), capture():
+            resp = await client.kbdint_challenge_received("", "", "", prompts)
+        return resp, asked
+
+    def test_prompt_classification(self):
+        for p in ("Password: ", "password for huangqd:", "请输入密码：", "Passwd:", "登录口令："):
+            self.assertTrue(pool.is_password_prompt(p), p)
+        for p in ("Verification code: ", "One-time password: ", "OTP password:",
+                  "请输入验证码：", "动态密码：", "动态口令：", "Token: ", "Passcode: "):
+            self.assertFalse(pool.is_password_prompt(p), p)
+
+    async def test_code_then_password_in_one_challenge(self):
+        pool._passwords[pool.BASTION_PASSWORD_KEY] = "s3cret"
+        resp, asked = await self.answer(
+            _bc(), [("Verification code: ", False), ("Password: ", False)], ["123456"]
+        )
+        self.assertEqual(resp, ["123456", "s3cret"])
+        self.assertEqual(asked, ["Verification code: "])
+
+    async def test_code_then_password_across_challenges(self):
+        pool._passwords[pool.BASTION_PASSWORD_KEY] = "s3cret"
+        c = _bc()
+        resp, asked = await self.answer(c, [("Verification code: ", True)], ["123456"])
+        self.assertEqual(resp, ["123456"])
+        resp, asked = await self.answer(c, [("Password: ", False)])
+        self.assertEqual((resp, asked), (["s3cret"], []))
+
+    async def test_password_sent_only_once_per_connection(self):
+        pool._passwords[pool.BASTION_PASSWORD_KEY] = "wrong"
+        c = _bc()
+        await self.answer(c, [("Password: ", False)])
+        resp, asked = await self.answer(c, [("Password: ", False)], ["typed"])
+        self.assertEqual((resp, asked), (["typed"], ["Password: "]))
+        # a fresh connection (reconnect) gets to try the saved one again
+        resp, asked = await self.answer(_bc(), [("Password: ", False)])
+        self.assertEqual((resp, asked), (["wrong"], []))
+
+    async def test_no_saved_password_prompts_as_before(self):
+        resp, asked = await self.answer(_bc(), [("Password: ", False)], ["typed"])
+        self.assertEqual((resp, asked), (["typed"], ["Password: "]))
+
+    def test_validate_bastion_fields(self):
+        errors, warnings = pool.validate_config({"bastion": {"password": "x"}})
+        self.assertEqual((errors, warnings), ([], []))
+        errors, _ = pool.validate_config({"bastion": {"password": 123}})
+        self.assertTrue(any("password" in e for e in errors))
+        _, warnings = pool.validate_config({"bastion": {"auth": "password"}})
+        self.assertTrue(any("auth" in w for w in warnings))
+        errors, _ = pool.validate_config({"bastion": {"key": "password"}})
+        self.assertTrue(any("key" in e for e in errors))
+        errors, _ = pool.validate_config({"bastion": {"key": __file__}})
+        self.assertEqual(errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()

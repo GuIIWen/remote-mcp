@@ -6,9 +6,12 @@ host = "bastion.example.com"   # 跳板机地址（域名或 IP）
 port = 22
 user = "yourname"              # 你在跳板机上的登录用户名
 key  = ""                      # 私钥路径；留空则用默认密钥对（~/.ssh/id_*）
+password = ""                  # 可选：跳板机登录密码。填了就自动回答 keyboard-interactive 里的“密码”提示，
+                               # 验证码（TOTP / OTP / code）提示仍在终端输入；先问验证码还是先问密码都可以。
+                               # 留空则所有提示都在终端输入（和以前一样）。明文保存在本机 config.toml（已 gitignore）。
 # keepalive_interval  = 15     # 可选：SSH 层保活间隔（秒），0 关闭；也用于所有目标机连接。默认 15
 # keepalive_count_max = 8      # 可选：连续多少次保活无响应才判定断线。默认 8
-# 跳板机只支持密钥认证（配合 keyboard-interactive 做 TOTP），不要在这里写 password/address——
+# 跳板机总是先用密钥认证，然后走 keyboard-interactive 做 TOTP / 密码；不要在这里写 address/auth——
 # 写了会在启动时被忽略并打印警告。
 
 [daemon]

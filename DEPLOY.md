@@ -53,6 +53,8 @@ ModuleNotFoundError: No module named 'pywintypes'
 ├── pool.py
 ├── tools.py
 ├── daemon.py
+├── setup_ssh_keys.py  # 可选：批量给直连节点配免密，见第 4 节
+├── nodes.example.yaml # setup_ssh_keys.py 的节点列表模板
 └── audit.jsonl        # 首次运行后自动生成（如果配置了 audit_log）
 ```
 
@@ -177,6 +179,77 @@ daemon 用同一对本机私钥分别认证跳板机和目标机（目标机认�
 
 **direct 节点（`via = "direct"`，`auth = "key"`）同样要把公钥放到这台机器自己的 `authorized_keys`，路径同上——`<远端家目录>/.ssh/authorized_keys`（这台机器登录账号自己的家目录）。因为 direct 节点不经过跳板机，这一步是这台机器独立要做的，和跳板机、其它节点的 `authorized_keys` 互不影响。密码认证的 direct 节点（`auth = "password"`）不需要这一步。**
 
+### 批量配置直连节点免密（setup_ssh_keys.py）
+
+direct 节点多的时候，不用一台台手动追加公钥：只要这些机器目前能用**密码**直接登录，就可以用 `setup_ssh_keys.py` 一次配好，之后把它们改成 `auth = "key"`。它只连 YAML 里写的 `ip:port`，**不经过跳板机**，所以只适用于本机能直连的机器；走跳板机的节点和 hop 节点仍按上面的方式处理。
+
+对每个节点，脚本依次做四步，哪一步失败就在结果里标出哪一步：
+
+1. **登录**：只用密码登录（不先试本机密钥，免得失败次数被算进远端的锁定策略）。
+2. **记录主机指纹**：把对方的 host key 自动写进本机 `~/.ssh/known_hosts`，之后脚本和手动 `ssh` 都不会再问 "Are you sure you want to continue connecting?"。如果这台机器之前记录过**不同**的指纹，旧记录保留、追加新的，并在结果里提示"指纹与旧记录不同"——确认是机器重装过，而不是连错了机器。
+3. **安装公钥**：把本机公钥追加到对方的 `~/.ssh/authorized_keys`，顺带把 `.ssh` 和 `authorized_keys` 的权限设成 700 / 600（有 SELinux 时还会 `restorecon`）。已经有这把公钥就跳过，重复运行不会重复添加。
+4. **免密验证**：只用密钥重新登录一次，并按 `known_hosts` 校验指纹，确认以后 `ssh` 真的不需要密码。
+
+**用法：**
+
+1. 依赖：`pyyaml` 已在 `requirements.txt` 里，按第 1 节 `uv pip install -r requirements.txt` 装过即可。
+2. 本机要有密钥对，默认用 `~/.ssh/id_ed25519`（和同名 `.pub`）；没有就先 `ssh-keygen -t ed25519`。
+3. 复制模板并填写：
+
+   ```powershell
+   copy nodes.example.yaml nodes.yaml
+   ```
+
+   ```yaml
+   defaults:              # 节点里没写的字段从这里取
+     port: 22
+     user: yourname
+     # password: "共用密码"
+
+   nodes:
+     lab3:
+       ip: 192.168.10.23
+       port: 2222
+       password: "lab3 的密码"
+     lab4:
+       ip: 192.168.10.24  # 没写 password：运行时会逐个提示输入
+   ```
+
+   `nodes.yaml` 里是明文密码，已加入 `.gitignore`；配完建议直接删掉，或至少把密码删掉。
+
+4. 运行：
+
+   ```powershell
+   uv run setup_ssh_keys.py nodes.yaml
+   uv run setup_ssh_keys.py nodes.yaml --only lab3,lab4   # 只处理部分节点
+   ```
+
+   | 参数 | 说明 |
+   |---|---|
+   | `--only a,b` | 只处理这些节点（名字必须在 YAML 里，否则直接报错退出） |
+   | `--key <路径>` | 换一把私钥，公钥取同名 `.pub`；默认 `~/.ssh/id_ed25519`。私钥有口令时会提示输入 |
+   | `--concurrency N` | 同时处理几个节点，默认 5 |
+   | `--retries N` | 每个节点最多尝试几次，默认 3（间隔 2s、4s……递增） |
+   | `--timeout 秒` | 单次建连 / 远端命令超时，默认 15 |
+
+   网络超时、连接断开之类的失败会自动重试；**密码被拒绝不重试**，只试一次，避免触发 `pam_faillock` 之类的账户锁定。
+
+5. 看结果：运行中逐个打印进度，最后输出汇总：
+
+   ```
+   ==== 汇总：成功 1，失败 1，用时 3.2s ====
+     OK    lab3         yourname@192.168.10.23:2222  指纹已记录；公钥已安装；免密验证通过
+     FAIL  lab4         yourname@192.168.10.24:22
+           第 1 次：登录失败（PermissionDenied: ...）
+           密码被拒绝，不再重试（避免触发账户锁定）
+   ```
+
+   退出码：`0` 全部成功；`1` 有节点失败；`2` YAML 格式不对或本机密钥读不出来（这种情况一台都不会连）。修好失败的节点后直接用 `--only` 重跑即可，已经配好的节点会显示"已存在"。
+
+6. 改 `config.toml`：把成功的节点改成 `auth = "key"`、删掉 `password`。主机指纹已经记在本机 `known_hosts` 里，可以顺手给这些节点配上 `known_hosts = "C:/Users/<you>/.ssh/known_hosts"` 开启 host key 校验。
+
+注意：指纹是按 YAML 里的 `ip`（非 22 端口时是 `[ip]:port`）记录的，`config.toml` 里这个节点的 `address` 要和 YAML 里的 `ip` 写成一样，校验才能匹配上。
+
 **hop 节点（`via = "hop"`）完全不涉及本机密钥**——本机既没有、也不需要它的私钥。需要的是跳板机自己能免密 `ssh` 到这台机器：私钥放在跳板机上（不是本机），且跳板机上已经把它的公钥加进了这台机器的 `authorized_keys`。这套配置通常是集群内网已经有的（跳板机到计算节点互信），本项目不负责生成或分发这把私钥。部署前建议登录跳板机手动自检一次：
 
 ```bash
@@ -260,6 +333,8 @@ daemon 启动、TOTP 输入完成后，依次验证：
 | TOTP 输错 / 认证失败 | 启动时最多可重试 3 次；仍失败时 daemon 照常运行并打印“尚未登录”，第一次需要跳板机的调用会在 daemon 窗口再次要求验证码，无需重启 |
 | 直连密码错误或被锁 | 交互输入的密码连续错 3 次，或配置文件里 `password` 字段本身就是错的，daemon 会打印提示并跳过这台机器，不阻塞启动；确认密码正确后重新 `uv run daemon.py`，或者手动调用 `reset_connections` 后重试该节点。如果远端账号已经因为多次失败被锁，需要先在目标机上解锁（这不是本工具能处理的） |
 | direct 节点连不上 | 先确认 `config.toml` 里这个节点的 `address`/`port` 正确、网络可达（`Test-NetConnection <address> -Port <port>`）；direct 节点不经过跳板机，所以跳板机状态正常不代表 direct 节点能连上。密钥认证失败会报 `PermissionDenied`，检查公钥是否已经放到这台机器的 `authorized_keys`（见第 4 节）；网络不可达或超时只在启动时打印警告，不影响其它节点，下一次调用这个节点时会按需重连并把真正的错误返回 |
+| `setup_ssh_keys.py` 报“免密验证失败” | 前三步都成功、只有最后的纯密钥登录失败：多半是远端 sshd 的 StrictModes 嫌家目录权限过松（家目录本身不能是 group/other 可写，`chmod go-w ~`），或 `sshd_config` 里 `PubkeyAuthentication no` / `AuthorizedKeysFile` 指向了别的路径，需要在目标机上处理；如果报的是 host key 不匹配，检查本机 `known_hosts` 是否被别的工具改过 |
+| `setup_ssh_keys.py` 报“登录失败（超时）” | 和 direct 节点连不上一样，先 `Test-NetConnection <ip> -Port <port>` 确认可达；网络慢可以加大 `--timeout` |
 | hop 节点报 `ssh to <节点> on the bastion failed: ...`（对应 ssh 退出码 255） | 说明跳板机上的 `ssh <节点名>` 本身失败了，跟 daemon/本机配置无关，daemon 也不会重试这类失败。先登录跳板机手动跑 `ssh -o BatchMode=yes <节点名> hostname` 复现：常见原因是跳板机上没有这台机器的私钥、这台机器的 `authorized_keys` 没加跳板机的公钥、host key 变了，或者 `user`/`port` 填得跟跳板机 `~/.ssh/config` 里的不一致 |
 | `ConfigError: [host.x] via="hop" 有 ... 需要 [bastion] 段` | hop 节点必须有 `[bastion]` 配置（所有命令都要经跳板机代跑）；补上 `[bastion]`，或者如果这台机器本机能直连，改成 `via = "direct"` |
 | hop 节点并发调用偶尔失败、或报跟 session 数量有关的错误 | 所有 hop 节点共用同一条跳板机连接，daemon 对全部 hop 流量合计限制了 8 个并发 session（留给跳板机自己 sshd `MaxSessions` 一点余量）；如果同时有大量 hop 调用在跑，属于预期的排队等待，不是错误 |

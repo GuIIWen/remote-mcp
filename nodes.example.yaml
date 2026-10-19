@@ -1,0 +1,21 @@
+# setup_ssh_keys.py 的节点列表模板：复制为 nodes.yaml 后填写真实值。
+# nodes.yaml 含明文密码，已加入 .gitignore；这份模板里全是占位值，可以放心提交。
+#
+# 每个节点的 ip / port / user / password 没写的，取 defaults 里的值；
+# password 两处都没写，运行时会用 getpass 逐个询问。
+
+defaults:
+  port: 22
+  user: yourname
+  # password: "shared-password"
+
+nodes:
+  lab1:
+    ip: 192.168.10.21
+  lab2:
+    ip: 192.168.10.22
+    password: "lab2-password"
+  lab3:
+    ip: 192.168.10.23
+    port: 2222
+    user: root

@@ -493,6 +493,27 @@ class _BastionClient(_TrackedClient):
         # string lets the server pick the submethod.
         return ""
 
+    def _take_config_password(self) -> str | None:
+        """Return the configured bastion password at most once per connection."""
+        if self._password_sent:
+            return None
+        saved = _passwords.get(BASTION_PASSWORD_KEY)
+        if not saved:
+            return None
+        self._password_sent = True
+        return saved
+
+    def password_auth_requested(self) -> str | None:
+        """Answer plain password authentication using the shared one-shot state.
+
+        AsyncSSH calls this for the ordinary ``password`` method when no
+        password argument was supplied to ``connect``. Keeping this path in
+        the same callback as keyboard-interactive prevents a rejected
+        keyboard-interactive password from being sent a second time via the
+        ordinary method.
+        """
+        return self._take_config_password()
+
     async def kbdint_challenge_received(
         self,
         name: str,
@@ -507,11 +528,13 @@ class _BastionClient(_TrackedClient):
         if instructions:
             print(instructions, flush=True)
         loop = asyncio.get_event_loop()
-        saved = _passwords.get(BASTION_PASSWORD_KEY)
         responses = []
         for prompt, echo in prompts:
-            if saved and not self._password_sent and is_password_prompt(prompt):
-                self._password_sent = True
+            if is_password_prompt(prompt):
+                saved = self._take_config_password()
+            else:
+                saved = None
+            if saved is not None:
                 print(f"{prompt.rstrip()} (using [bastion] password from config)", flush=True)
                 answer = saved
             elif echo:
@@ -578,10 +601,9 @@ async def _connect_bastion() -> asyncssh.SSHClientConnection:
         port=b["port"],
         username=b["user"],
         client_keys=_bastion_client_keys(),
-        # Only consulted if the server offers the plain "password" method;
-        # the usual keyboard-interactive case is answered in
-        # _BastionClient.kbdint_challenge_received.
-        password=_passwords.get(BASTION_PASSWORD_KEY) or None,
+        # Both ordinary password auth and keyboard-interactive password
+        # prompts are answered by _BastionClient, which shares one
+        # per-connection send-once flag between the two paths.
         known_hosts=None,
         connect_timeout=BASTION_CONNECT_TIMEOUT,
         **_keepalive_kwargs(),

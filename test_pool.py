@@ -451,11 +451,22 @@ class BastionPasswordTests(unittest.IsolatedAsyncioTestCase):
         pool._passwords[pool.BASTION_PASSWORD_KEY] = "wrong"
         c = _bc()
         await self.answer(c, [("Password: ", False)])
+        # Falling through to AsyncSSH's ordinary password method must not
+        # send the same configured password a second time.
+        self.assertIsNone(c.password_auth_requested())
         resp, asked = await self.answer(c, [("Password: ", False)], ["typed"])
         self.assertEqual((resp, asked), (["typed"], ["Password: "]))
         # a fresh connection (reconnect) gets to try the saved one again
         resp, asked = await self.answer(_bc(), [("Password: ", False)])
         self.assertEqual((resp, asked), (["wrong"], []))
+
+    async def test_plain_password_auth_shares_send_once_state(self):
+        pool._passwords[pool.BASTION_PASSWORD_KEY] = "s3cret"
+        c = _bc()
+        self.assertEqual(c.password_auth_requested(), "s3cret")
+        self.assertIsNone(c.password_auth_requested())
+        resp, asked = await self.answer(c, [("Password: ", False)], ["typed"])
+        self.assertEqual((resp, asked), (["typed"], ["Password: "]))
 
     async def test_no_saved_password_prompts_as_before(self):
         resp, asked = await self.answer(_bc(), [("Password: ", False)], ["typed"])

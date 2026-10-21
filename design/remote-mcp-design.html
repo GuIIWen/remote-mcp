@@ -275,19 +275,42 @@ hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
 <section class="section" id="background">
 <h2>1. 背景与目标</h2>
 
-<p>开发者在 Windows 本机使用 Claude Code（CC）或 Codex，但实际的代码运行、调试、编译工作发生在内网 Linux 机器上。这两个世界之间有一道跳板机墙：所有内网机器只能通过跳板机访问，跳板机要求 TOTP 验证码认证。</p>
+<p>开发者在 Windows 本机使用 Claude Code（CC）或 Codex，但代码实际的运行、调试、编译都发生在另一个网络里的 Linux 机器上，比如公司内网、机房集群或云上的私有网络。本机通常不能直接访问这些机器，要先登录一台中转机器（跳板机、堡垒机、登录节点或网关机），再从那里跳转过去。中转机器的认证方式因环境而异：有的只需要 SSH 密钥，有的还要求二次验证（TOTP 验证码、动态口令等）。另外也有一部分机器，本机可以直接连上。</p>
 
-<p>目标是让 CC / Codex 能像操作本地文件一样操作远端 Linux，读文件、改代码、执行命令、搜索内容，而不是在 PowerShell 里手写 SSH 命令行。</p>
+<p>目标是给 CC / Codex 提供一个统一的远端操作入口：对 AI 来说，远端的一批 Linux 节点就像本地的工作区，可以读文件、改代码、执行命令、搜索内容，还能在多个节点之间对比和批量操作，不需要在 PowerShell 里手写 SSH 命令行。具体有以下几点：</p>
+
+<ul>
+  <li><strong>连接只建一次，反复复用</strong>：本机常驻一个 Daemon，用连接池维护到跳板机和各节点的 SSH 连接。跳板机只登录一次（有二次验证的环境也只验证一次），之后所有工具调用、所有会话和客户端都复用这些连接。不需要每条命令重新握手，并发调用也不会互相阻塞；断线后自动重连，空闲连接会先探活。</li>
+  <li><strong>多节点统一管理</strong>：节点在 <code>config.toml</code> 里集中配置，工具只需要传 <code>host</code> 参数，AI 不需要关心节点是经跳板机隧道、由跳板机代跑 ssh，还是本机直连，也不需要关心是否在容器里。同一个会话可以同时操作多个节点，例如：
+    <ul>
+      <li><strong>对比</strong>：对比多个节点的配置文件、驱动和软件版本、环境变量、日志，找出“这台正常、那台不正常”的差异；</li>
+      <li><strong>批量巡检</strong>：一次查看所有节点的磁盘、显卡、docker、进程状态并汇总；</li>
+      <li><strong>部署与运维</strong>：在多个节点上按步骤执行初始化、安装、服务部署和验收。</li>
+    </ul>
+  </li>
+  <li><strong>工具语义贴近本地</strong>：<code>read_file</code> / <code>edit_file</code> / <code>grep</code> / <code>glob_files</code> 和 CC 内置的 Read / Edit / Grep / Glob 一致，写文件是原子操作，模型不需要学习新用法。</li>
+  <li><strong>可以沉淀为 Skill</strong>：在工具之上，把固定的运维流程（节点初始化、推理服务部署等）写成 Skill，交给 AI 按步骤执行，关键或不可逆操作前先让用户确认。新增流程不需要修改 Daemon。</li>
+  <li><strong>远端零安装、可控可审计</strong>：跳板机和目标机不装任何组件；节点访问受白名单限制，命令和写操作可以记录到本地审计日志，私钥和密码都只留在本机。</li>
+  <li><strong>不绑定特定客户端</strong>：Daemon 是一个标准的 MCP Server（Streamable HTTP，<code>http://127.0.0.1:8765/mcp</code>），任何支持 MCP 的 Agent 都能接入。Claude Code 和 Codex 是主要的使用场景，Cursor、Cline、VS Code 的 Agent 模式、基于 Agent SDK 的自研 Agent 也可以接入。只支持 stdio 的客户端可以用 <code>mcp-remote</code> 桥接。所有客户端连接同一个 Daemon，共享同一组连接，跳板机不会因为多接一个客户端而多登录一次。注意：项目里的 Skill（<code>SKILL.md</code>）是 CC / Codex 的格式，其他 Agent 需要把其中的流程改写成各自的规则或提示词。</li>
+</ul>
 
 <h3>约束条件</h3>
 <ul>
-  <li>跳板机：标准 sshd，允许 TCP 转发，登录需要 TOTP 验证码</li>
+  <li>跳板机：标准 sshd，允许 TCP 转发；登录可能只用密钥，也可能附加 TOTP 等 keyboard-interactive 二次验证</li>
   <li>目标机：密钥认证，无需 TOTP</li>
   <li>直连节点：一部分机器不走跳板机，本机可以直接通过 <code>ip:port</code> 访问，用户名加密码或密钥/证书登录（见 3.4）</li>
   <li>hop 节点：一部分机器（多为计算节点）本机从没拿到过私钥，只有跳板机能免密登录，靠跳板机代跑 <code>ssh &lt;节点&gt;</code> 访问（见 3.5）</li>
   <li>Windows 本机：无 ControlMaster 支持（Windows OpenSSH 限制）</li>
-  <li>远端机器不能安装任何东西</li>
-  <li>需要同时支持 CC 和 Codex 两个客户端</li>
+  <li>远端不依赖额外安装：只使用远端系统自带的 sshd、bash 和 coreutils（<code>timeout</code>、<code>stat</code>、<code>base64</code> 等），有 <code>rg</code> 时优先使用，没有就退回 <code>grep</code>。这不是说远端禁止安装，而是工具本身不应该依赖安装，原因如下：
+    <ul>
+      <li><strong>权限</strong>：很多节点是共享集群或其他团队管理的机器，普通账号没有 root，也不允许自己部署常驻服务；</li>
+      <li><strong>规模和差异</strong>：节点多，操作系统、Python 版本、网络条件各不相同，逐台安装和升级的成本高，版本也容易不一致；</li>
+      <li><strong>易变</strong>：计算节点可能被重装，容器可能被重建，装在上面的东西会丢，丢了还要重新部署；</li>
+      <li><strong>新节点开箱即用</strong>：刚交付的节点只要能 ssh 上去就能管理，节点初始化（<code>node-setup</code>）这类场景本身就发生在“什么都还没装”的时候；</li>
+      <li><strong>集中维护和审计</strong>：逻辑都在本机的 Daemon 里，升级只改一处，审计日志也只在一处；</li>
+      <li><strong>安全</strong>：不在共享机器上新开端口或常驻进程，攻击面不会因为这个工具而扩大。</li>
+    </ul>
+  </li>
 </ul>
 </section>
 
@@ -507,9 +530,10 @@ async def kbdint_challenge_received(self, name, instructions, lang, prompts):
   <line x1="270" y1="75" x2="90" y2="75" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
   <text x="175" y="70" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="currentColor">kbdint challenge</text>
 
-  <!-- Step 3: user inputs TOTP -->
-  <rect x="10" y="83" width="140" height="22" rx="3" fill="#EEF3FD" stroke="#1A56DB" stroke-width="1"/>
-  <text x="80" y="98" font-size="10" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="#1A56DB">用户在 Daemon 窗口输入 TOTP ← 仅此一次</text>
+  <!-- Step 3: user answers the keyboard-interactive prompt (TOTP / password) -->
+  <rect x="4" y="80" width="152" height="30" rx="3" fill="#EEF3FD" stroke="#1A56DB" stroke-width="1"/>
+  <text x="80" y="92" font-size="10" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="#1A56DB">用户在 Daemon 窗口输入</text>
+  <text x="80" y="105" font-size="10" font-family="IBM Plex Sans, sans-serif" text-anchor="middle" fill="#1A56DB">验证码 / 密码（启动时一次）</text>
 
   <!-- Step 4: Daemon → Bastion send TOTP -->
   <line x1="80" y1="115" x2="270" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#arr2)"/>
@@ -538,7 +562,7 @@ async def kbdint_challenge_received(self, name, instructions, lang, prompts):
   <line x1="80" y1="205" x2="610" y2="205" stroke="#1A56DB" stroke-width="1.5" marker-end="url(#arr2)"/>
   <text x="350" y="200" font-size="10" font-family="IBM Plex Mono, monospace" text-anchor="middle" fill="#1A56DB">tool result</text>
 </svg>
-<figcaption>图 2 — 连接时序。TOTP 只出现在 Daemon 启动阶段（步骤 1–5），后续所有工具调用（步骤 6–10）不经过任何认证对话。</figcaption>
+<figcaption>图 2 — 连接时序。跳板机发来的 keyboard-interactive 挑战由它自己决定内容，可能是 TOTP 验证码，也可能是密码，Daemon 把提示原样显示在窗口里；只用密钥认证的跳板机不会有这一步。交互只发生在 Daemon 启动阶段（步骤 1–5），后续所有工具调用（步骤 6–10）不再认证；只有跳板机断线重连或调用 <code>reset_connections</code> 时才会再次提示。另外，配置了 <code>auth = "password"</code> 但没写密码的直连节点，会在启动时、登录跳板机之前单独提示输入一次密码（图中未画出）。</figcaption>
 </figure>
 
 <h3>3.3 keepalive 与断线重连</h3>
@@ -597,7 +621,7 @@ default_cwd = "&lt;远端家目录&gt;"</code></pre>
 
 <div class="callout warn">
   <span class="callout-icon">⚠</span>
-  <div><strong>密码存放：</strong>直连节点的密码可以明文写在 <code>config.toml</code> 的 <code>password</code> 字段。为此 <code>config.toml</code> 要加进 <code>.gitignore</code>，仓库里只提交不含真实凭据的模板 <code>config.example.toml</code>。<code>password</code> 留空时，Daemon 启动时会用 <code>getpass</code> 提示输入。两种来源的密码最终都只保存在进程内存 <code>_passwords[host]</code> 里，断线重连时直接复用，不会再提示。审计日志、错误信息和 <code>list_hosts</code> 的输出里都不能出现密码。</div>
+  <div><strong>密码存放：</strong>直连节点的密码可以明文写在 <code>config.toml</code> 的 <code>password</code> 字段。为此 <code>config.toml</code> 要加进 <code>.gitignore</code>，仓库里只提交不含真实凭据的模板 <code>config.example.toml</code>。<code>password</code> 留空时，Daemon 启动时会用 <code>getpass</code> 提示输入。运行中通过 <code>reload_config</code> 热更时：配置里写了密码的节点直接用新密码；没写密码但登录字段（via / address / port / user / auth）没变的节点，保留启动时输入的密码；其余情况无法交互输入，返回里提示需要重启。所有来源的密码最终都只保存在进程内存 <code>_passwords[host]</code> 里，断线重连时直接复用，不会再提示；节点被删除或改成密钥认证时，内存里的密码随之清除。审计日志、错误信息和 <code>list_hosts</code> 的输出里都不能出现密码（工具返回的错误统一经过 <code>_scrub</code> 脱敏；相关行为由 <code>tests/test_daemon.py</code>、<code>tests/test_pool.py</code> 和 <code>tests/test_tools.py</code> 覆盖）。</div>
 </div>
 
 <h4>启动顺序</h4>
@@ -702,7 +726,7 @@ async def get_target(host):
 <div class="tool-grid">
   <div class="tool-card">
     <div class="tool-name">list_hosts</div>
-    <div class="tool-desc">列出跳板机状态、白名单，以及每个已配置节点的路由（bastion / direct address:port）、认证方式和连接状态。无参数。</div>
+    <div class="tool-desc">列出跳板机状态、白名单，以及每个已配置节点的路由（bastion / direct address:port / hop via bastion，容器节点带 docker:容器名）、认证方式和连接状态。每次调用都读取当前生效的配置，<code>reload_config</code> 之后立即反映新增、删除的节点和新白名单；配置有变化的节点因为旧连接已关闭，会显示 disconnected，下次调用时重连。输出里不含密码。无参数。</div>
   </div>
   <div class="tool-card">
     <div class="tool-name">exec(host, command, cwd?, timeout?)</div>
@@ -865,11 +889,11 @@ audit_log = "D:/tools/remote-mcp/audit.jsonl"
 [hosts]
 allowed = ["dev1", "gpu-box", "10.0.1.*"]
 
-[host.dev1]
+[host.dev1]             # 没写 via = 默认 "bastion"：经跳板机隧道，以 用户名@dev1 登录
 user        = "&lt;远端用户名&gt;"
 default_cwd = "&lt;远端家目录&gt;"
 
-[host.gpu-box]
+[host.gpu-box]          # 同上，默认 bastion 路由；节点名 gpu-box 由跳板机解析
 user        = "user"
 default_cwd = "/workspace"
 
@@ -1066,7 +1090,19 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
 <p>以下功能不在 v1 范围内，列出供后续迭代参考：</p>
 
 <ul>
-  <li><strong>后台长任务</strong>：<code>exec(background=True)</code> 将命令放入 tmux 会话，返回 <code>job_id</code>；配合 <code>job_status</code> / <code>job_output</code> 轮询结果，适合编译和训练任务</li>
+  <li><strong>后台长任务</strong>：<code>exec(background=True)</code> 用 <code>setsid</code> 把命令放到独立的进程组里后台运行，立即返回 <code>job_id</code>；配合 <code>job_status</code> / <code>job_output</code> / <code>job_kill</code> 查看和控制，适合编译和训练任务。
+    <ul>
+      <li><strong>任务记录放在远端</strong>：每个任务一个目录 <code>~/.remote-mcp/jobs/&lt;job_id&gt;/</code>，存放命令、<code>pid</code>、<code>log</code>（stdout + stderr）和结束时写入的 <code>exit_code</code>。状态都在远端文件里，Daemon 重启或断线后照样能查。
+<pre><code>d=~/.remote-mcp/jobs/&lt;job_id&gt;; mkdir -p "$d"
+setsid bash -c 'cmd &gt; "$0/log" 2&gt;&amp;1; echo $? &gt; "$0/exit_code"' "$d" &lt; /dev/null &amp;
+echo $! &gt; "$d/pid"</code></pre></li>
+      <li><strong>job_status</strong>：有 <code>exit_code</code> 就是已结束，返回退出码；没有的话用 <code>kill -0 &lt;pid&gt;</code> 判断，进程还在就是运行中，进程不在又没有退出码，说明是被外部结束的（如 OOM、节点重启）。</li>
+      <li><strong>job_output</strong>：按字节偏移增量读取日志，每次只返回新增部分，套用现有的输出截断规则。</li>
+      <li><strong>job_kill</strong>：<code>setsid</code> 让任务成为独立进程组，用 <code>kill -- -&lt;pgid&gt;</code> 连同子进程一起结束（先 TERM，超时再 KILL）。</li>
+      <li><strong>不用 tmux</strong>：tmux 在计算节点和容器里经常没有装，依赖它违背“远端不依赖额外安装”的前提；而且退出码和完整日志 tmux 本身也不提供，仍然要自己落盘。<code>setsid</code>、<code>nohup</code> 属于系统自带工具，与容器模式下已经推荐的 <code>setsid nohup ... &amp;</code> 写法一致。</li>
+      <li><strong>其他</strong>：hop 和容器节点同样适用（脚本就是普通命令，路径为容器内路径）；任务目录需要清理策略（如 <code>job_list</code> 列出、按天数清理已结束的任务）。</li>
+    </ul>
+  </li>
   <li><strong>命令黑名单</strong>：在 <code>exec</code> 工具里拦截 <code>rm -rf /</code>、<code>mkfs</code>、<code>dd if=/dev/</code> 等危险模式，记录告警</li>
   <li><strong>只读模式</strong>：在 <code>config.toml</code> 里对特定主机开启 <code>readonly = true</code>，禁用 <code>exec</code>、<code>write_file</code>、<code>edit_file</code></li>
   <li><strong>tail_log</strong>：实时追尾日志文件，支持关键字过滤，通过 SSE 流式返回</li>

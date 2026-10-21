@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>remote-linux MCP · 图解说明</title>
+<style>
+:root {
+  --bg: #F6F6F3;
+  --surface: #FFFFFF;
+  --surface-2: #FAFAF8;
+  --border: #E3E1DA;
+  --text: #1B1B19;
+  --muted: #6A6A64;
+  --accent: #1A56DB;
+  --accent-bg: #EAF1FE;
+  --hop: #B45309;
+  --hop-bg: #FEF5E7;
+  --direct: #047857;
+  --direct-bg: #E9F8F1;
+  --warn: #C2410C;
+  --warn-bg: #FFF2EB;
+  --code-bg: #F0EFE9;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.04);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --bg: #121210;
+  --surface: #1B1B19;
+  --surface-2: #20201D;
+  --border: #2F2F2A;
+  --text: #ECEBE6;
+  --muted: #8F8F87;
+  --accent: #79A7FF;
+  --accent-bg: #18233D;
+  --hop: #F5A54A;
+  --hop-bg: #2B1D0B;
+  --direct: #4CD39B;
+  --direct-bg: #0E2219;
+  --warn: #FB923C;
+  --warn-bg: #2A1406;
+  --code-bg: #262622;
+  --shadow: none;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 16px; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--sans); font-size: 15px; line-height: 1.75;
+}
+code, pre { font-family: var(--mono); font-size: .86em; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre {
+  background: var(--code-bg); padding: 14px 16px; border-radius: 8px;
+  overflow-x: auto; line-height: 1.6; margin: 10px 0 16px; position: relative;
+}
+pre code { background: none; padding: 0; font-size: 1em; }
+a { color: var(--accent); }
+
+/* ── layout ─────────────────────────────── */
+.layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); max-width: 1220px; margin: 0 auto; gap: 40px; padding: 0 28px; }
+nav.side { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 36px 0 24px; font-size: .86rem; }
+nav.side .brand { font-weight: 700; font-size: .95rem; margin-bottom: 4px; }
+nav.side .sub { color: var(--muted); font-size: .78rem; margin-bottom: 20px; }
+nav.side ol { list-style: none; padding: 0; margin: 0; counter-reset: n; }
+nav.side li { counter-increment: n; }
+nav.side a { display: block; padding: 4px 10px; color: var(--muted); text-decoration: none; border-left: 2px solid transparent; }
+nav.side a::before { content: counter(n, decimal-leading-zero) "  "; font-family: var(--mono); font-size: .75rem; opacity: .6; }
+nav.side a:hover { color: var(--text); }
+nav.side a.active { color: var(--accent); border-left-color: var(--accent); }
+.theme-btn { margin-top: 20px; font: inherit; font-size: .8rem; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+main { padding: 36px 0 80px; min-width: 0; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; padding: 0 16px; }
+  nav.side { display: none; }
+}
+
+/* ── typography ─────────────────────────── */
+h1 { font-size: 2rem; line-height: 1.25; letter-spacing: -.02em; margin: 0 0 10px; }
+h2 { font-size: 1.35rem; letter-spacing: -.01em; margin: 64px 0 6px; }
+h2 .num { font-family: var(--mono); color: var(--accent); font-size: .9rem; margin-right: 10px; vertical-align: 2px; }
+.lead2 { color: var(--muted); margin: 0 0 22px; }
+h3 { font-size: 1.02rem; margin: 30px 0 8px; }
+p { margin: 0 0 12px; }
+ul, ol { padding-left: 1.3em; margin: 0 0 12px; }
+li { margin: 3px 0; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+
+/* ── hero ───────────────────────────────── */
+.hero { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 34px 34px 28px; box-shadow: var(--shadow); }
+.hero .tag { display: inline-block; font-size: .75rem; font-family: var(--mono); color: var(--accent); background: var(--accent-bg); border-radius: 999px; padding: 2px 10px; margin-bottom: 14px; }
+.hero .pitch { font-size: 1.08rem; margin: 0 0 22px; max-width: 760px; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.kpi { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.kpi b { display: block; font-size: 1.35rem; line-height: 1.3; }
+.kpi span { color: var(--muted); font-size: .82rem; }
+@media (max-width: 700px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+
+/* ── cards / grids ──────────────────────── */
+.grid { display: grid; gap: 14px; }
+.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 760px) { .g2, .g3 { grid-template-columns: 1fr; } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; box-shadow: var(--shadow); }
+.card h4 { margin: 0 0 6px; font-size: .95rem; }
+.card p:last-child, .card ul:last-child { margin-bottom: 0; }
+.card .ico { font-size: 1.2rem; margin-right: 6px; }
+
+.before-after { display: grid; grid-template-columns: 1fr 44px 1fr; align-items: stretch; gap: 0; margin: 18px 0; }
+.before-after .arrow { display: flex; align-items: center; justify-content: center; font-size: 1.5rem; color: var(--muted); }
+.ba-box { border-radius: 10px; padding: 16px 18px; border: 1px solid var(--border); }
+.ba-box.bad { background: var(--warn-bg); }
+.ba-box.good { background: var(--direct-bg); }
+.ba-box h4 { margin: 0 0 8px; font-size: .92rem; }
+.ba-box ul { margin: 0; font-size: .9rem; }
+@media (max-width: 760px) { .before-after { grid-template-columns: 1fr; } .before-after .arrow { transform: rotate(90deg); height: 36px; } }
+
+/* ── figure ─────────────────────────────── */
+figure { margin: 18px 0 22px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; box-shadow: var(--shadow); }
+figure svg { display: block; width: 100%; height: auto; }
+figcaption { color: var(--muted); font-size: .84rem; margin-top: 10px; }
+svg text { font-family: var(--sans); fill: var(--text); }
+svg .mono { font-family: var(--mono); }
+svg .mut { fill: var(--muted); }
+svg .zone { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 6 5; }
+svg .box { fill: var(--surface); stroke: var(--text); stroke-opacity: .55; stroke-width: 1.3; }
+svg .box-a { fill: var(--accent-bg); stroke: var(--accent); stroke-width: 1.5; }
+svg .box-h { fill: var(--hop-bg); stroke: var(--hop); stroke-width: 1.5; }
+svg .box-d { fill: var(--direct-bg); stroke: var(--direct); stroke-width: 1.5; }
+svg .box-m { fill: var(--surface); stroke: var(--accent); stroke-opacity: .5; stroke-width: 1; }
+svg .ln { stroke: var(--text); stroke-opacity: .6; stroke-width: 1.5; fill: none; }
+svg .ln-a { stroke: var(--accent); stroke-width: 1.8; fill: none; }
+svg .ln-h { stroke: var(--hop); stroke-width: 1.8; fill: none; }
+svg .ln-d { stroke: var(--direct); stroke-width: 1.8; fill: none; }
+svg .dash { stroke-dasharray: 6 4; }
+svg .t-a { fill: var(--accent); }
+svg .t-h { fill: var(--hop); }
+svg .t-d { fill: var(--direct); }
+
+/* ── route cards ────────────────────────── */
+.route { border-radius: 10px; padding: 16px 18px; border: 1px solid var(--border); background: var(--surface); border-top: 4px solid; box-shadow: var(--shadow); }
+.route.r-b { border-top-color: var(--accent); }
+.route.r-h { border-top-color: var(--hop); }
+.route.r-d { border-top-color: var(--direct); }
+.route .via { font-family: var(--mono); font-size: .82rem; font-weight: 600; }
+.r-b .via { color: var(--accent); } .r-h .via { color: var(--hop); } .r-d .via { color: var(--direct); }
+.route h4 { margin: 2px 0 8px; font-size: 1rem; }
+.route .path { font-family: var(--mono); font-size: .78rem; background: var(--code-bg); border-radius: 6px; padding: 8px 10px; margin: 8px 0 10px; line-height: 1.6; white-space: pre; overflow-x: auto; }
+.route dl { margin: 0; font-size: .86rem; display: grid; grid-template-columns: 64px 1fr; gap: 4px 8px; }
+.route dt { color: var(--muted); }
+.route dd { margin: 0; }
+
+/* ── pipeline ───────────────────────────── */
+.pipe { display: flex; flex-wrap: wrap; gap: 0; align-items: stretch; margin: 16px 0; }
+.pipe .st { flex: 1 1 150px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; position: relative; margin: 0 18px 12px 0; box-shadow: var(--shadow); }
+.pipe .st:not(:last-child)::after { content: "→"; position: absolute; right: -16px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 1rem; }
+.pipe .st .k { font-family: var(--mono); font-size: .72rem; color: var(--accent); }
+.pipe .st b { display: block; font-size: .9rem; margin: 2px 0 4px; }
+.pipe .st p { font-size: .8rem; color: var(--muted); margin: 0; line-height: 1.55; }
+
+/* ── tables ─────────────────────────────── */
+.tw { overflow-x: auto; margin: 10px 0 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .87rem; }
+th, td { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-weight: 600; background: var(--surface-2); white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+td code { white-space: nowrap; }
+.pill { display: inline-block; font-size: .74rem; padding: 0 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+.pill.ok { background: var(--direct-bg); color: var(--direct); }
+.pill.no { background: var(--warn-bg); color: var(--warn); }
+.pill.mid { background: var(--hop-bg); color: var(--hop); }
+
+/* ── callouts ───────────────────────────── */
+.callout { display: flex; gap: 10px; border-radius: 10px; padding: 12px 16px; margin: 14px 0; font-size: .9rem; border: 1px solid var(--border); }
+.callout .i { flex: none; font-weight: 700; }
+.callout.info { background: var(--accent-bg); } .callout.info .i { color: var(--accent); }
+.callout.warn { background: var(--warn-bg); } .callout.warn .i { color: var(--warn); }
+.callout.good { background: var(--direct-bg); } .callout.good .i { color: var(--direct); }
+
+/* ── steps ──────────────────────────────── */
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 18px 0; }
+.steps > li { counter-increment: s; position: relative; padding: 0 0 22px 52px; margin: 0; }
+.steps > li::before { content: counter(s); position: absolute; left: 0; top: 0; width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: .9rem; }
+:root[data-theme="dark"] .steps > li::before { color: #0B1220; }
+.steps > li:not(:last-child)::after { content: ""; position: absolute; left: 16px; top: 38px; bottom: 4px; width: 2px; background: var(--border); }
+.steps h4 { margin: 4px 0 6px; font-size: 1rem; }
+.where { font-size: .72rem; font-family: var(--mono); padding: 1px 7px; border-radius: 4px; background: var(--code-bg); color: var(--muted); margin-left: 6px; vertical-align: 1px; }
+
+/* ── decision tree ──────────────────────── */
+.tree { display: grid; gap: 10px; margin: 14px 0; }
+.q { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; box-shadow: var(--shadow); }
+.q .qt { font-weight: 600; font-size: .92rem; }
+.q .qt small { display: block; font-weight: 400; color: var(--muted); font-size: .8rem; }
+.q .ans { font-family: var(--mono); font-size: .82rem; font-weight: 600; padding: 4px 12px; border-radius: 6px; white-space: nowrap; }
+.ans.b { background: var(--accent-bg); color: var(--accent); }
+.ans.h { background: var(--hop-bg); color: var(--hop); }
+.ans.d { background: var(--direct-bg); color: var(--direct); }
+.q .no { color: var(--muted); font-size: .78rem; grid-column: 1 / -1; margin-top: -4px; }
+
+/* ── tool cards ─────────────────────────── */
+.tool { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; box-shadow: var(--shadow); }
+.tool .sig { font-family: var(--mono); font-size: .8rem; color: var(--accent); font-weight: 600; word-break: break-all; }
+.tool p { font-size: .84rem; margin: 6px 0 0; color: var(--text); }
+.tool .like { font-size: .72rem; color: var(--muted); margin-top: 6px; }
+.tool.rw { border-left: 3px solid var(--warn); }
+
+/* ── chat demo ──────────────────────────── */
+.chat { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: grid; gap: 10px; box-shadow: var(--shadow); }
+.msg { max-width: 88%; padding: 10px 14px; border-radius: 12px; font-size: .88rem; }
+.msg.u { justify-self: end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+:root[data-theme="dark"] .msg.u { color: #0B1220; }
+.msg.a { background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.msg.a .call { display: block; font-family: var(--mono); font-size: .76rem; color: var(--muted); margin: 2px 0; }
+
+.copy { position: absolute; top: 6px; right: 6px; font: 600 .7rem var(--sans); color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; cursor: pointer; opacity: 0; transition: opacity .15s; }
+pre:hover .copy { opacity: 1; }
+footer { color: var(--muted); font-size: .8rem; text-align: center; margin-top: 70px; padding-top: 20px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="side" aria-label="目录">
+  <div class="brand">remote-linux MCP</div>
+  <div class="sub">图解说明文档</div>
+  <ol>
+    <li><a href="#what">一句话看懂</a></li>
+    <li><a href="#background">背景与痛点</a></li>
+    <li><a href="#arch">整体架构</a></li>
+    <li><a href="#routes">三种连接路由</a></li>
+    <li><a href="#lifecycle">一次调用的全过程</a></li>
+    <li><a href="#tools">工具一览</a></li>
+    <li><a href="#reliability">可靠性设计</a></li>
+    <li><a href="#security">安全边界</a></li>
+    <li><a href="#usage">使用说明</a></li>
+    <li><a href="#choose">配置选型</a></li>
+    <li><a href="#scenarios">典型场景</a></li>
+    <li><a href="#faq">常见问题</a></li>
+    <li><a href="#limits">限制与路线图</a></li>
+    <li><a href="#code">代码地图</a></li>
+  </ol>
+  <button class="theme-btn" id="themeBtn" type="button">切换深色 / 浅色</button>
+</nav>
+
+<main>
+
+<!-- ═══════════════ 1. HERO ═══════════════ -->
+<section id="what">
+<div class="hero">
+  <span class="tag">MCP Server · Python · asyncssh · FastMCP</span>
+  <h1>remote-linux MCP：让 AI Agent 直接操作内网 Linux</h1>
+  <p class="pitch">一个跑在 <b>Windows 本机</b>的常驻小服务。它替 AI 编码助手打通“本机 → 跳板机 → 内网机器 / 计算节点 / 容器”这条链路，把远端的读文件、改代码、跑命令、搜索变成和本地一样的工具调用。<b>跳板机只登录一次（需要验证码的环境也只输一次），远端什么都不用装。</b></p>
+  <div class="kpis">
+    <div class="kpi"><b>1 次</b><span>每次启动只登录一次跳板机，所有会话复用</span></div>
+    <div class="kpi"><b>0 安装</b><span>跳板机和目标机不装任何组件</span></div>
+    <div class="kpi"><b>3 种路由</b><span>跳板机隧道 / 跳板机代跑 / 直连</span></div>
+    <div class="kpi"><b>9 个工具</b><span>语义对齐 Claude Code 内置的 Read / Edit / Grep</span></div>
+  </div>
+</div>
+
+<div class="before-after">
+  <div class="ba-box bad">
+    <h4>没有它：AI 在“墙外”干着急</h4>
+    <ul>
+      <li>代码在内网机器上，AI 只能看到本机</li>
+      <li>手写 <code>ssh host "..."</code>，引号层层转义</li>
+      <li>每条命令都要重新经跳板机握手，有验证码的环境每次都要输</li>
+      <li>计算节点的私钥只在跳板机上，本机连不过去</li>
+      <li>文件得来回复制粘贴给 AI 看</li>
+    </ul>
+  </div>
+  <div class="arrow">➜</div>
+  <div class="ba-box good">
+    <h4>有了它：对 AI 来说，远端就是“本地”</h4>
+    <ul>
+      <li>“帮我看下 dev1 上的训练日志” —— 直接读</li>
+      <li><code>edit_file</code> 精确替换并原子写入</li>
+      <li>一条跳板机长连接，后续调用不再认证</li>
+      <li>hop 路由让跳板机代跑 ssh，连容器里都能进</li>
+      <li>多个会话、多个 Agent 共用一组连接</li>
+    </ul>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ 2. BACKGROUND ═══════════════ -->
+<section id="background">
+<h2><span class="num">02</span>背景与痛点</h2>
+<p class="lead2">开发者在 Windows 上用 AI 编码助手，但代码的编译、运行、调试都在另一个网络里的 Linux 机器上，比如公司内网、机房集群或云上的私有网络。本机通常连不到这些机器，要先登录一台跳板机（堡垒机、登录节点或网关机）再跳转过去。</p>
+
+<div class="grid g2">
+  <div class="card"><h4><span class="ico">🧱</span>要经过跳板机中转</h4><p>目标机器只能从跳板机访问。跳板机的认证方式因环境而异：有的只用 SSH 密钥，有的还要 TOTP 验证码或动态口令。每条命令都重新经跳板机登录一次，慢且繁琐；有二次验证的环境基本没法用。</p></div>
+  <div class="card"><h4><span class="ico">🪟</span>Windows 没有 ControlMaster</h4><p>Linux/macOS 上可以用 OpenSSH 的 ControlMaster 复用连接，Windows 版 OpenSSH 不支持，没法靠 ssh 配置解决。</p></div>
+  <div class="card"><h4><span class="ico">🚫</span>不想在远端装东西</h4><p>节点常常没有 root 权限、数量多且环境各异，还可能被重装、重建。每台都部署一个服务，安装、升级和审计成本都很高；刚交付的新节点上也还什么都没有。所以工具只依赖远端自带的 sshd、bash 和 coreutils。</p></div>
+  <div class="card"><h4><span class="ico">🔑</span>节点类型五花八门</h4><p>有的走跳板机、有的本机能直连（密码或密钥）、有的计算节点只有跳板机持有私钥、有的服务跑在 docker 容器里。</p></div>
+</div>
+
+<h3>设计目标：给 AI 一个统一的远端工作区</h3>
+<p>目标不只是“能 ssh 上去”，而是让 AI Agent（Claude Code、Codex 或其他支持 MCP 的 Agent）把远端的一批 Linux 节点当成本地工作区来用：读文件、改代码、执行命令、搜索内容，还能在多个节点之间对比和批量操作。</p>
+
+<figure>
+<svg viewBox="0 0 920 300" role="img" aria-label="没有连接池与有连接池的对比">
+  <defs><marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+  <text x="20" y="26" font-size="13" font-weight="700" fill="var(--warn)">没有连接池：每次调用单独连接</text>
+  <g font-size="11">
+    <rect class="box" x="20" y="44" width="90" height="30" rx="6"/><text x="65" y="64" text-anchor="middle" class="mono">exec</text>
+    <rect class="box" x="20" y="84" width="90" height="30" rx="6"/><text x="65" y="104" text-anchor="middle" class="mono">read_file</text>
+    <rect class="box" x="20" y="124" width="90" height="30" rx="6"/><text x="65" y="144" text-anchor="middle" class="mono">grep</text>
+    <rect class="box" x="20" y="164" width="90" height="30" rx="6"/><text x="65" y="184" text-anchor="middle" class="mono">exec</text>
+  </g>
+  <g stroke="var(--warn)" stroke-width="1.5" fill="none">
+    <path d="M110,59 L268,59" marker-end="url(#m3)"/><path d="M110,99 L268,99" marker-end="url(#m3)"/>
+    <path d="M110,139 L268,139" marker-end="url(#m3)"/><path d="M110,179 L268,179" marker-end="url(#m3)"/>
+  </g>
+  <g font-size="10" fill="var(--warn)" text-anchor="middle">
+    <text x="190" y="53">握手 + 认证 (+ 验证码)</text><text x="190" y="93">握手 + 认证 (+ 验证码)</text>
+    <text x="190" y="133">握手 + 认证 (+ 验证码)</text><text x="190" y="173">握手 + 认证 (+ 验证码)</text>
+  </g>
+  <rect class="box" x="272" y="44" width="130" height="150" rx="8"/>
+  <text x="337" y="114" text-anchor="middle" font-size="13" font-weight="600">跳板机</text>
+  <text x="337" y="134" text-anchor="middle" font-size="10.5" class="mut">每次都重新登录</text>
+  <g font-size="11.5">
+    <text x="20" y="228">✗ 每次调用都要等握手，有验证码时每次都要人工输入</text>
+    <text x="20" y="250">✗ 多个会话各连各的，连接数随会话数增长</text>
+    <text x="20" y="272">✗ 断线、超时、并发上限都要调用方自己处理</text>
+  </g>
+
+  <line x1="452" y1="16" x2="452" y2="284" stroke="var(--border)" stroke-width="1.5"/>
+
+  <text x="480" y="26" font-size="13" font-weight="700" class="t-d">有连接池：登录一次，所有调用复用</text>
+  <g font-size="11">
+    <rect class="box" x="480" y="44" width="84" height="26" rx="6"/><text x="522" y="61" text-anchor="middle" class="mono">CC 会话 A</text>
+    <rect class="box" x="480" y="78" width="84" height="26" rx="6"/><text x="522" y="95" text-anchor="middle" class="mono">CC 会话 B</text>
+    <rect class="box" x="480" y="112" width="84" height="26" rx="6"/><text x="522" y="129" text-anchor="middle" class="mono">其他 Agent</text>
+  </g>
+  <g class="ln-a"><path d="M564,57 L604,90" marker-end="url(#m3)"/><path d="M564,91 L604,94" marker-end="url(#m3)"/><path d="M564,125 L604,100" marker-end="url(#m3)"/></g>
+  <rect class="box-a" x="606" y="54" width="122" height="84" rx="8"/>
+  <text x="667" y="82" text-anchor="middle" font-size="13" font-weight="700" class="t-a">连接池</text>
+  <text x="667" y="100" text-anchor="middle" font-size="10" class="t-a">复用 · 限流 · 探活</text>
+  <text x="667" y="116" text-anchor="middle" font-size="10" class="t-a">断线重连 · 心跳</text>
+  <path class="ln" stroke-width="3" d="M728,96 L776,96" marker-end="url(#m3)"/>
+  <text x="752" y="88" text-anchor="middle" font-size="9.5" class="mut">1 条长连接</text>
+  <rect class="box" x="780" y="54" width="70" height="84" rx="8"/>
+  <text x="815" y="100" text-anchor="middle" font-size="12" font-weight="600">跳板机</text>
+  <g class="ln-a dash"><path d="M850,70 L878,58" marker-end="url(#m3)"/><path d="M850,96 L878,96" marker-end="url(#m3)"/><path d="M850,122 L878,134" marker-end="url(#m3)"/></g>
+  <g font-size="10" class="mono"><text x="882" y="61">dev1</text><text x="882" y="99">nmz01</text><text x="882" y="137">gpu..</text></g>
+  <g font-size="11.5">
+    <text x="480" y="186">✓ 跳板机只登录一次，后续调用直接开 channel</text>
+    <text x="480" y="208">✓ 多个会话、多个客户端共享同一组连接</text>
+    <text x="480" y="230">✓ 每个节点独立加锁和限流，并发调用互不阻塞</text>
+    <text x="480" y="252">✓ 断线自动重连，空闲连接复用前先探活</text>
+    <text x="480" y="274">✓ 各节点的连接已就绪，跨节点操作不用等握手</text>
+  </g>
+</svg>
+<figcaption>图 0　连接池的作用。左边：每次调用都重新登录跳板机。右边：Daemon 常驻，连接只建一次，之后所有调用都复用。</figcaption>
+</figure>
+
+<div class="grid g3">
+  <div class="card"><h4><span class="ico">🔍</span>多节点对比</h4><p class="small">“dev1 能跑、dev2 不行，帮我找差异”：AI 在两个节点上分别读取配置、查看驱动和依赖版本、环境变量和日志，然后对比给出结论。</p></div>
+  <div class="card"><h4><span class="ico">📋</span>批量巡检</h4><p class="small">一句话检查所有节点的磁盘、显卡、docker、进程和服务状态，汇总成一张表。节点都在连接池里，不用逐台登录。</p></div>
+  <div class="card"><h4><span class="ico">🚀</span>部署与运维</h4><p class="small">把节点初始化、推理服务部署等流程写成 Skill，AI 在多个节点上按步骤执行并验收，不可逆操作前先让用户确认。</p></div>
+  <div class="card"><h4><span class="ico">🧭</span>屏蔽网络差异</h4><p class="small">无论节点是经跳板机隧道、由跳板机代跑 ssh、本机直连还是在容器里，AI 都只需要传 <code>host="..."</code>。</p></div>
+  <div class="card"><h4><span class="ico">✍️</span>本地化的工具语义</h4><p class="small">Read / Edit / Grep / Glob 的用法照搬，写文件是原子操作。AI 不需要学新工具，也不用拼引号转义。</p></div>
+  <div class="card"><h4><span class="ico">🛡️</span>可控可审计</h4><p class="small">白名单限定可访问的节点，命令和写操作记录到本地审计日志；私钥、密码不离开本机，远端不装任何组件。</p></div>
+</div>
+
+<h3>为什么选“本地 HTTP Daemon + asyncssh 连接池”</h3>
+<div class="tw"><table>
+<thead><tr><th>方案</th><th>跳板机登录频率</th><th>远端依赖</th><th>主要问题</th></tr></thead>
+<tbody>
+<tr><td>PowerShell 里直接 <code>ssh host "..."</code></td><td><span class="pill no">每条命令</span></td><td>无</td><td>无连接复用、引号转义困难、每次重新握手</td></tr>
+<tr><td>stdio 模式，每个会话拉起一个 MCP 进程</td><td><span class="pill mid">每个会话</span></td><td>无</td><td>进程随会话重建，跳板机连接无法复用</td></tr>
+<tr><td>在远端部署 MCP Server</td><td><span class="pill mid">按需</span></td><td><span class="pill no">每台都要装</span></td><td>维护成本高、环境差异大、无法统一审计</td></tr>
+<tr><td><b>本地常驻 HTTP Daemon（本项目）</b></td><td><span class="pill ok">仅启动时一次</span></td><td><span class="pill ok">无</span></td><td>需要一个保持前台的窗口</td></tr>
+</tbody></table></div>
+
+<div class="callout info"><span class="i">核心思路</span><div>跳板机连接只建一次并常驻；之后访问目标机用 <code>asyncssh.connect(target, tunnel=bastion_conn)</code> 在这条已认证的连接上开 <code>direct-tcpip</code> 隧道，不再重复登录跳板机。Daemon 以 Streamable HTTP 暴露 MCP，多个客户端会话共享同一个连接池。</div></div>
+<div class="callout info"><span class="i">关于 TOTP</span><div>本文后面说的“输入 TOTP”，泛指跳板机登录时的交互式验证（keyboard-interactive，比如验证码、动态口令）。如果你的跳板机只用密钥认证，启动和重连时都不会弹出提示，相关注意事项可以忽略。</div></div>
+</section>
+
+<!-- ═══════════════ 3. ARCH ═══════════════ -->
+<section id="arch">
+<h2><span class="num">03</span>整体架构</h2>
+<p class="lead2">所有逻辑都在本机：客户端只和 <code>127.0.0.1:8765</code> 说话，Daemon 负责连接、路由、超时、重试和审计。</p>
+
+<figure>
+<svg viewBox="0 0 960 470" role="img" aria-label="整体架构图">
+  <defs>
+    <marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker>
+  </defs>
+  <!-- local zone -->
+  <rect class="zone" x="14" y="14" width="430" height="442" rx="12"/>
+  <text x="32" y="38" class="mono mut" font-size="12">Windows 本机</text>
+
+  <rect class="box" x="44" y="54" width="170" height="52" rx="8"/>
+  <text x="129" y="77" text-anchor="middle" font-size="14" font-weight="600">Claude Code</text>
+  <text x="129" y="95" text-anchor="middle" font-size="11" class="mono mut">MCP client</text>
+  <rect class="box" x="244" y="54" width="170" height="52" rx="8"/>
+  <text x="329" y="77" text-anchor="middle" font-size="14" font-weight="600">Codex / 其他 Agent</text>
+  <text x="329" y="95" text-anchor="middle" font-size="11" class="mono mut">MCP client</text>
+
+  <path class="ln-a" d="M129,106 L190,146" marker-end="url(#m)"/>
+  <path class="ln-a" d="M329,106 L268,146" marker-end="url(#m)"/>
+  <text x="229" y="128" text-anchor="middle" font-size="11" class="mono t-a">HTTP · 127.0.0.1:8765/mcp</text>
+
+  <rect class="box-a" x="44" y="148" width="370" height="226" rx="10"/>
+  <text x="62" y="172" font-size="14" font-weight="700" class="t-a">MCP Daemon</text>
+  <text x="396" y="172" text-anchor="end" font-size="11" class="mono t-a">uv run daemon.py</text>
+
+  <rect class="box-m" x="62" y="184" width="334" height="54" rx="7"/>
+  <text x="76" y="205" font-size="13" font-weight="600">tools.py · 工具层</text>
+  <text x="76" y="225" font-size="11" class="mut">9 个 MCP 工具 · 路径解析 · 输出截断 · 审计 · 脱敏</text>
+
+  <rect class="box-m" x="62" y="248" width="334" height="54" rx="7"/>
+  <text x="76" y="269" font-size="13" font-weight="600">pool.py · 连接池</text>
+  <text x="76" y="289" font-size="11" class="mut">路由分派 · 锁/信号量 · 超时包装 · 断线重试 · 心跳</text>
+
+  <rect class="box-m" x="62" y="312" width="334" height="50" rx="7"/>
+  <text x="76" y="333" font-size="13" font-weight="600">daemon.py · 入口</text>
+  <text x="76" y="351" font-size="11" class="mut">读配置 · 交互输入 TOTP/密码 · 启动 HTTP 服务</text>
+
+  <rect class="box" x="44" y="394" width="176" height="46" rx="7" stroke-dasharray="4 3"/>
+  <text x="132" y="414" text-anchor="middle" font-size="12" font-weight="600">config.toml</text>
+  <text x="132" y="430" text-anchor="middle" font-size="10.5" class="mut">节点 / 白名单 / 凭据（gitignore）</text>
+  <rect class="box" x="238" y="394" width="176" height="46" rx="7" stroke-dasharray="4 3"/>
+  <text x="326" y="414" text-anchor="middle" font-size="12" font-weight="600">audit.jsonl</text>
+  <text x="326" y="430" text-anchor="middle" font-size="10.5" class="mut">命令与写操作审计（可选）</text>
+
+  <!-- intranet -->
+  <rect class="zone" x="476" y="14" width="470" height="442" rx="12"/>
+  <text x="494" y="38" class="mono mut" font-size="12">内网</text>
+
+  <rect class="box" x="506" y="168" width="150" height="74" rx="9"/>
+  <text x="581" y="196" text-anchor="middle" font-size="14" font-weight="700">跳板机</text>
+  <text x="581" y="214" text-anchor="middle" font-size="11" class="mono mut">bastion</text>
+  <text x="581" y="231" text-anchor="middle" font-size="11" class="mut">密钥（+ 可选验证码）</text>
+
+  <path class="ln" d="M414,206 L504,206" marker-end="url(#m)"/>
+  <text x="459" y="196" text-anchor="middle" font-size="10.5" class="mono">SSH 长连接</text>
+  <text x="459" y="222" text-anchor="middle" font-size="10.5" class="mut">仅登录一次</text>
+
+  <!-- bastion target -->
+  <rect class="box-a" x="772" y="56" width="152" height="62" rx="9"/>
+  <text x="848" y="81" text-anchor="middle" font-size="14" font-weight="700">dev1</text>
+  <text x="848" y="100" text-anchor="middle" font-size="11" class="mono t-a">via = "bastion"</text>
+  <path class="ln-a dash" d="M656,186 C700,150 720,96 770,88" marker-end="url(#m)"/>
+  <text x="700" y="118" font-size="10.5" class="mono t-a">direct-tcpip 隧道</text>
+
+  <!-- hop target -->
+  <rect class="box-h" x="772" y="170" width="152" height="62" rx="9"/>
+  <text x="848" y="195" text-anchor="middle" font-size="14" font-weight="700">nmz01</text>
+  <text x="848" y="214" text-anchor="middle" font-size="11" class="mono t-h">via = "hop"</text>
+  <path class="ln-h" d="M656,204 L770,202" marker-end="url(#m)"/>
+  <text x="713" y="194" text-anchor="middle" font-size="10.5" class="mono t-h">ssh nmz01 '…'</text>
+  <text x="713" y="222" text-anchor="middle" font-size="10" class="t-h">跳板机代跑</text>
+  <rect class="box-h" x="790" y="252" width="116" height="38" rx="7" stroke-dasharray="4 3"/>
+  <text x="848" y="276" text-anchor="middle" font-size="11.5" class="mono t-h">docker 容器</text>
+  <path class="ln-h dash" d="M848,232 L848,250" marker-end="url(#m)"/>
+
+  <!-- direct -->
+  <rect class="box-d" x="772" y="350" width="152" height="62" rx="9"/>
+  <text x="848" y="375" text-anchor="middle" font-size="14" font-weight="700">lab3</text>
+  <text x="848" y="394" text-anchor="middle" font-size="11" class="mono t-d">via = "direct"</text>
+  <path class="ln-d" d="M414,344 C560,344 640,382 770,382" marker-end="url(#m)"/>
+  <text x="600" y="350" text-anchor="middle" font-size="10.5" class="mono t-d">SSH 直连 · 密钥或密码</text>
+  <text x="600" y="404" text-anchor="middle" font-size="10" class="t-d">不经过跳板机，不受其断线影响</text>
+</svg>
+<figcaption>图 1　整体拓扑。蓝色：经跳板机隧道直达目标机（本机私钥认证）；橙色：跳板机自己 ssh 到计算节点（私钥在跳板机上），可进一步进入容器；绿色：本机直连。三条路对 AI 来说完全一样，只需要传 <code>host="..."</code>。</figcaption>
+</figure>
+
+<h3>模块分工</h3>
+<div class="tw"><table>
+<thead><tr><th>模块</th><th>负责</th><th>不负责</th></tr></thead>
+<tbody>
+<tr><td><code>tools.py</code></td><td>定义 MCP 工具签名；路径解析（<code>default_cwd</code>、<code>~</code>）；拼远端命令；输出截断；审计与密码脱敏</td><td>不直接持有 SSH 连接</td></tr>
+<tr><td><code>pool.py</code></td><td>维护跳板机/目标机连接；按 <code>via</code> 分派路由；并发控制；远端 timeout 包装；断线诊断与重试；心跳；配置校验与热更</td><td>不了解 MCP 协议和工具语义</td></tr>
+<tr><td><code>daemon.py</code></td><td>加载并校验配置；启动时预连接密码节点、登录跳板机；启动心跳和 HTTP 服务</td><td>不含业务逻辑</td></tr>
+<tr><td><code>setup_ssh_keys.py</code></td><td>独立小工具：用密码登录直连节点，批量装公钥、记录指纹、验证免密</td><td>不经过跳板机，不参与 daemon 运行</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ═══════════════ 4. ROUTES ═══════════════ -->
+<section id="routes">
+<h2><span class="num">04</span>三种连接路由</h2>
+<p class="lead2">每个节点在 <code>config.toml</code> 里用 <code>via</code> 字段选择路由。工具层的用法完全一致，区别只在 Daemon 内部怎么连。</p>
+
+<div class="grid g3">
+  <div class="route r-b">
+    <div class="via">via = "bastion"（默认）</div>
+    <h4>经跳板机隧道</h4>
+    <div class="path">本机 ══SSH══▶ 跳板机
+       └─tunnel─▶ dev1</div>
+    <dl>
+      <dt>适用</dt><dd>内网普通开发机，本机公钥已放到目标机</dd>
+      <dt>认证</dt><dd>本机私钥（不经过跳板机）</dd>
+      <dt>文件</dt><dd>SFTP 原子写</dd>
+      <dt>并发</dt><dd>每节点 8 个 channel</dd>
+    </dl>
+  </div>
+  <div class="route r-h">
+    <div class="via">via = "hop"</div>
+    <h4>跳板机代跑 ssh</h4>
+    <div class="path">本机 ══SSH══▶ 跳板机
+   跳板机$ ssh nmz01 '…'
+     [└▶ docker exec 容器]</div>
+    <dl>
+      <dt>适用</dt><dd>计算节点：只有跳板机能免密登录，本机没有私钥</dd>
+      <dt>认证</dt><dd>跳板机上已有的密钥</dd>
+      <dt>文件</dt><dd>base64 经 stdin 传输 + mv 原子写</dd>
+      <dt>并发</dt><dd>所有 hop 节点合计 8 个</dd>
+    </dl>
+  </div>
+  <div class="route r-d">
+    <div class="via">via = "direct"</div>
+    <h4>本机直连</h4>
+    <div class="path">本机 ══SSH══▶ lab3
+  (address:port)</div>
+    <dl>
+      <dt>适用</dt><dd>本机网络直接可达的机器</dd>
+      <dt>认证</dt><dd>密钥 / OpenSSH 证书 / 密码</dd>
+      <dt>文件</dt><dd>SFTP 原子写</dd>
+      <dt>特点</dt><dd>不依赖跳板机，跳板机断线不受影响</dd>
+    </dl>
+  </div>
+</div>
+
+<h3>hop 路由的细节</h3>
+<p>hop 节点在跳板机上实际执行的命令形如：</p>
+<pre><code>ssh -o BatchMode=yes -o ControlMaster=auto \
+    -o ControlPath=~/.ssh/remote-mcp-%C -o ControlPersist=10m \
+    [-p &lt;port&gt;] [-l &lt;user&gt;] nmz01 '&lt;timeout 包装后的命令&gt;'</code></pre>
+<ul>
+  <li><b>BatchMode=yes</b>：禁止任何交互提示。缺密钥或 host key 不对时 ssh 以 255 退出，Daemon 将其包装为 <code>HopSSHError</code> 并附带 stderr，而不是卡住。</li>
+  <li><b>ControlMaster</b>：在跳板机这一侧复用到节点的连接，连续调用不用每次重新握手。</li>
+  <li><b>容器模式</b>：配置 <code>container</code> 后，命令再包一层 <code>docker exec -i [-u 用户] 容器 bash -c …</code>，<code>default_cwd</code> 和所有路径都是容器内路径。同一个 <code>node</code> 可以配多个段对应不同容器。</li>
+</ul>
+</section>
+
+<!-- ═══════════════ 5. LIFECYCLE ═══════════════ -->
+<section id="lifecycle">
+<h2><span class="num">05</span>一次工具调用的全过程</h2>
+<p class="lead2">以 <code>exec(host="dev1", command="make -j8", cwd="src")</code> 为例：</p>
+
+<div class="pipe">
+  <div class="st"><span class="k">tools.py</span><b>① 审计</b><p>写入 <code>audit.jsonl</code>（host / action / 命令）</p></div>
+  <div class="st"><span class="k">tools.py</span><b>② 拼路径</b><p><code>cd default_cwd &amp;&amp; cd src &amp;&amp;</code>，与其它工具的相对路径规则一致</p></div>
+  <div class="st"><span class="k">pool.py</span><b>③ 白名单 + 路由</b><p>检查 <code>[hosts] allowed</code>，按 <code>via</code> 选连接方式</p></div>
+  <div class="st"><span class="k">pool.py</span><b>④ 取连接</b><p>复用池中连接；空闲超过 120 秒先探活，失效就重连</p></div>
+  <div class="st"><span class="k">pool.py</span><b>⑤ 超时包装</b><p><code>timeout -k 5 N bash -c '…'</code>，由远端负责杀进程</p></div>
+  <div class="st"><span class="k">pool.py</span><b>⑥ 执行</b><p>信号量限流；客户端另有 N+15 秒兜底</p></div>
+  <div class="st"><span class="k">tools.py</span><b>⑦ 返回</b><p>exit_code / stdout / stderr，超过 30K 字符时保留首尾</p></div>
+</div>
+
+<figure>
+<svg viewBox="0 0 900 300" role="img" aria-label="连接时序图">
+  <defs><marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+  <text x="90" y="22" text-anchor="middle" font-size="12.5" font-weight="600">AI Agent</text>
+  <text x="320" y="22" text-anchor="middle" font-size="12.5" font-weight="600">Daemon</text>
+  <text x="560" y="22" text-anchor="middle" font-size="12.5" font-weight="600">跳板机</text>
+  <text x="800" y="22" text-anchor="middle" font-size="12.5" font-weight="600">dev1</text>
+  <g class="ln" stroke-dasharray="3 4" stroke-opacity=".3">
+    <line x1="90" y1="32" x2="90" y2="290"/><line x1="320" y1="32" x2="320" y2="290"/>
+    <line x1="560" y1="32" x2="560" y2="290"/><line x1="800" y1="32" x2="800" y2="290"/>
+  </g>
+  <rect x="200" y="40" width="460" height="92" rx="8" fill="var(--accent-bg)" opacity=".7"/>
+  <text x="210" y="56" font-size="10.5" class="mono t-a">启动阶段（仅一次）</text>
+  <path class="ln" d="M320,70 L556,70" marker-end="url(#m2)"/><text x="438" y="64" text-anchor="middle" font-size="10.5" class="mono">SSH connect（密钥）</text>
+  <path class="ln" d="M560,90 L324,90" marker-end="url(#m2)"/><text x="438" y="84" text-anchor="middle" font-size="10.5" class="mono">keyboard-interactive 挑战</text>
+  <text x="314" y="112" text-anchor="end" font-size="10.5" class="t-a">如需验证码 / 密码，在 Daemon 窗口输入</text>
+  <path class="ln" d="M320,120 L556,120" marker-end="url(#m2)"/><text x="438" y="114" text-anchor="middle" font-size="10.5" class="mono">认证通过 → 连接常驻</text>
+
+  <text x="210" y="158" font-size="10.5" class="mono mut">之后每次工具调用（不再认证）</text>
+  <path class="ln-a" d="M90,176 L316,176" marker-end="url(#m2)"/><text x="203" y="170" text-anchor="middle" font-size="10.5" class="mono t-a">exec(host="dev1")</text>
+  <path class="ln dash" d="M320,200 L556,200" marker-end="url(#m2)"/><text x="438" y="194" text-anchor="middle" font-size="10.5" class="mono">open direct-tcpip</text>
+  <path class="ln dash" d="M560,200 L796,200" marker-end="url(#m2)"/><text x="678" y="194" text-anchor="middle" font-size="10.5" class="mono">TCP 转发 + 本机密钥认证</text>
+  <path class="ln" d="M800,230 L324,230" marker-end="url(#m2)"/><text x="560" y="224" text-anchor="middle" font-size="10.5" class="mono">stdout / stderr / exit_code</text>
+  <path class="ln-a" d="M320,260 L94,260" marker-end="url(#m2)"/><text x="203" y="254" text-anchor="middle" font-size="10.5" class="mono t-a">tool result</text>
+  <text x="560" y="284" text-anchor="middle" font-size="10" class="mut">目标机连接建立后也会缓存，后续调用直接开 channel</text>
+</svg>
+<figcaption>图 2　连接时序。跳板机的交互式验证（验证码或密码，由跳板机决定）只发生在启动阶段，只用密钥的跳板机没有这一步；之后的工具调用都复用已认证的连接，断线重连时才会再次提示。直连节点如果用密码登录且配置里没写密码，也会在启动时提示输入一次。</figcaption>
+</figure>
+</section>
+
+<!-- ═══════════════ 6. TOOLS ═══════════════ -->
+<section id="tools">
+<h2><span class="num">06</span>工具一览</h2>
+<p class="lead2">工具语义刻意贴近 Claude Code 内置工具，模型不需要学习新概念。左侧带红边的是写操作，会记录审计日志。</p>
+<div class="grid g3">
+  <div class="tool"><div class="sig">list_hosts()</div><p>跳板机状态、白名单，以及每个节点的路由、认证方式、连接状态。不含密码。</p><div class="like">建议每次会话先调一次</div></div>
+  <div class="tool rw"><div class="sig">exec(host, command, cwd?, timeout=60)</div><p>执行 shell 命令，返回退出码、stdout、stderr。相对 <code>cwd</code> 基于 <code>default_cwd</code>。</p><div class="like">≈ Bash</div></div>
+  <div class="tool"><div class="sig">read_file(host, path, offset=1, limit=2000)</div><p>按行分页读取，带行号前缀。</p><div class="like">≈ Read</div></div>
+  <div class="tool rw"><div class="sig">write_file(host, path, content)</div><p>整文件覆盖，先写临时文件再 rename，保留原权限，跟随软链接。</p><div class="like">≈ Write</div></div>
+  <div class="tool rw"><div class="sig">edit_file(host, path, old_str, new_str, replace_all?)</div><p>精确替换；<code>old_str</code> 不唯一时报错并要求补充上下文。</p><div class="like">≈ Edit</div></div>
+  <div class="tool"><div class="sig">grep(host, pattern, path?, glob?, context?)</div><p>远端有 <code>rg</code> 就用 rg，否则退回 <code>grep -rnE</code>，自动跳过 .git。</p><div class="like">≈ Grep</div></div>
+  <div class="tool"><div class="sig">glob_files(host, pattern, base?)</div><p>支持 <code>**</code> 的文件匹配，最多返回 200 条。</p><div class="like">≈ Glob</div></div>
+  <div class="tool"><div class="sig">reload_config()</div><p>热更 <code>[host.*]</code> 和 <code>[hosts]</code>，不断开跳板机、不重新输 TOTP。失败时保留旧配置。</p><div class="like">加节点不用重启</div></div>
+  <div class="tool"><div class="sig">reset_connections()</div><p>关闭所有连接，下次调用时重建。会再次触发 TOTP。</p><div class="like">连接异常时的手动兜底</div></div>
+</div>
+
+<div class="callout info"><span class="i">路径规则</span><div><code>exec</code> 的 <code>cwd</code>、<code>glob_files</code> 的 <code>base</code>、以及 <code>read_file</code> / <code>write_file</code> / <code>edit_file</code> / <code>grep</code> 的相对路径，都以节点的 <code>default_cwd</code> 为基准解析；<code>~</code> 和 <code>~/...</code> 会展开。因此 <code>exec("ls src")</code> 和 <code>read_file("src/a.py")</code> 一定指向同一个目录。</div></div>
+</section>
+
+<!-- ═══════════════ 7. RELIABILITY ═══════════════ -->
+<section id="reliability">
+<h2><span class="num">07</span>可靠性设计</h2>
+<p class="lead2">跳板机连接一断就要再输 TOTP，所以项目在“保持连接”和“出错时怎么处理”上做了较多设计。</p>
+
+<div class="grid g2">
+  <div class="card"><h4>🫀 三层保活</h4>
+    <ul class="small">
+      <li><b>SSH keepalive</b>：每 15 秒一次，连续 8 次无响应判定断线（可配置）。</li>
+      <li><b>心跳</b>：每 60 秒在已有的跳板机连接上开一个 channel 跑 <code>true</code>，防止跳板机按“channel 无活动”踢人。心跳<b>不会自己重连</b>，所以不会凭空弹出 TOTP。</li>
+      <li><b>空闲探活</b>：连接空闲超过 120 秒后，复用前先用 5 秒探测一次，半死连接提前重建。</li>
+    </ul></div>
+  <div class="card"><h4>🔍 断线诊断</h4>
+    <p class="small">断线时在 Daemon 窗口打印连接时长、空闲时长和推断原因，例如：</p>
+    <ul class="small">
+      <li>存活时长是整数（如 <code>~1h</code>）→ 可能是会话时长上限</li>
+      <li>空闲时长是整数 → 可能是空闲超时策略</li>
+      <li><code>exc=None</code> → 对端主动断开</li>
+      <li><code>keepalive failure</code> → 网络问题</li>
+    </ul></div>
+</div>
+
+<h3>错误处理策略：哪些会重试，哪些不会</h3>
+<div class="tw"><table>
+<thead><tr><th>情况</th><th>处理</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>网络断开（ConnectionLost / DisconnectError / OSError）</td><td><span class="pill ok">重连并重试 1 次</span></td><td>属于可恢复的瞬时故障</td></tr>
+<tr><td>认证失败 <code>PermissionDenied</code></td><td><span class="pill no">不重试</span></td><td>重试错误密码可能导致账号被锁；跳板机上还会重复要求 TOTP</td></tr>
+<tr><td>建连超时 <code>TimeoutError</code></td><td><span class="pill no">不重试</span></td><td>重试会让等待时间翻倍</td></tr>
+<tr><td>命令超时（退出码 124 / 137）</td><td><span class="pill mid">报 RemoteTimeout</span></td><td>远端 <code>timeout</code> 已经结束了进程</td></tr>
+<tr><td>hop 节点 ssh 失败（退出码 255）</td><td><span class="pill no">不重试，报 HopSSHError</span></td><td>属于跳板机侧的密钥或配置问题，重试解决不了</td></tr>
+<tr><td><code>edit_file</code> 写成功后断线</td><td><span class="pill ok">幂等保护</span></td><td>重试时检测到已完成，不会重复替换或误报“未找到”</td></tr>
+</tbody></table></div>
+
+<div class="grid g3">
+  <div class="card"><h4>⚛️ 原子写</h4><p class="small">先写 <code>.mcp.tmp</code>，再 <code>chmod</code> 和 rename 替换，目标文件只会是旧版本或新版本。保留原权限，写入软链接时修改的是链接指向的文件。</p></div>
+  <div class="card"><h4>🚦 并发限流</h4><p class="small">sshd 默认每条连接最多 10 个 channel。每个节点限 8 个并发；所有 hop 节点共用一条跳板机连接，因此合计限 8 个。</p></div>
+  <div class="card"><h4>🔒 断线隔离</h4><p class="small">跳板机断线时只清理经它连接的节点，direct 节点不受影响。每个节点有独立的建连锁，互不阻塞。</p></div>
+</div>
+</section>
+
+<!-- ═══════════════ 8. SECURITY ═══════════════ -->
+<section id="security">
+<h2><span class="num">08</span>安全边界</h2>
+<div class="grid g2">
+  <div class="card"><h4>✅ 已有的防护</h4><ul class="small">
+    <li><b>只监听 127.0.0.1</b>，局域网其它机器访问不到</li>
+    <li><b>主机白名单</b> <code>[hosts] allowed</code>，支持通配符</li>
+    <li><b>私钥留在本机</b>，不开 agent forwarding</li>
+    <li>密码只保存在进程内存中，<b>错误信息会脱敏</b>，<code>list_hosts</code> 和审计日志里不出现密码</li>
+    <li><code>config.toml</code> / <code>nodes.yaml</code> 已加入 gitignore</li>
+    <li>容器名、用户名做了字符集校验，避免命令注入</li>
+    <li>direct 节点可配置 <code>known_hosts</code> 校验 host key</li>
+  </ul></div>
+  <div class="card"><h4>⚠️ 需要知道的边界</h4><ul class="small">
+    <li><b>没有命令黑名单</b>：AI 发出的 <code>rm -rf</code> 会被执行。重要机器请依赖客户端的权限确认，或不要放进白名单。</li>
+    <li>任何能访问本机 8765 端口的进程都能调用工具（目前没有鉴权）。</li>
+    <li>客户端如果能修改 <code>config.toml</code>，可以放宽白名单后调用 <code>reload_config</code> 生效。</li>
+    <li>bastion / hop 路由默认不校验 host key。</li>
+  </ul></div>
+</div>
+</section>
+
+<!-- ═══════════════ 9. USAGE ═══════════════ -->
+<section id="usage">
+<h2><span class="num">09</span>使用说明</h2>
+<p class="lead2">从零到可用大约 10 分钟。完整说明见 <code>DEPLOY.md</code>。</p>
+
+<ol class="steps">
+<li>
+  <h4>安装依赖 <span class="where">本机 PowerShell</span></h4>
+  <p>需要 Python 3.11+，推荐用 <a href="https://docs.astral.sh/uv/">uv</a>（无需管理员权限）。</p>
+<pre><code>irm https://astral.sh/uv/install.ps1 | iex     # 已装可跳过
+cd &lt;REMOTE_MCP_DIR&gt;
+uv venv --python 3.11
+uv pip install -r requirements.txt</code></pre>
+  <p class="small muted">如果报 <code>No module named 'pywintypes'</code>：运行 <code>&amp; .venv\Scripts\python.exe .venv\Scripts\pywin32_postinstall.py -install</code>。</p>
+</li>
+<li>
+  <h4>填写配置 <span class="where">config.toml</span></h4>
+<pre><code>copy config.example.toml config.toml</code></pre>
+<pre><code>[bastion]
+host = "bastion.example.com"
+user = "&lt;跳板机用户名&gt;"
+
+[daemon]
+port      = 8765
+audit_log = "D:/tools/remote-mcp/audit.jsonl"   # 可选
+
+[hosts]
+allowed = ["dev1", "nmz01", "nmz01-ctr", "lab3"]
+
+[host.dev1]                  # 经跳板机隧道（默认）
+user        = "&lt;远端用户名&gt;"
+default_cwd = "&lt;远端家目录&gt;"  # 在远端 echo $HOME 确认
+
+[host.nmz01-ctr]             # 跳板机代跑 + 进入容器
+via       = "hop"
+node      = "nmz01"
+container = "&lt;容器名&gt;"
+default_cwd = "/workspace"
+
+[host.lab3]                  # 本机直连
+via     = "direct"
+address = "192.168.10.23"
+user    = "&lt;远端用户名&gt;"
+auth    = "key"              # 或 "password"（留空则启动时输入）
+default_cwd = "&lt;远端家目录&gt;"</code></pre>
+  <p class="small muted">各字段的说明见 <code>config.example.toml</code> 里的注释。不确定用哪种 <code>via</code> 时，参考 <a href="#choose">配置选型</a>。</p>
+</li>
+<li>
+  <h4>配置免密登录 <span class="where">一次性</span></h4>
+  <ul>
+    <li><b>bastion 路由</b>：把本机公钥加到跳板机和目标机的 <code>~/.ssh/authorized_keys</code>（权限 700 / 600）。</li>
+    <li><b>direct 节点较多时</b>：用脚本批量配置，只要这些机器目前能用密码登录：
+<pre><code>copy nodes.example.yaml nodes.yaml   # 填 ip / port / 密码
+uv run setup_ssh_keys.py nodes.yaml  # 登录 → 记录指纹 → 装公钥 → 验证免密</code></pre></li>
+    <li><b>hop 节点</b>：本机不需要做任何事，只需确认在跳板机上 <code>ssh -o BatchMode=yes nmz01 hostname</code> 能直接返回结果。</li>
+  </ul>
+</li>
+<li>
+  <h4>启动 Daemon <span class="where">独立的前台窗口</span></h4>
+<pre><code>cd &lt;REMOTE_MCP_DIR&gt;
+uv run daemon.py
+# Verification code: ******     ← 输入 TOTP
+# remote-mcp listening on http://127.0.0.1:8765/mcp</code></pre>
+  <div class="callout warn"><span class="i">注意</span><div>这个窗口要<b>一直保持在前台、可以输入</b>。跳板机断线重连时会在这里再次要求 TOTP，在此之前所有工具调用会一直等待。也不要让 AI 在后台替你启动它，后台没有终端，会卡在输入提示上。</div></div>
+</li>
+<li>
+  <h4>接入客户端 <span class="where">只需一次</span></h4>
+<pre><code># Claude Code（用户级，所有项目可用）
+claude mcp add --transport http --scope user remote-linux http://127.0.0.1:8765/mcp</code></pre>
+<pre><code># Codex：~/.codex/config.toml
+[mcp_servers.remote-linux]
+url = "http://127.0.0.1:8765/mcp"</code></pre>
+  <p><b>其他 Agent</b>（Cursor、Cline、VS Code Agent 模式、基于 Agent SDK 的自研 Agent 等）：Daemon 是标准的 MCP Server，在对应客户端的 MCP 配置里添加同一个地址即可。</p>
+<pre><code># 支持 Streamable HTTP 的客户端：直接填 URL
+http://127.0.0.1:8765/mcp
+
+# 只支持 stdio 的客户端：用 mcp-remote 桥接
+command = "npx"
+args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]</code></pre>
+  <p class="small muted">各客户端的配置文件位置和字段名不一样，以它们自己的文档为准。所有客户端共享同一个 Daemon 和同一组连接，多接一个客户端不会多登录一次跳板机。项目附带的 Skill 是 CC / Codex 的 <code>SKILL.md</code> 格式，其他 Agent 需要把其中的流程改写成各自的规则或提示词。</p>
+</li>
+<li>
+  <h4>验证 <span class="where">在 Agent 里</span></h4>
+  <p>依次让 AI 调用：<code>list_hosts</code>（跳板机显示 connected）→ <code>exec(host="dev1", command="pwd")</code>（返回 <code>default_cwd</code>）→ <code>read_file</code> 读取一个已知文件。三步都正常就可以使用了。</p>
+</li>
+</ol>
+
+<h3>日常使用：直接用自然语言</h3>
+<div class="chat">
+  <div class="msg u">dev1 上 ~/proj 的单元测试挂了，帮我看看原因并修掉</div>
+  <div class="msg a">
+    <span class="call">→ exec(host="dev1", cwd="proj", command="pytest -x -q 2>&amp;1 | tail -40")</span>
+    <span class="call">→ grep(host="dev1", pattern="def parse_header", path="proj")</span>
+    <span class="call">→ read_file(host="dev1", path="proj/io/header.py", offset=80, limit=60)</span>
+    <span class="call">→ edit_file(host="dev1", path="proj/io/header.py", old_str="…", new_str="…")</span>
+    <span class="call">→ exec(host="dev1", cwd="proj", command="pytest -x -q")</span>
+    原因是 <code>parse_header</code> 没处理空行，已修复，42 个测试全部通过。
+  </div>
+  <div class="msg u">在 nmz01-ctr 容器里看一下显卡占用，再把 /workspace/logs 里最新的报错找出来</div>
+  <div class="msg u">同一个推理服务，nmz01 起得来，nmz02 起不来，帮我对比一下两台的差异</div>
+  <div class="msg a">
+    <span class="call">→ exec(host="nmz01", command="hy-smi; docker images | head; cat /etc/docker/daemon.json")</span>
+    <span class="call">→ exec(host="nmz02", command="hy-smi; docker images | head; cat /etc/docker/daemon.json")</span>
+    <span class="call">→ grep(host="nmz02", pattern="error|Error", path="/data0/logs", context=3)</span>
+    两台的主要差异：nmz02 的驱动版本较旧，有 2 张卡处于 offline 状态，日志中的报错与此对应。建议先在 nmz02 上处理驱动问题。
+  </div>
+</div>
+
+<h3>运维小抄</h3>
+<div class="tw"><table>
+<thead><tr><th>我想…</th><th>怎么做</th></tr></thead>
+<tbody>
+<tr><td>新增或修改节点、改白名单</td><td>编辑 <code>config.toml</code> 后让 AI 调用 <code>reload_config</code>，无需重启</td></tr>
+<tr><td>修改 <code>[bastion]</code> / <code>[daemon]</code></td><td>重启 Daemon</td></tr>
+<tr><td>连接异常、一直报错</td><td>调用 <code>reset_connections</code>（会重新要求 TOTP）</td></tr>
+<tr><td>查 AI 执行过哪些命令</td><td>配置 <code>audit_log</code>，查看 <code>audit.jsonl</code></td></tr>
+<tr><td>跑耗时较长的任务（训练、编译）</td><td>用 <code>nohup … &amp;</code> 或 <code>setsid</code> 放到后台，再用 <code>tail</code> 轮询日志；单次 <code>exec</code> 默认 60 秒超时</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ═══════════════ 10. CHOOSE ═══════════════ -->
+<section id="choose">
+<h2><span class="num">10</span>配置选型：我的机器该用哪种 via？</h2>
+<p class="lead2">从上往下判断，命中第一条就停。</p>
+<div class="tree">
+  <div class="q"><div class="qt">本机能直接 ping 通 / ssh 到这台机器吗？<small>不经过跳板机，网络直接可达</small></div><span class="ans d">via = "direct"</span>
+    <div class="no">密码登录也可以；之后建议用 setup_ssh_keys.py 改成密钥登录</div></div>
+  <div class="q"><div class="qt">能把本机公钥放进这台机器的 authorized_keys 吗？<small>只能经跳板机访问，但你可以登录它并修改自己的 ~/.ssh</small></div><span class="ans b">via = "bastion"</span>
+    <div class="no">这是默认值，可以不写 via</div></div>
+  <div class="q"><div class="qt">只有在跳板机上执行 ssh &lt;节点&gt; 才能登录？<small>典型情况：计算节点，私钥在跳板机上</small></div><span class="ans h">via = "hop"</span>
+    <div class="no">如果要在节点上的 docker 容器里工作，另起一段加上 node + container</div></div>
+</div>
+</section>
+
+<!-- ═══════════════ 11. SCENARIOS ═══════════════ -->
+<section id="scenarios">
+<h2><span class="num">11</span>典型场景与上层生态</h2>
+<p class="lead2">remote-linux MCP 提供的是基础的远端操作能力。在此之上可以用 Skill 把运维流程固化下来，交给 AI 执行。</p>
+
+<div class="grid g3">
+  <div class="card"><h4>🧑‍💻 远程开发调试</h4><p class="small">在内网开发机上看代码、改代码、跑测试、查日志，体验和本地仓库一样。</p></div>
+  <div class="card"><h4>🖥️ 集群节点巡检</h4><p class="small">一句话让 AI 在多个节点上查磁盘、显卡、docker、进程状态并汇总。</p></div>
+  <div class="card"><h4>📦 容器内工作</h4><p class="small">通过 hop + container，直接在计算节点的容器里排查推理或训练服务。</p></div>
+</div>
+
+<h3>已有的配套 Skill</h3>
+<div class="tw"><table>
+<thead><tr><th>Skill</th><th>作用</th><th>依赖的工具</th></tr></thead>
+<tbody>
+<tr><td><code>remote-linux-mcp</code></td><td>引导安装、填写配置、接入客户端和排障（项目内自带，位于 <code>.claude/skills/</code>）</td><td>—</td></tr>
+<tr><td><code>node-setup</code></td><td>新 GPU/DCU 节点初始化：勘察 → 挂盘 → 安装 docker 并修改 data-root → 安装 DCU 驱动。先勘察后执行，破坏性操作前先确认</td><td><code>exec</code></td></tr>
+<tr><td><code>sglang-pd-deploy</code></td><td>在指定节点上部署 sglang PD 分离推理服务（mooncake + prefill/decode + router）并验收</td><td><code>exec</code> / <code>write_file</code> / <code>read_file</code> / <code>list_hosts</code></td></tr>
+</tbody></table></div>
+<div class="callout good"><span class="i">扩展方式</span><div>新的运维流程不需要修改 Daemon：写一个 Skill，在其中说明“用 <code>exec</code> 运行哪些脚本、哪些步骤需要用户确认”即可。</div></div>
+</section>
+
+<!-- ═══════════════ 12. FAQ ═══════════════ -->
+<section id="faq">
+<h2><span class="num">12</span>常见问题</h2>
+<div class="tw"><table>
+<thead><tr><th>现象</th><th>原因与处理</th></tr></thead>
+<tbody>
+<tr><td>工具调用一直没有返回</td><td>多半是 Daemon 窗口在等待 TOTP，切过去输入即可</td></tr>
+<tr><td>空闲一段时间后又要 TOTP</td><td>跳板机断开了连接，看 Daemon 窗口的 <code>hint:</code> 判断是会话时长上限、空闲策略还是网络问题</td></tr>
+<tr><td><code>Host '…' is not in the allowed list</code></td><td>加入 <code>[hosts] allowed</code> 后调用 <code>reload_config</code></td></tr>
+<tr><td>相对路径找不到文件</td><td><code>default_cwd</code> 填错了。家目录不一定是 <code>/home/&lt;用户名&gt;</code>（有的集群是 <code>/public/home/&lt;用户名&gt;</code>），先在远端 <code>echo $HOME</code> 确认</td></tr>
+<tr><td>hop 节点报 <code>ssh to … on the bastion failed</code></td><td>跳板机自身 ssh 不到该节点，登录跳板机运行 <code>ssh -o BatchMode=yes 节点 hostname</code> 复现</td></tr>
+<tr><td>容器节点报 <code>No such container</code></td><td>容器名写错或容器未运行；确认跳板机用户在该节点上能不加 sudo 执行 <code>docker</code></td></tr>
+<tr><td>端口被占用</td><td>修改 <code>[daemon] port</code>，并同步修改客户端里配置的 URL</td></tr>
+<tr><td>direct 节点密码错误</td><td>交互输入最多试 3 次，配置文件中的密码只试 1 次，失败则跳过该节点，不影响其它节点</td></tr>
+</tbody></table></div>
+<p class="small muted">更多排障项见 <code>DEPLOY.md</code> 第 8 节。</p>
+</section>
+
+<!-- ═══════════════ 13. LIMITS ═══════════════ -->
+<section id="limits">
+<h2><span class="num">13</span>限制与路线图</h2>
+<div class="grid g2">
+  <div class="card"><h4>当前限制</h4><ul class="small">
+    <li>Daemon 必须在前台窗口常驻；窗口被关闭后需要重新启动并输入 TOTP</li>
+    <li>只支持一台跳板机</li>
+    <li>只能本机访问，没有鉴权</li>
+    <li>单次 <code>exec</code> 是同步的，长任务需要自己放后台再轮询</li>
+    <li>每次 <code>exec</code> 都是新 shell，<code>cd</code> 和环境变量不会保留</li>
+    <li>容器模式下超时只会结束跳板机上的 ssh/docker 客户端，容器内已启动的进程不一定被结束</li>
+    <li>不支持二进制文件上传和下载</li>
+  </ul></div>
+  <div class="card"><h4>规划中（TODO.md / 设计文档）</h4><ul class="small">
+    <li><b>多台并列跳板机</b>：<code>via = "&lt;跳板机名&gt;"</code>，每台单独输入 TOTP</li>
+    <li><b>局域网访问</b>：可配置监听地址 + <code>api_key</code>（Bearer 鉴权）；绑定非回环地址但没有 key 时拒绝启动</li>
+    <li>后台任务：<code>exec(background=True)</code> 用 <code>setsid</code> 后台运行，任务记录（pid / 日志 / 退出码）放在远端，配合 <code>job_status</code> / <code>job_output</code> / <code>job_kill</code> 使用，不依赖 tmux</li>
+    <li>命令黑名单和只读节点（<code>readonly = true</code>）</li>
+    <li>SFTP 上传和下载、实时 tail 日志</li>
+  </ul></div>
+</div>
+</section>
+
+<!-- ═══════════════ 14. CODE MAP ═══════════════ -->
+<section id="code">
+<h2><span class="num">14</span>代码地图</h2>
+<p class="lead2">想读源码或参与修改时，从这里开始。</p>
+<pre><code>remote-mcp/
+├── daemon.py              入口：main() → 校验配置 → 预连接密码节点 → 登录跳板机 → 心跳 + HTTP 服务
+├── tools.py               @mcp.tool() 定义的 9 个工具；hop 节点的读写实现 _hop_read_raw / _hop_write_raw
+├── pool.py                连接池核心
+│   ├── validate_config / load_config / apply_config   配置校验与热更
+│   ├── get_bastion / get_target                       建连（锁、白名单、空闲探活）
+│   ├── run / with_sftp                                执行入口，含重试规则
+│   ├── hop_ssh_command / _run_hop                     hop 路由命令拼接
+│   ├── _timeout_wrap                                  远端 timeout 包装
+│   └── heartbeat_loop / classify_drop                 心跳与断线诊断
+├── setup_ssh_keys.py      批量为 direct 节点配置免密
+├── tests/                 单元测试：test_pool.py / test_daemon.py / test_tools.py（python -m unittest discover）
+├── config.example.toml    配置模板（含逐项注释）
+├── nodes.example.yaml     setup_ssh_keys.py 的节点清单模板
+├── design/                文档目录
+│   ├── DEPLOY.md              部署指南
+│   ├── TODO.md                待办：多跳板机、局域网访问
+│   ├── remote-mcp-design.html 详细设计文档
+│   └── remote-mcp-guide.html  图解说明文档（本文）
+└── .claude/skills/remote-linux-mcp/SKILL.md   安装与使用 Skill</code></pre>
+<p class="small muted">依赖：<code>mcp[cli]</code>（FastMCP，Streamable HTTP）、<code>asyncssh</code>、<code>pyyaml</code>（仅 setup_ssh_keys.py 使用）。</p>
+</section>
+
+<footer>remote-linux MCP · 图解说明文档 · 2026-10 · 设计细节见 remote-mcp-design.html，部署步骤见 DEPLOY.md</footer>
+</main>
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var saved = localStorage.getItem('rmcp-theme');
+  if (saved) root.setAttribute('data-theme', saved);
+  else if (window.matchMedia('(prefers-color-scheme: dark)').matches) root.setAttribute('data-theme', 'dark');
+  document.getElementById('themeBtn').addEventListener('click', function () {
+    var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    localStorage.setItem('rmcp-theme', next);
+  });
+
+  document.querySelectorAll('pre').forEach(function (pre) {
+    var b = document.createElement('button');
+    b.className = 'copy'; b.type = 'button'; b.textContent = '复制';
+    b.addEventListener('click', function () {
+      var text = pre.querySelector('code').innerText;
+      navigator.clipboard.writeText(text).then(function () {
+        b.textContent = '已复制'; setTimeout(function () { b.textContent = '复制'; }, 1200);
+      });
+    });
+    pre.appendChild(b);
+  });
+
+  var links = Array.prototype.slice.call(document.querySelectorAll('nav.side a'));
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.toggle('active', l.getAttribute('href') === '#' + e.target.id); });
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  document.querySelectorAll('main section[id]').forEach(function (s) { obs.observe(s); });
+})();
+</script>
+</body>
+</html>

@@ -12,7 +12,7 @@ remote-linux 是一个跑在 **Windows 本机**的 MCP daemon（Python + asyncss
 - 直连节点（`via = "direct"`）：直接连 `address:port`，用密钥/证书或密码登录，不经过跳板机。
 - 跳板机和目标机上**不装任何东西**，也不建服务目录；远端唯一的改动是 `authorized_keys`。
 
-下文 `<REPO>` 指包含 `daemon.py` 的仓库目录（这个 skill 放在 `<REPO>\.claude\skills\remote-linux-mcp\` 下）。不确定在哪就先问用户，不要猜。完整说明见 `<REPO>\DEPLOY.md`，设计见 `<REPO>\remote-mcp-design.html`。
+下文 `<REPO>` 指包含 `daemon.py` 的仓库目录（这个 skill 放在 `<REPO>\.claude\skills\remote-linux-mcp\` 下）。不确定在哪就先问用户，不要猜。完整说明见 `<REPO>\design\DEPLOY.md`，设计见 `<REPO>\design\remote-mcp-design.html`。
 
 ## 0. 安装这个 skill
 
@@ -262,4 +262,4 @@ args    = ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
 | 连接超时 | `Test-NetConnection <地址> -Port <端口>` 检查可达性，必要时调大 `connect_timeout` |
 | 端口被占用 | 改 `[daemon] port`，同步更新客户端 URL |
 
-更多情况见 `<REPO>\DEPLOY.md` 第 8 节。
+更多情况见 `<REPO>\design\DEPLOY.md` 第 8 节。

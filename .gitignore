@@ -2,9 +2,8 @@
 config.toml
 nodes.yaml
 
-# Local-only docs
-DEPLOY.md
-TODO.md
+# Local scratch files
+.tmp_claude/
 
 # Audit logs
 audit.jsonl

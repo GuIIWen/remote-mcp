@@ -210,7 +210,10 @@ nodes:
 | 文件 | 内容 |
 |---|---|
 | `config.example.toml` | 配置模板，每个字段都有注释 |
-| `remote-mcp-design.html` | 设计文档 |
+| `design/DEPLOY.md` | 部署指南：环境、完整配置字段、密钥部署、排障 |
+| `design/remote-mcp-design.html` | 设计文档 |
+| `design/remote-mcp-guide.html` | 图解说明文档 |
+| `design/TODO.md` | 待办：多跳板机、局域网访问 |
 | `.claude/skills/remote-linux-mcp/` | 安装与使用 Skill |
 | `tests/` | 单元测试（`test_pool.py`、`test_daemon.py`、`test_tools.py`），不连真实 SSH |
 

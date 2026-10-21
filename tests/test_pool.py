@@ -1,6 +1,6 @@
 """Unit tests for pool.py's connection-robustness logic (drop classification,
 keepalive/heartbeat config, heartbeat, idle probe). No real SSH: connections
-are fakes. Run from this directory:  python -m unittest test_pool -v"""
+are fakes. Run from the repo root:  python -m unittest tests.test_pool -v"""
 import asyncio
 import contextlib
 import io
@@ -47,17 +47,20 @@ def capture():
 
 class PoolTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._saved = (pool.cfg, pool._bastion_conn, dict(pool._target_conns))
+        self._saved = (pool.cfg, pool._bastion_conn, dict(pool._target_conns), dict(pool._passwords))
         pool.cfg = {}
         pool._bastion_conn = None
         pool._target_conns.clear()
         pool._conn_stats.clear()
+        pool._passwords.clear()
         pool._bastion_lock = asyncio.Lock()
 
     def tearDown(self):
-        pool.cfg, pool._bastion_conn, targets = self._saved
+        pool.cfg, pool._bastion_conn, targets, passwords = self._saved
         pool._target_conns.clear()
         pool._target_conns.update(targets)
+        pool._passwords.clear()
+        pool._passwords.update(passwords)
         pool._conn_stats.clear()
 
 
@@ -483,6 +486,100 @@ class BastionPasswordTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("key" in e for e in errors))
         errors, _ = pool.validate_config({"bastion": {"key": __file__}})
         self.assertEqual(errors, [])
+def _direct_pw(**kw) -> dict:
+    hc = {"via": "direct", "address": "10.0.0.4", "port": 22, "user": "u", "auth": "password"}
+    hc.update(kw)
+    return hc
+
+
+class PasswordTests(PoolTestCase):
+    """Direct+password nodes: password reaches asyncssh, is never retried,
+    and survives / is dropped across reload_config (apply_config) correctly."""
+
+    async def test_connect_uses_password_and_offers_no_keys(self):
+        pool.cfg = {"host": {"lab4": _direct_pw()}}
+        pool._passwords["lab4"] = "s3cret"
+        with mock.patch.object(pool.asyncssh, "connect", mock.AsyncMock(return_value=FakeConn())) as c:
+            await pool.get_target("lab4")
+        kwargs = c.await_args.kwargs
+        self.assertEqual(c.await_args.args, ("10.0.0.4",))
+        self.assertEqual(kwargs["password"], "s3cret")
+        self.assertIsNone(kwargs["client_keys"])  # rejected keys would count toward lockout
+        self.assertIsNone(kwargs["agent_path"])
+        self.assertNotIn("tunnel", kwargs)
+
+    async def test_reconnect_reuses_password_silently(self):
+        pool.cfg = {"host": {"lab4": _direct_pw()}}
+        pool._passwords["lab4"] = "s3cret"
+        with mock.patch.object(pool.asyncssh, "connect", mock.AsyncMock(return_value=FakeConn())) as c:
+            await pool.get_target("lab4")
+            pool._invalidate_target("lab4")
+            await pool.get_target("lab4")
+        self.assertEqual([k.kwargs["password"] for k in c.await_args_list], ["s3cret", "s3cret"])
+
+    async def test_run_does_not_retry_permission_denied(self):
+        pool.cfg = {"host": {"lab4": _direct_pw()}}
+        with mock.patch.object(pool, "get_target", mock.AsyncMock(
+                side_effect=asyncssh.PermissionDenied("denied"))) as g:
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.run("lab4", "true")
+        self.assertEqual(g.await_count, 1)
+
+    def test_reload_adds_node_with_config_password(self):
+        pool.cfg = {"host": {}}
+        s = pool.apply_config({"host": {"lab4": _direct_pw(password="s3cret")}})
+        self.assertEqual(s["added"], ["lab4"])
+        self.assertEqual(s["need_password"], [])
+        self.assertEqual(pool._passwords["lab4"], "s3cret")
+
+    def test_reload_adds_node_without_password_needs_restart(self):
+        pool.cfg = {"host": {}}
+        s = pool.apply_config({"host": {"lab4": _direct_pw()}})
+        self.assertEqual(s["need_password"], ["lab4"])
+        self.assertNotIn("lab4", pool._passwords)
+
+    def test_reload_keeps_typed_password_when_login_unchanged(self):
+        pool.cfg = {"host": {"lab4": _direct_pw(default_cwd="/a")}}
+        pool._passwords["lab4"] = "typed"
+        s = pool.apply_config({"host": {"lab4": _direct_pw(default_cwd="/b")}})
+        self.assertEqual(s["changed"], ["lab4"])
+        self.assertEqual(s["need_password"], [])
+        self.assertEqual(pool._passwords["lab4"], "typed")
+
+    def test_reload_drops_typed_password_when_login_changed(self):
+        for field, value in (("address", "10.0.0.99"), ("user", "other"), ("port", 2222)):
+            pool.cfg = {"host": {"lab4": _direct_pw()}}
+            pool._passwords["lab4"] = "typed"
+            s = pool.apply_config({"host": {"lab4": _direct_pw(**{field: value})}})
+            self.assertEqual(s["need_password"], ["lab4"], field)
+            self.assertNotIn("lab4", pool._passwords, field)
+
+    def test_reload_config_password_overrides_typed(self):
+        pool.cfg = {"host": {"lab4": _direct_pw()}}
+        pool._passwords["lab4"] = "typed"
+        pool.apply_config({"host": {"lab4": _direct_pw(password="fromfile")}})
+        self.assertEqual(pool._passwords["lab4"], "fromfile")
+
+    def test_reload_drops_password_on_remove_or_switch_to_key(self):
+        pool.cfg = {"host": {"lab4": _direct_pw(), "lab5": _direct_pw(address="10.0.0.5")}}
+        pool._passwords.update({"lab4": "p4", "lab5": "p5"})
+        conn = FakeConn()
+        pool._target_conns["lab4"] = conn
+        s = pool.apply_config({"host": {"lab5": _direct_pw(address="10.0.0.5", auth="key")}})
+        self.assertEqual(s["removed"], ["lab4"])
+        self.assertEqual(pool._passwords, {})
+        self.assertTrue(conn.closed)
+        self.assertNotIn("lab4", pool._target_conns)
+
+    def test_validate_warns_password_on_non_direct(self):
+        _, warnings = pool.validate_config({
+            "bastion": {"host": "b"},
+            "host": {"dev1": {"password": "x"}, "n1": {"via": "hop", "password": "x"}},
+        })
+        self.assertEqual(len(warnings), 2)
+        for w in warnings:
+            self.assertIn("password", w)
+            self.assertNotIn("'x'", w)
 
 
 if __name__ == "__main__":

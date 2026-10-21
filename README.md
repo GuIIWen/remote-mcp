@@ -212,9 +212,11 @@ nodes:
 | `config.example.toml` | 配置模板，每个字段都有注释 |
 | `remote-mcp-design.html` | 设计文档 |
 | `.claude/skills/remote-linux-mcp/` | 安装与使用 Skill |
+| `tests/` | 单元测试（`test_pool.py`、`test_daemon.py`、`test_tools.py`），不连真实 SSH |
 
-运行单元测试：
+在项目根目录运行单元测试：
 
 ```shell
-python -m unittest discover
+python -m unittest discover            # 全部
+python -m unittest tests.test_pool -v  # 单个文件
 ```

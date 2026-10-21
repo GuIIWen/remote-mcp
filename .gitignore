@@ -2,6 +2,10 @@
 config.toml
 nodes.yaml
 
+# Local-only docs
+DEPLOY.md
+TODO.md
+
 # Audit logs
 audit.jsonl
 *.log

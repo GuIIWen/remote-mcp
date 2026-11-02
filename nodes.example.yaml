@@ -3,6 +3,8 @@
 #
 # 每个节点的 ip / port / user / password 没写的，取 defaults 里的值；
 # password 两处都没写，运行时会用 getpass 逐个询问。
+# 节点登录时还要二次验证码的，不用在这里配：运行到该节点时会在终端提示输入
+# （多个节点同时要码时按顺序逐个问）。
 
 defaults:
   port: 22

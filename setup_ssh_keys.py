@@ -6,8 +6,12 @@ the local public key to ~/.ssh/authorized_keys on the node, then verify a
 key-only login. Nodes run concurrently; a failed node is retried (up to
 --retries attempts in total), except a rejected password, which is never
 retried — repeating it can't help and could trip a lockout policy such as
-pam_faillock. Ends with a success/failure summary; exit code 1 if any node
-failed, 2 if the YAML file or local key couldn't be loaded.
+pam_faillock. A node that also asks for a second factor (a verification code
+after or alongside the password) prompts for it in this terminal, one node at
+a time. A node whose sshd doesn't offer publickey auth at all is detected
+before anything is asked or installed and reported as failed, not retried.
+Ends with a success/failure summary; exit code 1 if any node failed,
+2 if the YAML file or local key couldn't be loaded.
 
 Usage (from this directory):
     python setup_ssh_keys.py nodes.yaml
@@ -18,6 +22,7 @@ import argparse
 import asyncio
 import contextlib
 import getpass
+import re
 import shlex
 import sys
 import time
@@ -38,6 +43,7 @@ DEFAULT_KEY = SSH_DIR / "id_ed25519"
 RETRIES = 3
 RETRY_BACKOFF = 2.0  # seconds; attempt n waits n * RETRY_BACKOFF before the next one
 
+STAGE_PROBE = "探测认证方式"
 STAGE_LOGIN = "登录"
 STAGE_HOST_KEY = "记录主机指纹"
 STAGE_INSTALL = "安装公钥"
@@ -66,6 +72,10 @@ class Result:
     errors: list[str] = field(default_factory=list)
 
 
+class NoPublicKeyAuth(Exception):
+    """The node's sshd doesn't offer publickey auth, so no key can ever be used there."""
+
+
 class StageError(Exception):
     """A failed attempt, tagged with the step it failed in."""
 
@@ -73,6 +83,108 @@ class StageError(Exception):
         super().__init__(f"{stage}失败（{_fmt_exc(exc)}）")
         self.stage = stage
         self.exc = exc
+
+
+# Same split as pool.py's is_password_prompt: a keyboard-interactive prompt gets
+# the node's password only if it looks like a password prompt and not like a
+# one-time code ("One-time password:" contains "password" too).
+_PASSWORD_PROMPT_RE = re.compile(r"password|passwd|密码|口令", re.IGNORECASE)
+_OTP_PROMPT_RE = re.compile(
+    r"one[- ]?time|otp|totp|token|code|verif|passcode|2fa|mfa|验证码|动态",
+    re.IGNORECASE,
+)
+
+_prompt_lock = asyncio.Lock()  # concurrent nodes must not interleave terminal prompts
+
+
+def is_password_prompt(prompt: str) -> bool:
+    return bool(_PASSWORD_PROMPT_RE.search(prompt)) and not _OTP_PROMPT_RE.search(prompt)
+
+
+async def _ask(prompt: str, echo: bool, instructions: str = "") -> str:
+    async with _prompt_lock:
+        if instructions:
+            print(instructions, flush=True)
+        return await asyncio.get_running_loop().run_in_executor(
+            None, input if echo else getpass.getpass, prompt)
+
+
+class _NodeClient(asyncssh.SSHClient):
+    """Answers a node's password prompts from the YAML and anything else (a
+    second-factor verification code) in the terminal. The password goes out
+    at most once per connection, over either password or keyboard-interactive
+    auth: being asked again means it was rejected, and resending risks a
+    lockout."""
+
+    def __init__(self, node: Node, stage: str, allow_password: bool = True):
+        self._node = node
+        self._stage = stage
+        # allow_password=False (key verification) pretends it's been sent, so
+        # a password prompt means "the key wasn't enough" instead of a login.
+        self._password_sent = not allow_password
+        self.prompting = False  # lets _connect_node stop its clock while a human types
+        self.asked_user = False  # a verification code was needed
+        self.trace: list[str] = []  # what was asked and who answered, never the answers; shown on rejection
+
+    def _take_password(self) -> str | None:
+        if self._password_sent:
+            return None
+        self._password_sent = True
+        return self._node.password
+
+    def password_auth_requested(self) -> str | None:
+        password = self._take_password()
+        self.trace.append("password 方式：" + ("已发送密码" if password is not None else "未发送密码"))
+        return password
+
+    def kbdint_auth_requested(self) -> str:
+        # asyncssh's default only tries keyboard-interactive when connect()
+        # was given a password, and then only answers a lone "Password:" prompt.
+        return ""
+
+    async def kbdint_challenge_received(self, name: str, instructions: str, lang: str,
+                                        prompts: list[tuple[str, bool]]) -> list[str] | None:
+        self.prompting = True
+        try:
+            responses = []
+            for prompt, echo in prompts:
+                if is_password_prompt(prompt):
+                    answer = self._take_password()
+                    self.trace.append(f"{prompt.strip()!r}→" + ("已发送密码" if answer is not None else "未发送密码，放弃"))
+                    if answer is None:
+                        return None  # asked again: rejected, don't resend
+                else:
+                    self.trace.append(f"{prompt.strip()!r}→终端输入")
+                    self.asked_user = True
+                    answer = await _ask(f"[{self._node.name}/{self._stage}] {prompt}", echo, instructions)
+                responses.append(answer)
+            return responses
+        finally:
+            self.prompting = False
+
+
+async def _connect_node(node: Node, stage: str, allow_password: bool = True,
+                        **kw) -> tuple[asyncssh.SSHClientConnection, _NodeClient]:
+    """asyncssh's connect_timeout also covers auth, which may be waiting on a
+    human typing a verification code. So its own clock is off and
+    kw["connect_timeout"] only runs while we're not waiting on the user."""
+    timeout = kw["connect_timeout"]
+    client = _NodeClient(node, stage, allow_password)
+    task = asyncio.ensure_future(asyncssh.create_connection(
+        lambda: client, node.ip, **{**kw, "connect_timeout": None, "login_timeout": 0}))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if done:
+                return task.result()[0], client
+            if not client.prompting:
+                raise asyncio.TimeoutError
+    except asyncssh.PermissionDenied as e:
+        # asyncssh's own message doesn't say which step the server refused.
+        raise asyncssh.PermissionDenied(
+            f"{e.reason}（认证过程：{'；'.join(client.trace) or '服务器没有发起任何密码/验证码提示'}）") from e
+    finally:
+        task.cancel()
 
 
 def _fmt_exc(e: BaseException) -> str:
@@ -179,6 +291,29 @@ if command -v restorecon >/dev/null 2>&1; then restorecon -F "$HOME/.ssh" "$f" |
 """
 
 
+# Run on the still-open password login when key verification is refused: the
+# usual reasons sshd ignores an installed key (StrictModes on a group-writable
+# $HOME, AuthorizedKeysFile pointing elsewhere, PubkeyAuthentication off).
+DIAG_SCRIPT = r"""echo "HOME=$HOME  passwd_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+ls -ld "$HOME" "$HOME/.ssh" "$HOME/.ssh/authorized_keys" 2>&1
+echo "selinux=$(getenforce 2>/dev/null || echo n/a)"
+ls -dZ "$HOME" "$HOME/.ssh" "$HOME/.ssh/authorized_keys" 2>&1 | head -3
+for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+  [ -e "$f" ] || continue
+  echo "[$f]"
+  grep -iE '^[[:space:]]*(AuthorizedKeysFile|PubkeyAuthentication|StrictModes|AuthenticationMethods|PubkeyAccepted[A-Za-z]*|Match)[[:space:]]' "$f" 2>&1 || true
+done
+"""
+
+
+async def _diagnose(conn: asyncssh.SSHClientConnection, timeout: float) -> str:
+    try:
+        proc = await conn.run("sh -s", input=DIAG_SCRIPT, timeout=timeout)
+    except Exception as e:
+        return f"（取节点信息失败：{_fmt_exc(e)}）"
+    return "\n".join("          " + line for line in (proc.stdout or "").splitlines())
+
+
 @contextlib.contextmanager
 def _stage(stage: str):
     """Tag any exception raised inside the block with the step it came from."""
@@ -202,16 +337,29 @@ async def _attempt(node: Node, client_key: asyncssh.SSHKey, pubkey: str, timeout
     )
     notes = []
 
+    with _stage(STAGE_PROBE):
+        # Before anything is typed or installed: a node whose sshd has
+        # publickey auth off (PubkeyAuthentication no) can't be set up, and
+        # finding that out after login/key install would cost two codes.
+        methods = await asyncio.wait_for(
+            asyncssh.get_server_auth_methods(node.ip, node.port, node.user, config=None),
+            timeout)
+        if "publickey" not in methods:
+            raise NoPublicKeyAuth(f"服务器只提供 {', '.join(methods) or '（无）'}，没有 publickey")
+
     with _stage(STAGE_LOGIN):
         # Password only: offering local keys first would burn MaxAuthTries /
         # lockout attempts before the password is even tried. known_hosts=None
         # because recording the (still unknown) host key is the next step.
-        conn = await asyncssh.connect(
-            node.ip,
-            password=node.password,
+        conn, _ = await _connect_node(
+            node,
+            STAGE_LOGIN,
             client_keys=None,
             known_hosts=None,
-            preferred_auth="password,keyboard-interactive",
+            # keyboard-interactive first: with a PAM second factor the plain
+            # password method can't be asked for the code, fails, and would
+            # burn the one password we allow ourselves to send.
+            preferred_auth="keyboard-interactive,password",
             **common,
         )
     async with conn:
@@ -234,24 +382,41 @@ async def _attempt(node: Node, client_key: asyncssh.SSHKey, pubkey: str, timeout
                 raise RuntimeError(f"安装脚本输出异常：{(proc.stdout or '').strip()!r}")
         notes.append("公钥已安装" if state == "added" else "公钥已存在")
 
-    with _stage(STAGE_VERIFY):
-        # Key only, and the host key must now verify against known_hosts —
-        # exactly what a later plain ssh will rely on.
-        async with asyncssh.connect(
-            node.ip,
-            client_keys=[client_key],
-            password=None,
-            known_hosts=str(KNOWN_HOSTS),
-            preferred_auth="publickey",
-            **common,
-        ) as vconn:
-            await vconn.run("true", check=True, timeout=timeout)
-    notes.append("免密验证通过")
+        with _stage(STAGE_VERIFY):
+            # Key only (a password prompt here means the key wasn't accepted,
+            # so it's refused), and the host key must now verify against
+            # known_hosts — exactly what a later plain ssh will rely on. A node
+            # that wants a code after the key (publickey + keyboard-interactive)
+            # gets asked again. The login connection stays open meanwhile, so a
+            # refusal can still look at the node.
+            try:
+                vconn, vclient = await _connect_node(
+                    node,
+                    STAGE_VERIFY,
+                    allow_password=False,
+                    client_keys=[client_key],
+                    known_hosts=str(KNOWN_HOSTS),
+                    preferred_auth="publickey,keyboard-interactive",
+                    **common,
+                )
+            except asyncssh.PermissionDenied as e:
+                raise asyncssh.PermissionDenied(
+                    f"{e.reason}\n        节点上的情况（公钥已装但被拒时看这里）：\n"
+                    f"{await _diagnose(conn, timeout)}") from e
+            async with vconn:
+                await vconn.run("true", check=True, timeout=timeout)
+    notes.append("公钥登录通过，但该节点仍需验证码" if vclient.asked_user else "免密验证通过")
     return "；".join(notes)
 
 
-def _is_auth_rejected(e: StageError) -> bool:
-    return e.stage == STAGE_LOGIN and isinstance(e.exc, asyncssh.PermissionDenied)
+def _no_retry_reason(e: StageError) -> str | None:
+    """Why retrying this failure can't help (None: it might, so retry)."""
+    if isinstance(e.exc, NoPublicKeyAuth):
+        return "该节点的 sshd 没开公钥认证（PubkeyAuthentication），无法配置免密；需要管理员开启，重试无效"
+    # Verify too: same key, same server, same answer, and each retry costs a code.
+    if e.stage in (STAGE_LOGIN, STAGE_VERIFY) and isinstance(e.exc, asyncssh.PermissionDenied):
+        return "认证被拒绝，不再重试（重试无效，还可能触发账户锁定）"
+    return None
 
 
 async def setup_node(node: Node, client_key: asyncssh.SSHKey, pubkey: str,
@@ -265,8 +430,8 @@ async def setup_node(node: Node, client_key: asyncssh.SSHKey, pubkey: str,
                 detail = await _attempt(node, client_key, pubkey, timeout)
             except StageError as e:
                 errors.append(f"第 {attempts} 次：{e}")
-                if _is_auth_rejected(e):
-                    errors.append("密码被拒绝，不再重试（避免触发账户锁定）")
+                if reason := _no_retry_reason(e):
+                    errors.append(reason)
                     break
                 if attempts < retries:
                     wait = attempts * RETRY_BACKOFF

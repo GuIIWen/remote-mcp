@@ -190,6 +190,8 @@ nodes:
 
 该脚本不经过跳板机，只适用于本机能直连、且目前可以用密码登录的机器（`via = "direct"`）。`nodes.yaml` 里是明文密码，已加入 `.gitignore`，配完后建议删掉。
 
+登录时还要二次验证码的节点，运行到它时会在终端提示输入。sshd 没开公钥认证（`PubkeyAuthentication no`，`ssh -v` 里 `Authentications that can continue` 没有 `publickey`）的节点没法配免密，脚本会在登录前直接报失败，需要管理员先开启。
+
 ## 配置热更
 
 运行中改了 `config.toml`，让 Agent 调用 `reload_config` 即可生效，不需要重启：

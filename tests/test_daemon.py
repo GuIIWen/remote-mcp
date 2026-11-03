@@ -5,6 +5,8 @@ root:  python -m unittest tests.test_daemon -v"""
 import asyncio
 import contextlib
 import io
+import socket
+import struct
 import unittest
 from unittest import mock
 
@@ -178,6 +180,51 @@ class PreparePasswordHostsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(get.await_count, 1)
         self.assertIn("跳过该节点", out)
+
+
+class ListenerSurvivesResetTests(unittest.TestCase):
+    """A client resetting its connection before accept completes (WinError 64
+    under the Proactor loop) must not kill the listening socket."""
+
+    def _listener_alive_after_resets(self, loop_factory) -> bool:
+        errors = []
+
+        async def go() -> bool:
+            srv = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            for i in range(300):
+                if errors:  # accept already failed; more resets would only wait out connect timeouts
+                    break
+                s = socket.socket()
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() sends RST
+                s.settimeout(1)
+                try:
+                    s.connect(("127.0.0.1", port))
+                except OSError:
+                    pass
+                s.close()
+                if i % 20 == 0:
+                    await asyncio.sleep(0)
+            await asyncio.sleep(0.3)
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                return True
+            except OSError:
+                return False
+            finally:
+                srv.close()
+
+        with asyncio.Runner(loop_factory=loop_factory) as runner:
+            runner.get_loop().set_exception_handler(lambda loop, ctx: errors.append(ctx))
+            return runner.run(go())
+
+    def test_daemon_loop_keeps_listening(self):
+        self.assertTrue(self._listener_alive_after_resets(daemon.LOOP_FACTORY))
+
+    @unittest.skipUnless(hasattr(asyncio, "ProactorEventLoop"), "Windows only")
+    def test_proactor_loop_loses_listener(self):
+        # Documents why daemon.LOOP_FACTORY is not the default loop.
+        self.assertFalse(self._listener_alive_after_resets(asyncio.ProactorEventLoop))
 
 
 if __name__ == "__main__":

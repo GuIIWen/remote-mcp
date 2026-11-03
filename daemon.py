@@ -13,6 +13,13 @@ CONFIG_PATH = pool.CONFIG_PATH
 PASSWORD_RETRIES = 3
 BASTION_RETRIES = 3
 
+# Not the Windows default (Proactor): when a client resets a connection before
+# AcceptEx completes (WinError 64), Proactor logs "Accept failed on a socket"
+# and closes the listening socket for good while the server still looks
+# alive, so every later connect is refused. The Selector loop logs and keeps
+# listening.
+LOOP_FACTORY = asyncio.SelectorEventLoop
+
 
 def _report_config(warnings: list[str], errors: list[str]) -> None:
     """Startup-side reporting of pool.validate_config's result: warnings to
@@ -186,7 +193,9 @@ def main() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
 
-    asyncio.run(_serve())
+    # asyncio.run(loop_factory=) needs 3.12; Runner is the same thing on 3.11.
+    with asyncio.Runner(loop_factory=LOOP_FACTORY) as runner:
+        runner.run(_serve())
 
 
 if __name__ == "__main__":

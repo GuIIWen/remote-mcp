@@ -14,6 +14,21 @@ password = ""                  # 可选：跳板机登录密码。填了就自�
 # 跳板机总是先用密钥认证，然后走 keyboard-interactive 做 TOTP / 密码；不要在这里写 address/auth——
 # 写了会在启动时被忽略并打印警告。
 
+# ── 多个并列跳板机（可选）──────────────────────────────────────────
+# 把上面的 [bastion] 换成多张 [bastion.<名字>] 表即可（字段和上面一样）：
+#   [bastion.a]
+#   host = "bastion-a.example.com"
+#   user = "yourname"
+#   [bastion.b]
+#   host = "bastion-b.example.com"
+#   user = "yourname"
+# 有多台时，每个 via="bastion"（默认）或 via="hop" 的节点必须用 bastion 字段指定走哪一台：
+#   [host.nmz01]
+#   via     = "hop"
+#   bastion = "a"      # 只有一台跳板机时可省略
+# 启动时会逐台登录，验证码弹窗 / 提示里带上跳板机名字（如 "[a] Verification code:"）。
+# 某台跳板机断线只影响经它连出去的节点，direct 节点和其它跳板机不受影响。
+
 [daemon]
 port            = 8765   # daemon 监听的本地端口，仅绑定 127.0.0.1
 audit_log       = ""      # 留空则不记录；填绝对路径则写 JSONL 审计日志（不含密码）

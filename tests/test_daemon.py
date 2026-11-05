@@ -20,13 +20,15 @@ def capture():
 
 class LoginBastionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._saved = (pool.cfg, pool._bastion_conn)
-        pool.cfg = {}
-        pool._bastion_conn = None
-        pool._bastion_lock = asyncio.Lock()
+        self._saved = (pool.cfg, dict(pool._bastion_conns))
+        pool.cfg = {"bastion": {"host": "b", "user": "u", "port": 22}}
+        pool._bastion_conns.clear()
+        pool._bastion_locks.clear()
 
     def tearDown(self):
-        pool.cfg, pool._bastion_conn = self._saved
+        pool.cfg, bconns = self._saved
+        pool._bastion_conns.clear()
+        pool._bastion_conns.update(bconns)
 
     async def test_retry_after_one_bad_code(self):
         get = mock.AsyncMock(side_effect=[asyncssh.PermissionDenied("bad code"), object()])
@@ -79,8 +81,8 @@ class LoginBastionTests(unittest.IsolatedAsyncioTestCase):
             ok = await daemon._login_bastion()
         self.assertFalse(ok)
         self.assertEqual(connect.await_count, 3)
-        self.assertIsNone(pool._bastion_conn)
-        self.assertFalse(pool._bastion_lock.locked())
+        self.assertIsNone(pool._bastion_conns.get("default"))
+        self.assertFalse(pool._bastion_lock("default").locked())
 
 
 def _pw_cfg(password: str = "") -> dict:

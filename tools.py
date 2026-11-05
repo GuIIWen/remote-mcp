@@ -287,17 +287,19 @@ async def _hop_write_raw(host: str, path: str, content: str, mode: int | None = 
 async def list_hosts() -> str:
     """List bastion status, allowed hosts, connected targets, and configured
     hosts (route, auth method, connection state). Never includes passwords."""
-    b = pool.cfg.get("bastion")
-    if b:
-        bastion_addr = f"{b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}"
-        bastion_up = not pool._is_closed(pool._bastion_conn)
-        bastion_line = f"bastion: {bastion_addr} ({'connected' if bastion_up else 'disconnected'})"
-    else:
-        bastion_line = "bastion: (not configured)"
+    bs = pool.bastions()
+    bastion_lines = []
+    for bname, b in bs.items():
+        addr = f"{b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}"
+        up = not pool._is_closed(pool._bastion_conns.get(bname))
+        label = "bastion" if bname == pool.DEFAULT_BASTION else f"bastion {bname}"
+        bastion_lines.append(f"{label}: {addr} ({'connected' if up else 'disconnected'})")
+    if not bastion_lines:
+        bastion_lines = ["bastion: (not configured)"]
     allowed = pool.cfg.get("hosts", {}).get("allowed", [])
 
     lines = [
-        bastion_line,
+        *bastion_lines,
         f"allowed: {allowed if allowed else '(unrestricted)'}",
         "configured hosts:",
     ]
@@ -315,15 +317,17 @@ async def list_hosts() -> str:
             # hop hosts never get their own entry in _target_conns (see
             # pool.get_target's guard) — every call rides the one bastion
             # connection, so that's what "connected" reflects here.
-            route_desc = "hop via bastion"
+            bname = pool._bastion_or_none(host)
+            route_desc = "hop via bastion" + (f" {bname}" if bname and len(bs) > 1 else "")
             if hc.get("container"):
                 route_desc += f" → docker:{hc['container']}"
                 if hc.get("container_user"):
                     route_desc += f" (-u {hc['container_user']})"
             auth = "key"
-            state = "connected" if not pool._is_closed(pool._bastion_conn) else "disconnected"
+            state = "connected" if not pool._is_closed(pool._bastion_conns.get(bname)) else "disconnected"
         else:
-            route_desc = "bastion"
+            bname = pool._bastion_or_none(host)
+            route_desc = "bastion" + (f" {bname}" if bname and len(bs) > 1 else "")
             auth = "key"
             state = "connected" if not pool._is_closed(pool._target_conns.get(host)) else "disconnected"
         lines.append(f"  {host}: {route_desc}, auth={auth}, {state}")

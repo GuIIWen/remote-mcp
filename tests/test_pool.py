@@ -47,16 +47,18 @@ def capture():
 
 class PoolTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._saved = (pool.cfg, pool._bastion_conn, dict(pool._target_conns), dict(pool._passwords))
-        pool.cfg = {}
-        pool._bastion_conn = None
+        self._saved = (pool.cfg, dict(pool._bastion_conns), dict(pool._target_conns), dict(pool._passwords))
+        pool.cfg = {"bastion": {"host": "b", "user": "u", "port": 22}}
+        pool._bastion_conns.clear()
         pool._target_conns.clear()
         pool._conn_stats.clear()
         pool._passwords.clear()
-        pool._bastion_lock = asyncio.Lock()
+        pool._bastion_locks.clear()
 
     def tearDown(self):
-        pool.cfg, pool._bastion_conn, targets, passwords = self._saved
+        pool.cfg, bconns, targets, passwords = self._saved
+        pool._bastion_conns.clear()
+        pool._bastion_conns.update(bconns)
         pool._target_conns.clear()
         pool._target_conns.update(targets)
         pool._passwords.clear()
@@ -183,7 +185,7 @@ class HeartbeatTests(PoolTestCase):
     async def test_success_opens_channel_and_touches(self):
         conn = FakeConn()
         s = register(conn, idle=50, idle_real=50)
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         self.assertTrue(await pool.heartbeat_once())
         self.assertEqual(conn.commands, ["true"])
         self.assertLess(time.monotonic() - s.last_used, 1)  # channel activity recorded
@@ -191,25 +193,25 @@ class HeartbeatTests(PoolTestCase):
 
     async def test_failure_is_logged_not_raised_and_keeps_conn(self):
         conn = FakeConn(run_exc=asyncssh.ConnectionLost("boom"))
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         with capture() as out:
             self.assertFalse(await pool.heartbeat_once())
         self.assertIn("heartbeat failed", out.getvalue())
         self.assertIn("ConnectionLost", out.getvalue())
-        self.assertIs(pool._bastion_conn, conn)  # no invalidate -> no surprise TOTP
+        self.assertIs(pool._bastion_conns.get("default"), conn)  # no invalidate -> no surprise TOTP
         self.assertFalse(conn.closed)
 
     async def test_timeout_is_failure(self):
         conn = FakeConn(run_delay=5)
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         with mock.patch.object(pool, "HEARTBEAT_TIMEOUT", 0.05), capture() as out:
             self.assertFalse(await pool.heartbeat_once())
         self.assertIn("heartbeat failed", out.getvalue())
 
     async def test_does_not_take_bastion_lock(self):
         conn = FakeConn()
-        pool._bastion_conn = conn
-        async with pool._bastion_lock:  # a real call holding the lock (e.g. mid-login)
+        pool._bastion_conns["default"] = conn
+        async with pool._bastion_lock("default"):  # a real call holding the lock (e.g. mid-login)
             self.assertTrue(await asyncio.wait_for(pool.heartbeat_once(), 1))
 
     async def test_loop_disabled_returns_immediately(self):
@@ -217,7 +219,7 @@ class HeartbeatTests(PoolTestCase):
 
     async def test_loop_beats_and_cancels_cleanly(self):
         conn = FakeConn()
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         with capture():
             task = asyncio.create_task(pool.heartbeat_loop(0.02))
             await asyncio.sleep(0.15)
@@ -280,18 +282,18 @@ class IdleProbeTests(PoolTestCase):
     async def test_dead_bastion_reconnects_exactly_once(self):
         dead, fresh = FakeConn(run_exc=asyncssh.ConnectionLost("dead")), FakeConn()
         register(dead, idle=1000)
-        pool._bastion_conn = dead
+        pool._bastion_conns["default"] = dead
         with capture(), mock.patch.object(pool, "_connect_bastion", return_value=fresh) as c:
             got = await pool._ensure_bastion()
         self.assertIs(got, fresh)
-        self.assertIs(pool._bastion_conn, fresh)
+        self.assertIs(pool._bastion_conns.get("default"), fresh)
         self.assertTrue(dead.closed)
         c.assert_called_once()
 
     async def test_healthy_bastion_not_reconnected(self):
         ok = FakeConn()
         register(ok, idle=1000)
-        pool._bastion_conn = ok
+        pool._bastion_conns["default"] = ok
         with mock.patch.object(pool, "_connect_bastion", side_effect=AssertionError("reconnect!")):
             self.assertIs(await pool._ensure_bastion(), ok)
 
@@ -301,7 +303,7 @@ class IdleProbeTests(PoolTestCase):
         for exc in (asyncssh.PermissionDenied("bad code"), TimeoutError("connect")):
             dead = FakeConn(run_exc=asyncssh.ConnectionLost("dead"))
             register(dead, idle=1000)
-            pool._bastion_conn = dead
+            pool._bastion_conns["default"] = dead
             with capture(), mock.patch.object(pool, "_connect_bastion", side_effect=exc) as c:
                 with self.assertRaises(type(exc)):
                     await pool._ensure_bastion()
@@ -334,8 +336,8 @@ class TrackingTests(PoolTestCase):
     async def test_in_use_host_includes_bastion_unless_direct(self):
         t, b = FakeConn(), FakeConn()
         st, sb = register(t, idle=100), register(b, idle=100)
-        pool._bastion_conn = b
-        pool.cfg = {"host": {"viab": {}, "d": {"via": "direct"}}}
+        pool._bastion_conns["default"] = b
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"viab": {}, "d": {"via": "direct"}}}
         with pool._in_use_host("d", t):
             pass
         self.assertGreater(time.monotonic() - sb.last_used, 90)
@@ -365,25 +367,25 @@ class TrackingTests(PoolTestCase):
         conn = FakeConn()
         client = pool._BastionClient()
         client.connection_made(conn)
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         with capture() as out:
             client.connection_lost(asyncssh.ConnectionLost("Connection lost"))
         self.assertIn("verification code", out.getvalue())
-        self.assertIsNone(pool._bastion_conn)
+        self.assertIsNone(pool._bastion_conns.get("default"))
 
         # a stale client's late callback must not claim anything about the pool
         stale, newer = _bc(), FakeConn()
-        pool._bastion_conn = newer
+        pool._bastion_conns["default"] = newer
         with capture() as out:
             stale.connection_lost(None)
         self.assertNotIn("verification code", out.getvalue())
-        self.assertIs(pool._bastion_conn, newer)
+        self.assertIs(pool._bastion_conns.get("default"), newer)
 
     async def test_local_close_is_reported_as_local(self):
         conn = FakeConn()
         client = pool._BastionClient()
         client.connection_made(conn)
-        pool._bastion_conn = conn
+        pool._bastion_conns["default"] = conn
         pool._invalidate_bastion()
         self.assertTrue(conn.closed)
         with capture() as out:
@@ -580,6 +582,121 @@ class PasswordTests(PoolTestCase):
         for w in warnings:
             self.assertIn("password", w)
             self.assertNotIn("'x'", w)
+
+
+class MultiBastionTests(PoolTestCase):
+    def setUp(self):
+        super().setUp()
+        pool.cfg = {
+            "bastion": {
+                "a": {"host": "ha", "user": "ua", "port": 22, "password": "pa"},
+                "b": {"host": "hb", "user": "ub"},
+            },
+            "host": {
+                "na": {"bastion": "a"},
+                "nb": {"bastion": "b"},
+                "ha": {"via": "hop", "bastion": "a"},
+                "hb": {"via": "hop", "bastion": "b"},
+                "d": {"via": "direct", "address": "1.1.1.1"},
+            },
+        }
+
+    def test_bastions_shapes(self):
+        self.assertEqual(pool.bastions({}), {})
+        flat = {"bastion": {"host": "h", "user": "u"}}
+        self.assertEqual(list(pool.bastions(flat)), [pool.DEFAULT_BASTION])
+        self.assertEqual(list(pool.bastions(pool.cfg)), ["a", "b"])
+
+    def test_bastion_of(self):
+        self.assertEqual(pool.bastion_of("na"), "a")
+        self.assertEqual(pool.bastion_of("hb"), "b")
+        pool.cfg["host"]["x"] = {}
+        with self.assertRaises(pool.ConfigError):  # several bastions, no binding
+            pool.bastion_of("x")
+        pool.cfg["host"]["y"] = {"bastion": "nope"}
+        with self.assertRaises(pool.ConfigError):
+            pool.bastion_of("y")
+        pool.cfg["bastion"] = {"host": "h", "user": "u"}  # single bastion: implicit
+        self.assertEqual(pool.bastion_of("x"), pool.DEFAULT_BASTION)
+
+    def test_validate_requires_binding_when_several(self):
+        cfg = {"bastion": pool.cfg["bastion"], "host": {"h1": {"via": "hop"}, "n1": {}}}
+        errors, _ = pool.validate_config(cfg)
+        self.assertTrue(any("h1" in e and "bastion" in e for e in errors))
+        self.assertTrue(any("n1" in e for e in errors))
+        cfg["host"] = {"h1": {"via": "hop", "bastion": "zzz"}}
+        errors, _ = pool.validate_config(cfg)
+        self.assertTrue(any("zzz" in e for e in errors))
+        cfg["host"] = {"h1": {"via": "hop", "bastion": "a"}}
+        self.assertEqual(pool.validate_config(cfg)[0], [])
+        # one bastion: binding is optional
+        cfg = {"bastion": {"host": "h", "user": "u"}, "host": {"h1": {"via": "hop"}}}
+        self.assertEqual(pool.validate_config(cfg)[0], [])
+
+    def test_validate_checks_each_bastion(self):
+        cfg = {"bastion": {"a": {"host": "h", "password": 1}, "b": {"keepalive_interval": "x"}}}
+        errors, _ = pool.validate_config(cfg)
+        self.assertTrue(any("bastion.a" in e and "password" in e for e in errors))
+        self.assertTrue(any("bastion.b" in e and "keepalive_interval" in e for e in errors))
+
+    async def test_drop_only_clears_own_targets(self):
+        ca, cb = FakeConn(), FakeConn()
+        client = pool._BastionClient("a")
+        client.connection_made(ca)
+        pool._bastion_conns["a"], pool._bastion_conns["b"] = ca, cb
+        ta, tb, td = FakeConn(), FakeConn(), FakeConn()
+        pool._target_conns.update({"na": ta, "nb": tb, "d": td})
+        with capture():
+            client.connection_lost(None)
+        self.assertNotIn("a", pool._bastion_conns)
+        self.assertIs(pool._bastion_conns["b"], cb)
+        self.assertNotIn("na", pool._target_conns)
+        self.assertIn("nb", pool._target_conns)
+        self.assertIn("d", pool._target_conns)
+
+    async def test_invalidate_only_that_bastion(self):
+        ca, cb = FakeConn(), FakeConn()
+        pool._bastion_conns["a"], pool._bastion_conns["b"] = ca, cb
+        pool._target_conns.update({"na": FakeConn(), "nb": FakeConn()})
+        pool._invalidate_bastion("b")
+        self.assertTrue(cb.closed)
+        self.assertFalse(ca.closed)
+        self.assertIn("na", pool._target_conns)
+        self.assertNotIn("nb", pool._target_conns)
+
+    async def test_prompt_names_the_bastion_and_uses_its_password(self):
+        asked = []
+
+        async def fake_ask(prompt, echo):
+            asked.append(prompt)
+            return "123456"
+
+        pool._passwords[pool._bpw_key("a")] = "pa"
+        client = pool._BastionClient("a")
+        with mock.patch.object(pool, "ask", fake_ask), capture():
+            resp = await client.kbdint_challenge_received(
+                "", "", "", [("Password: ", False), ("Verification code: ", True)])
+        pool._passwords.pop(pool._bpw_key("a"), None)
+        self.assertEqual(resp, ["pa", "123456"])
+        self.assertEqual(asked, ["[a] Verification code: "])
+
+    async def test_heartbeat_pings_every_bastion(self):
+        ca, cb = FakeConn(), FakeConn(run_exc=asyncssh.ConnectionLost("x"))
+        register(ca), register(cb)
+        pool._bastion_conns["a"], pool._bastion_conns["b"] = ca, cb
+        with capture():
+            self.assertFalse(await pool.heartbeat_once())
+        self.assertEqual(ca.commands, ["true"])
+        self.assertEqual(cb.commands, ["true"])
+
+    def test_connection_status_rows(self):
+        pool._bastion_conns["a"] = FakeConn()
+        rows = {r["name"]: r for r in pool.connection_status()}
+        self.assertEqual(rows["跳板机 a"]["state"], "connected")
+        self.assertEqual(rows["跳板机 b"]["state"], "offline")
+        self.assertEqual(rows["ha"]["state"], "via-bastion")
+        self.assertEqual(rows["hb"]["state"], "offline")
+        self.assertEqual(rows["d"]["state"], "idle")
 
 
 if __name__ == "__main__":

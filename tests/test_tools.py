@@ -31,10 +31,10 @@ def _lab4(**kw) -> dict:
 
 class ToolsTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self._saved = (pool.cfg, pool._bastion_conn, dict(pool._target_conns),
+        self._saved = (pool.cfg, dict(pool._bastion_conns), dict(pool._target_conns),
                        dict(pool._passwords), tools.AUDIT_LOG)
         pool.cfg = {}
-        pool._bastion_conn = None
+        pool._bastion_conns.clear()
         pool._target_conns.clear()
         pool._passwords.clear()
         fd, self.audit = tempfile.mkstemp(suffix=".jsonl")
@@ -42,7 +42,9 @@ class ToolsTestCase(unittest.IsolatedAsyncioTestCase):
         tools.AUDIT_LOG = self.audit
 
     def tearDown(self):
-        pool.cfg, pool._bastion_conn, targets, passwords, tools.AUDIT_LOG = self._saved
+        pool.cfg, bconns, targets, passwords, tools.AUDIT_LOG = self._saved
+        pool._bastion_conns.clear()
+        pool._bastion_conns.update(bconns)
         pool._target_conns.clear()
         pool._target_conns.update(targets)
         pool._passwords.clear()

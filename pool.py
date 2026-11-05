@@ -27,12 +27,82 @@ BASTION_CONNECT_TIMEOUT = 120
 # no leading "-" so the value can never be parsed as a docker option.
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
 
-_bastion_conn: asyncssh.SSHClientConnection | None = None
+# One entry per [bastion] / [bastion.<name>]; the legacy single [bastion]
+# table is the bastion called DEFAULT_BASTION.
+_bastion_conns: dict[str, asyncssh.SSHClientConnection] = {}
+_bastion_locks: dict[str, asyncio.Lock] = {}
 _target_conns: dict[str, asyncssh.SSHClientConnection] = {}
 _sems: dict[str, asyncio.Semaphore] = {}
-_bastion_lock = asyncio.Lock()
 _host_locks: dict[str, asyncio.Lock] = {}
 cfg: dict = {}
+
+DEFAULT_BASTION = "default"
+
+
+def bastions(c: dict | None = None) -> dict[str, dict]:
+    """Configured bastions by name. Two config shapes are accepted:
+      [bastion]            host=... user=...   -> {"default": {...}}  (legacy, one bastion)
+      [bastion.<name>]     host=... user=...   -> {name: {...}, ...}  (one or more)"""
+    b = (cfg if c is None else c).get("bastion") or {}
+    if not b:
+        return {}
+    if all(isinstance(v, dict) for v in b.values()):
+        return dict(b)
+    return {DEFAULT_BASTION: b}
+
+
+def _bastion_lock(name: str) -> asyncio.Lock:
+    lock = _bastion_locks.get(name)
+    if lock is None:
+        lock = _bastion_locks[name] = asyncio.Lock()
+    return lock
+
+
+def _default_bastion() -> str:
+    names = list(bastions())
+    if not names:
+        # Reachable if a bastion-routed host is used without a [bastion]
+        # section configured at all — give a clear error.
+        raise ConfigError(
+            "no [bastion] section is configured; this host needs one "
+            "(or set via = \"direct\" and give it an address)"
+        )
+    return names[0]
+
+
+def bastion_of(host: str) -> str:
+    """Which bastion a bastion/hop-routed host belongs to: its `bastion`
+    field, or the only bastion when exactly one is configured."""
+    names = list(bastions())
+    wanted = cfg.get("host", {}).get(host, {}).get("bastion")
+    if wanted:
+        if wanted not in names:
+            raise ConfigError(f"[host.{host}] bastion = {wanted!r} 不存在（已配置：{', '.join(names) or '无'}）")
+        return wanted
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        _default_bastion()  # raises the "no [bastion]" error
+    raise ConfigError(
+        f"[host.{host}] 配置了多个跳板机（{', '.join(names)}），必须用 bastion 字段指定走哪一台"
+    )
+
+
+def _bastion_or_none(host: str) -> str | None:
+    try:
+        return bastion_of(host)
+    except ConfigError:
+        return None
+
+
+def _bpw_key(name: str) -> str:
+    """_passwords key for a bastion's password; brackets keep it from
+    colliding with a [host.x] section name."""
+    return "[bastion]" if name == DEFAULT_BASTION else f"[bastion:{name}]"
+
+
+def _blabel(name: str) -> str:
+    return "bastion" if name == DEFAULT_BASTION else f"bastion:{name}"
 
 # Hop-routed hosts (via = "hop") all ride the single bastion connection
 # (`ssh <node> '<cmd>'` run *on* the bastion) instead of getting a
@@ -40,14 +110,20 @@ cfg: dict = {}
 # bastion's own sshd MaxSessions — never a per-host one (see run()/
 # _run_hop()), or concurrent calls to different hop hosts could add up
 # past the bastion's limit even though each host's own count looks fine.
-_hop_sem = asyncio.Semaphore(8)
+_hop_sems: dict[str, asyncio.Semaphore] = {}
+
+
+def _hop_sem(name: str) -> asyncio.Semaphore:
+    sem = _hop_sems.get(name)
+    if sem is None:
+        sem = _hop_sems[name] = asyncio.Semaphore(8)
+    return sem
 
 # In-memory only — populated at startup (config value or interactive prompt)
 # and reused silently on reconnect. Never written to disk, never logged.
 _passwords: dict[str, str] = {}
 
-# _passwords key for [bastion] password; brackets keep it from colliding with
-# a [host.x] section name.
+# _passwords key of the legacy single bastion's password (see _bpw_key).
 BASTION_PASSWORD_KEY = "[bastion]"
 
 
@@ -76,40 +152,53 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
     than causing wrong behavior."""
     errors: list[str] = []
     warnings: list[str] = []
-    # [bastion] always authenticates with a key first; password only answers
+    # A bastion always authenticates with a key first; password only answers
     # keyboard-interactive password prompts, so there is no auth switch here.
-    b = cfg.get("bastion", {})
-    if "auth" in b:
-        warnings.append(
-            "warning: [bastion] 不支持 auth 字段，将被忽略（跳板机总是先发密钥，"
-            "password 只用来自动回答 keyboard-interactive 里的密码提示）"
-        )
-    if b.get("password") is not None and not isinstance(b["password"], str):
-        errors.append(f"[bastion] password 必须是字符串，当前是 {type(b['password']).__name__}")
-    bastion_key = b.get("key", "")
-    if bastion_key and not Path(str(bastion_key)).expanduser().is_file():
-        errors.append(
-            f"[bastion] key 应该是私钥文件路径，但 {bastion_key!r} 不存在；"
-            "留空则使用默认密钥对（~/.ssh/id_*）"
-        )
-
-    # Optional numeric knobs: absent is fine (defaults apply), present must be
-    # a sane number — a string here would otherwise only blow up at connect time.
-    for sec, key, lo, integer in (
-        ("bastion", "keepalive_interval", 0, False),
-        ("bastion", "keepalive_count_max", 1, True),
-        ("daemon", "heartbeat_interval", 0, False),
-    ):
-        v = cfg.get(sec, {}).get(key)
-        if v is None:
-            continue
-        ok_type = isinstance(v, int) if integer else isinstance(v, (int, float))
-        if isinstance(v, bool) or not ok_type or v < lo:
-            errors.append(
-                f"[{sec}] {key} 必须是 >= {lo} 的{'整数' if integer else '数字'}，当前是 {v!r}"
+    bs = bastions(cfg)
+    for bname, b in bs.items():
+        tag = "[bastion]" if bname == DEFAULT_BASTION else f"[bastion.{bname}]"
+        if "auth" in b:
+            warnings.append(
+                f"warning: {tag} 不支持 auth 字段，将被忽略（跳板机总是先发密钥，"
+                "password 只用来自动回答 keyboard-interactive 里的密码提示）"
             )
+        if b.get("password") is not None and not isinstance(b["password"], str):
+            errors.append(f"{tag} password 必须是字符串，当前是 {type(b['password']).__name__}")
+        bastion_key = b.get("key", "")
+        if bastion_key and not Path(str(bastion_key)).expanduser().is_file():
+            errors.append(
+                f"{tag} key 应该是私钥文件路径，但 {bastion_key!r} 不存在；"
+                "留空则使用默认密钥对（~/.ssh/id_*）"
+            )
+        # Optional numeric knobs: absent is fine (defaults apply), present must be
+        # a sane number — a string here would otherwise only blow up at connect time.
+        for key, lo, integer in (("keepalive_interval", 0, False), ("keepalive_count_max", 1, True)):
+            v = b.get(key)
+            if v is None:
+                continue
+            ok_type = isinstance(v, int) if integer else isinstance(v, (int, float))
+            if isinstance(v, bool) or not ok_type or v < lo:
+                errors.append(
+                    f"{tag} {key} 必须是 >= {lo} 的{'整数' if integer else '数字'}，当前是 {v!r}"
+                )
+    v = cfg.get("daemon", {}).get("heartbeat_interval")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+        errors.append(f"[daemon] heartbeat_interval 必须是 >= 0 的数字，当前是 {v!r}")
     for host, hc in cfg.get("host", {}).items():
         via = hc.get("via", "bastion")
+        if via in ("bastion", "hop") and bs:
+            bn = hc.get("bastion")
+            if bn is not None and not isinstance(bn, str):
+                errors.append(f"[host.{host}] bastion 必须是字符串（跳板机名字）")
+            elif bn and bn not in bs:
+                errors.append(f"[host.{host}] bastion = {bn!r} 不存在（已配置：{', '.join(bs)}）")
+            elif not bn and len(bs) > 1:
+                errors.append(
+                    f"[host.{host}] 配置了多个跳板机（{', '.join(bs)}），"
+                    f"via=\"{via}\" 的节点必须用 bastion 字段指定走哪一台"
+                )
+        elif via == "direct" and hc.get("bastion"):
+            warnings.append(f"warning: [host.{host}] via=\"direct\" 不经过跳板机，bastion 字段将被忽略")
         if via != "hop":
             hop_only = [f for f in ("node", "container", "container_user") if hc.get(f)]
             if hop_only:
@@ -123,7 +212,7 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
             if auth not in ("key", "password"):
                 errors.append(f"[host.{host}] auth 必须是 \"key\" 或 \"password\"，当前是 {auth!r}")
         elif via == "hop":
-            if not cfg.get("bastion"):
+            if not bs:
                 errors.append(f"[host.{host}] via=\"hop\" 需要配置 [bastion] 段")
             ignored = [f for f in ("address", "password", "auth", "key", "cert") if hc.get(f)]
             if ignored:
@@ -204,10 +293,13 @@ _PROBE_IDLE_AFTER = 120  # s of no channel use before a reused conn is probed
 _PROBE_TIMEOUT = 5  # s
 
 
-def _keepalive_kwargs() -> dict:
+def _keepalive_kwargs(name: str | None = None) -> dict:
     # tcp_keepalive is deliberately not passed: asyncssh already defaults it
-    # to True (unless ~/.ssh/config says TCPKeepAlive no).
-    b = cfg.get("bastion", {})
+    # to True (unless ~/.ssh/config says TCPKeepAlive no). A bastion uses its
+    # own knobs; targets use their bastion's (direct nodes: the first one).
+    bs = bastions()
+    b = bs.get(name) if name else next(iter(bs.values()), {})
+    b = b or {}
     return dict(
         keepalive_interval=b.get("keepalive_interval", KEEPALIVE_INTERVAL_DEFAULT),
         keepalive_count_max=b.get("keepalive_count_max", KEEPALIVE_COUNT_MAX_DEFAULT),
@@ -341,7 +433,8 @@ def _in_use_host(host: str, conn):
     bastion connection, so that one counts as used too."""
     if _route(host) == "direct":
         return _in_use(conn)
-    return _in_use(conn, _bastion_conn)
+    bname = _bastion_or_none(host)
+    return _in_use(conn, _bastion_conns.get(bname) if bname else None)
 
 
 def _close_local(conn) -> None:
@@ -406,8 +499,9 @@ def _default_keypairs() -> list:
     return list(load_default_keypairs())
 
 
-def _bastion_client_keys() -> list:
-    path = cfg.get("bastion", {}).get("key", "")
+def _bastion_client_keys(name: str | None = None) -> list:
+    bs = bastions()
+    path = (bs.get(name) if name else next(iter(bs.values()), {}) or {}).get("key", "")
     if path:
         return list(asyncssh.load_keypairs(path))
     return _default_keypairs()
@@ -423,7 +517,9 @@ def _host_client_keys(host: str) -> list:
         if cert:
             return list(asyncssh.load_keypairs([(key, cert)]))
         return list(asyncssh.load_keypairs(key))
-    bastion_key = cfg.get("bastion", {}).get("key", "")
+    bs = bastions()
+    bname = _bastion_or_none(host) or hc.get("bastion")
+    bastion_key = (bs.get(bname) if bname else next(iter(bs.values()), {}) or {}).get("key", "")
     if bastion_key:
         return list(asyncssh.load_keypairs(bastion_key))
     return _default_keypairs()
@@ -474,11 +570,28 @@ def is_password_prompt(prompt: str) -> bool:
     return bool(_PASSWORD_PROMPT_RE.search(prompt)) and not _OTP_PROMPT_RE.search(prompt)
 
 
+# Interactive input (bastion TOTP / password prompts, direct-node passwords).
+# None = ask in the terminal (daemon.py CLI). The GUI (app.py) installs an
+# async handler `(prompt, echo) -> str` that shows a dialog instead.
+prompt_handler = None
+
+
+async def ask(prompt: str, echo: bool) -> str:
+    if prompt_handler is not None:
+        return await prompt_handler(prompt, echo)
+    loop = asyncio.get_running_loop()
+    if echo:
+        return await loop.run_in_executor(None, input, prompt)
+    return await loop.run_in_executor(None, getpass.getpass, prompt)
+
+
 class _BastionClient(_TrackedClient):
     _label = "bastion"
 
-    def __init__(self):
+    def __init__(self, name: str = DEFAULT_BASTION):
         super().__init__()
+        self._name = name
+        self._label = _blabel(name)
         # [bastion] password is offered at most once per connection: if the
         # server asks again it was rejected, and resending it would only burn
         # attempts toward a lockout — the terminal takes over instead.
@@ -497,7 +610,7 @@ class _BastionClient(_TrackedClient):
         """Return the configured bastion password at most once per connection."""
         if self._password_sent:
             return None
-        saved = _passwords.get(BASTION_PASSWORD_KEY)
+        saved = _passwords.get(_bpw_key(self._name))
         if not saved:
             return None
         self._password_sent = True
@@ -527,7 +640,8 @@ class _BastionClient(_TrackedClient):
         # gets [bastion] password, everything else is typed in the terminal.
         if instructions:
             print(instructions, flush=True)
-        loop = asyncio.get_event_loop()
+        # With several bastions the dialog must say which one is asking.
+        tag = "" if self._name == DEFAULT_BASTION else f"[{self._name}] "
         responses = []
         for prompt, echo in prompts:
             if is_password_prompt(prompt):
@@ -535,29 +649,26 @@ class _BastionClient(_TrackedClient):
             else:
                 saved = None
             if saved is not None:
-                print(f"{prompt.rstrip()} (using [bastion] password from config)", flush=True)
+                print(f"{tag}{prompt.rstrip()} (using [{_blabel(self._name)}] password from config)", flush=True)
                 answer = saved
-            elif echo:
-                answer = await loop.run_in_executor(None, input, prompt)
             else:
-                answer = await loop.run_in_executor(None, getpass.getpass, prompt)
+                answer = await ask(tag + prompt, echo)
             responses.append(answer)
         return responses
 
     def connection_lost(self, exc: Exception | None) -> None:
-        global _bastion_conn
         self._report_lost(exc)
         # A stale client's callback can arrive after a newer connection has
         # already replaced it in the pool (e.g. this client was pop()'d and
         # reconnected while the old socket's close was still in flight) —
         # only clear the pool entry if it's still this client's connection.
-        if _bastion_conn is self._conn:
-            _bastion_conn = None
-            _log("[bastion] next call will require a new verification code (TOTP) in this terminal")
-            # Only bastion-routed targets are tunneled through this
-            # connection — direct nodes have their own socket and must not
-            # be dropped just because the bastion went away.
-            for h in [h for h in _target_conns if _route(h) != "direct"]:
+        if _bastion_conns.get(self._name) is self._conn:
+            _bastion_conns.pop(self._name, None)
+            _log(f"[{_blabel(self._name)}] next call will require a new verification code (TOTP) in this terminal")
+            # Only targets tunneled through THIS bastion are dropped — direct
+            # nodes have their own socket, and other bastions are unaffected.
+            for h in [h for h in _target_conns
+                      if _route(h) != "direct" and _bastion_or_none(h) == self._name]:
                 _target_conns.pop(h, None)
 
 
@@ -580,35 +691,32 @@ def _allowed(host: str) -> bool:
     return any(fnmatch.fnmatch(host, p) for p in patterns)
 
 
-async def _connect_bastion() -> asyncssh.SSHClientConnection:
-    b = cfg.get("bastion")
+async def _connect_bastion(name: str | None = None) -> asyncssh.SSHClientConnection:
+    name = name or _default_bastion()
+    b = bastions().get(name)
     if not b:
-        # Reachable if a bastion-routed host is used without a [bastion]
-        # section configured at all — give a clear error instead of the
-        # KeyError that cfg["bastion"] below would raise.
-        raise ConfigError(
-            "no [bastion] section is configured; this host needs one "
-            "(or set via = \"direct\" and give it an address)"
-        )
+        raise ConfigError(f"bastion {name!r} is not configured")
+    port = b.get("port", 22)
+    label = _blabel(name)
     print(
-        f"Connecting to bastion {b['user']}@{b['host']}:{b['port']} — "
-        "enter TOTP / password in this terminal when prompted.",
+        f"Connecting to {label} {b['user']}@{b['host']}:{port} — "
+        "enter TOTP / password when prompted.",
         flush=True,
     )
     conn, _ = await asyncssh.create_connection(
-        _BastionClient,
+        lambda: _BastionClient(name),
         b["host"],
-        port=b["port"],
+        port=port,
         username=b["user"],
-        client_keys=_bastion_client_keys(),
+        client_keys=_bastion_client_keys(name),
         # Both ordinary password auth and keyboard-interactive password
         # prompts are answered by _BastionClient, which shares one
         # per-connection send-once flag between the two paths.
         known_hosts=None,
         connect_timeout=BASTION_CONNECT_TIMEOUT,
-        **_keepalive_kwargs(),
+        **_keepalive_kwargs(name),
     )
-    _log(f"[bastion] connected {b['user']}@{b['host']}:{b['port']}")
+    _log(f"[{label}] connected {b['user']}@{b['host']}:{port}")
     return conn
 
 
@@ -618,21 +726,23 @@ def _is_closed(conn: asyncssh.SSHClientConnection | None) -> bool:
     return conn is None
 
 
-async def _ensure_bastion() -> asyncssh.SSHClientConnection:
-    """Must be called with _bastion_lock already held."""
-    global _bastion_conn
-    if _bastion_conn is not None and not await _idle_probe_ok(_bastion_conn, "bastion"):
+async def _ensure_bastion(name: str | None = None) -> asyncssh.SSHClientConnection:
+    """Must be called with that bastion's lock (_bastion_lock(name)) held."""
+    name = name or _default_bastion()
+    conn = _bastion_conns.get(name)
+    if conn is not None and not await _idle_probe_ok(conn, _blabel(name)):
         # Half-dead after a long idle gap: drop it now and reconnect once
         # below, instead of failing a real command on it first.
-        _invalidate_bastion()
-    if _bastion_conn is None:
-        _bastion_conn = await _connect_bastion()
-    return _bastion_conn
+        _invalidate_bastion(name)
+    if _bastion_conns.get(name) is None:
+        _bastion_conns[name] = await _connect_bastion(name)
+    return _bastion_conns[name]
 
 
-async def get_bastion() -> asyncssh.SSHClientConnection:
-    async with _bastion_lock:
-        return await _ensure_bastion()
+async def get_bastion(name: str | None = None) -> asyncssh.SSHClientConnection:
+    name = name or _default_bastion()
+    async with _bastion_lock(name):
+        return await _ensure_bastion(name)
 
 
 async def get_target(host: str) -> asyncssh.SSHClientConnection:
@@ -689,10 +799,11 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
                 kwargs["client_keys"] = _host_client_keys(host)
             conn = await asyncssh.connect(address, **kwargs)
         else:
-            async with _bastion_lock:
-                bastion = await _ensure_bastion()
+            bname = bastion_of(host)
+            async with _bastion_lock(bname):
+                bastion = await _ensure_bastion(bname)
 
-            username = host_cfg.get("user", cfg.get("bastion", {}).get("user", ""))
+            username = host_cfg.get("user", bastions()[bname].get("user", ""))
 
             conn = await asyncssh.connect(
                 host,
@@ -702,7 +813,7 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
                 known_hosts=None,
                 connect_timeout=_connect_timeout(),
                 client_factory=lambda: _TargetClient(host),
-                **_keepalive_kwargs(),
+                **_keepalive_kwargs(bname),
             )
         _target_conns[host] = conn
         if host not in _sems:
@@ -735,18 +846,18 @@ def _invalidate_target(host: str) -> None:
         _close_local(conn)
 
 
-def _invalidate_bastion() -> None:
-    """Drop and close the bastion connection, plus every target connection
+def _invalidate_bastion(name: str | None = None) -> None:
+    """Drop and close a bastion connection, plus every target connection
     tunneled through it, so the next hop/bastion-routed call reconnects
     instead of reusing a socket that's already dead but hasn't run its
     connection_lost() callback yet (same reasoning as _invalidate_target).
-    direct-routed targets have their own socket and are left alone."""
-    global _bastion_conn
-    conn = _bastion_conn
-    _bastion_conn = None
+    direct-routed targets and other bastions' targets are left alone."""
+    name = name or _default_bastion()
+    conn = _bastion_conns.pop(name, None)
     if conn is not None:
         _close_local(conn)
-    for h in [h for h in _target_conns if _route(h) != "direct"]:
+    for h in [h for h in _target_conns
+              if _route(h) != "direct" and _bastion_or_none(h) == name]:
         _target_conns.pop(h, None)
 
 
@@ -847,9 +958,10 @@ async def _run_hop(
     - a *remote* timeout (124/137) is ssh's exit status once the nested
       `timeout` fires, so it maps to RemoteTimeout just like the local path.
     """
-    async with _bastion_lock:
-        bastion = await _ensure_bastion()
-    async with _hop_sem:
+    bname = bastion_of(host)
+    async with _bastion_lock(bname):
+        bastion = await _ensure_bastion(bname)
+    async with _hop_sem(bname):
         with _in_use(bastion):
             process = await bastion.create_process(
                 hop_ssh_command(host, cmd, timeout), input=stdin, errors="replace"
@@ -910,7 +1022,7 @@ async def run(
         except HopSSHError:
             raise
         except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
-            _invalidate_bastion()
+            _invalidate_bastion(bastion_of(host))
             return await _run_hop(host, cmd, timeout, stdin)
 
     try:
@@ -958,40 +1070,93 @@ async def with_sftp(host: str, func):
         return await _attempt()
 
 
+def connection_status() -> list[dict]:
+    """Snapshot for the GUI: one row per bastion, then one per configured
+    node. state is "connected" | "idle" | "offline" | "via-bastion"; detail
+    is a short human string. Read-only — never connects anything.
+    Connections are lazy, so "idle" just means nothing has used that node
+    yet (or its connection dropped); the next call connects on demand."""
+    now = time.monotonic()
+
+    def age(conn) -> str:
+        s = _conn_stats.get(conn)
+        return f"已连接 {_fmt_dur(now - s.connected_at)}" if s else "已连接"
+
+    rows: list[dict] = []
+    bs = bastions()
+    for bname in bs:
+        conn = _bastion_conns.get(bname)
+        rows.append({
+            "name": "跳板机" if bname == DEFAULT_BASTION else f"跳板机 {bname}",
+            "via": "bastion",
+            "state": "connected" if conn is not None else "offline",
+            "detail": age(conn) if conn is not None else "未登录（首次调用时需验证码）",
+        })
+    for host, hc in cfg.get("host", {}).items():
+        via = hc.get("via", "bastion")
+        bname = None if via == "direct" else _bastion_or_none(host)
+        bastion_up = bname is not None and bname in _bastion_conns
+        suffix = f"（{bname}）" if bname and len(bs) > 1 else ""
+        if via == "hop":
+            if bname is None:
+                rows.append({"name": host, "via": via, "state": "offline",
+                             "detail": "未指定跳板机（bastion 字段）"})
+            else:
+                rows.append({
+                    "name": host, "via": via,
+                    "state": "via-bastion" if bastion_up else "offline",
+                    "detail": f"经跳板机代跑 ssh{suffix}" if bastion_up else f"跳板机未登录{suffix}",
+                })
+            continue
+        conn = _target_conns.get(host)
+        if conn is not None:
+            rows.append({"name": host, "via": via, "state": "connected", "detail": age(conn) + suffix})
+        elif via == "bastion" and not bastion_up:
+            rows.append({"name": host, "via": via, "state": "offline", "detail": f"跳板机未登录{suffix}"})
+        else:
+            rows.append({"name": host, "via": via, "state": "idle",
+                         "detail": f"未连接（首次调用时按需连接）{suffix}"})
+    return rows
+
+
 async def reset_all() -> None:
-    global _bastion_conn
-    async with _bastion_lock:
-        for conn in list(_target_conns.values()):
-            _close_local(conn)
-        _target_conns.clear()
-        if _bastion_conn is not None:
-            _close_local(_bastion_conn)
-            _bastion_conn = None
+    for conn in list(_target_conns.values()):
+        _close_local(conn)
+    _target_conns.clear()
+    for name in list(_bastion_conns):
+        async with _bastion_lock(name):
+            conn = _bastion_conns.pop(name, None)
+            if conn is not None:
+                _close_local(conn)
 
 
 async def heartbeat_once() -> bool | None:
-    """One heartbeat: a real channel (`true`) on the *existing* bastion
+    """One heartbeat: a real channel (`true`) on every *existing* bastion
     connection, to count as channel activity for a bastion that kicks
-    sessions idle on channels (SSH keepalives don't). Returns True/False for
-    ok/failed, None if there was no bastion to ping.
+    sessions idle on channels (SSH keepalives don't). Returns True if all
+    pings were ok, False if any failed, None if there was no bastion to ping.
 
     Never reconnects: a new bastion login means a TOTP prompt, which must
     only ever happen because a user call needed it. Uses the connection
-    object directly and not _bastion_lock, so it can neither queue behind
-    nor starve a real call (a login in progress isn't in _bastion_conn yet,
-    so it is skipped too). A failed ping is only logged — not invalidated —
-    since a slow link or a full MaxSessions must not cost a TOTP re-login;
-    keepalive / the idle probe handle genuinely dead sockets."""
-    conn = _bastion_conn
-    if conn is None:
+    objects directly and not the bastion locks, so it can neither queue
+    behind nor starve a real call (a login in progress isn't in
+    _bastion_conns yet, so it is skipped too). A failed ping is only logged
+    — not invalidated — since a slow link or a full MaxSessions must not
+    cost a TOTP re-login; keepalive / the idle probe handle genuinely dead
+    sockets."""
+    conns = list(_bastion_conns.items())
+    if not conns:
         return None
-    try:
-        await _ping(conn, HEARTBEAT_TIMEOUT)
-    except Exception as e:
-        _log(f"[bastion] heartbeat failed: {_fmt_exc(e)}")
-        return False
-    _touch(conn, real=False)
-    return True
+    ok = True
+    for name, conn in conns:
+        try:
+            await _ping(conn, HEARTBEAT_TIMEOUT)
+        except Exception as e:
+            _log(f"[{_blabel(name)}] heartbeat failed: {_fmt_exc(e)}")
+            ok = False
+            continue
+        _touch(conn, real=False)
+    return ok
 
 
 async def heartbeat_loop(interval: float | None = None) -> None:

@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import getpass
 import sys
 
 import asyncssh
@@ -32,7 +31,7 @@ def _validate_config(cfg: dict) -> None:
 
 
 async def _prompt_password(loop: asyncio.AbstractEventLoop, host: str) -> str:
-    return await loop.run_in_executor(None, getpass.getpass, f"[{host}] password: ")
+    return await pool.ask(f"[{host}] password: ", False)
 
 
 async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -92,37 +91,41 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
                 break
 
 
-async def _login_bastion() -> bool:
+async def _login_bastion(name: str | None = None) -> bool:
     """Startup login to the bastion. A rejected TOTP/password or a timeout
     (e.g. the code wasn't typed within pool.BASTION_CONNECT_TIMEOUT) gets
     retried (up to BASTION_RETRIES total attempts, each one prompting
     again); any other failure is reported once and not retried. Either way, failure
     doesn't stop the daemon — the pool reconnects lazily, so the first call
     that needs the bastion prompts for a code in this terminal."""
+    label = pool._blabel(name) if name else "bastion"
     attempts_left = BASTION_RETRIES
     while True:
         try:
-            await pool.get_bastion()
+            await pool.get_bastion(name)
             return True
         except asyncssh.PermissionDenied as e:
             attempts_left -= 1
             reason = getattr(e, "reason", "") or str(e)
             if attempts_left <= 0:
-                print(f"[bastion] 认证失败（{reason}），次数已用完，放弃启动时登录", flush=True)
+                print(f"[{label}] 认证失败（{reason}），次数已用完，放弃启动时登录", flush=True)
                 return False
-            print(f"[bastion] 认证失败（{reason}），请重新输入，还剩 {attempts_left} 次", flush=True)
+            print(f"[{label}] 认证失败（{reason}），请重新输入，还剩 {attempts_left} 次", flush=True)
         except asyncio.TimeoutError:
             attempts_left -= 1
             if attempts_left <= 0:
-                print("[bastion] 登录超时，次数已用完，放弃启动时登录", flush=True)
+                print(f"[{label}] 登录超时，次数已用完，放弃启动时登录", flush=True)
                 return False
-            print(f"[bastion] 登录超时，请重新输入，还剩 {attempts_left} 次", flush=True)
+            print(f"[{label}] 登录超时，请重新输入，还剩 {attempts_left} 次", flush=True)
         except Exception as e:
-            print(f"[bastion] 登录失败（{type(e).__name__}: {e}），放弃启动时登录", flush=True)
+            print(f"[{label}] 登录失败（{type(e).__name__}: {e}），放弃启动时登录", flush=True)
             return False
 
 
-def main() -> None:
+def init_service() -> tuple[dict, int]:
+    """Load + validate config.toml and wire it into pool/tools. Exits via
+    sys.exit(1) (after printing the reason) on a missing/invalid config;
+    the GUI catches SystemExit and shows the printed message."""
     if not CONFIG_PATH.exists():
         print(
             "config.toml not found. 复制 config.example.toml 为 config.toml 后填写。",
@@ -139,54 +142,80 @@ def main() -> None:
 
     pool.cfg = cfg
     # Not prompted for when empty: the bastion's own keyboard-interactive
-    # prompt in this terminal already asks for it, exactly as before.
-    bastion_password = cfg.get("bastion", {}).get("password", "")
-    if bastion_password:
-        pool._passwords[pool.BASTION_PASSWORD_KEY] = bastion_password
+    # prompt already asks for it, exactly as before.
+    for bname, bcfg in pool.bastions(cfg).items():
+        if bcfg.get("password"):
+            pool._passwords[pool._bpw_key(bname)] = bcfg["password"]
 
-    audit_log = cfg.get("daemon", {}).get("audit_log", "")
-    tools.AUDIT_LOG = audit_log
+    tools.AUDIT_LOG = cfg.get("daemon", {}).get("audit_log", "")
 
     port = cfg.get("daemon", {}).get("port", 8765)
-    b = cfg.get("bastion")
     tools.mcp.settings.host = "127.0.0.1"
     tools.mcp.settings.port = port
+    return cfg, port
 
-    async def _serve() -> None:
-        # Everything that touches the event loop — password pre-connects,
-        # the bastion connection, and serving — must run inside this one
-        # asyncio.run() call: asyncio.run() tears its loop down when it
-        # returns, which would leave any connection bound to a dead loop
-        # and unable to fire connection_lost on that loop ever again.
-        loop = asyncio.get_event_loop()
-        await _prepare_password_hosts(cfg, loop)
 
-        if b:
-            logged_in = await _login_bastion()
-            print(
-                f"remote-mcp listening on http://127.0.0.1:{port}/mcp\n"
-                f"bastion: {b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}",
-                flush=True,
+async def serve(cfg: dict, port: int, on_server=None, use_colors: bool | None = None) -> None:
+    """Everything that touches the event loop — password pre-connects, the
+    bastion connection, and serving — must run inside ONE event loop that
+    lives as long as the service: asyncio.run() tears its loop down when it
+    returns, which would leave any connection bound to a dead loop and
+    unable to fire connection_lost on that loop ever again.
+
+    on_server(server) is called with the uvicorn.Server once it exists, so
+    a caller (the GUI) can stop the service by setting server.should_exit."""
+    import uvicorn
+
+    bs = pool.bastions(cfg)
+    loop = asyncio.get_running_loop()
+    await _prepare_password_hosts(cfg, loop)
+
+    not_logged_in = []
+    for bname in bs:
+        if not await _login_bastion(bname):
+            not_logged_in.append(bname)
+    lines = [f"remote-mcp listening on http://127.0.0.1:{port}/mcp"]
+    for bname, b in bs.items():
+        lines.append(f"{pool._blabel(bname)}: {b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}")
+    if not bs:
+        lines.append('no [bastion] configured; every host must use via="direct"')
+    print(chr(10).join(lines), flush=True)
+    for bname in not_logged_in:
+        print(f"[{pool._blabel(bname)}] 尚未登录，首次需要它的调用会要求输入验证码", flush=True)
+    # Started only after the initial login (so it can't race the first
+    # TOTP prompt); it never reconnects, see pool.heartbeat_once().
+    heartbeat = asyncio.create_task(pool.heartbeat_loop())
+    try:
+        # FastMCP builds its StreamableHTTP session manager once and that
+        # manager can only run() once per instance, so a second start in the
+        # same process (GUI stop -> start) would die in the lifespan. Drop it
+        # so streamable_http_app() makes a fresh one.
+        tools.mcp._session_manager = None
+        server = uvicorn.Server(
+            uvicorn.Config(
+                tools.mcp.streamable_http_app(),
+                host="127.0.0.1",
+                port=port,
+                log_level=tools.mcp.settings.log_level.lower(),
+                # Don't let an idle MCP client's open SSE stream block Stop forever.
+                timeout_graceful_shutdown=3,
+                use_colors=use_colors,
             )
-            if not logged_in:
-                print("尚未登录，首次需要堡垒机的调用会在此终端要求输入验证码", flush=True)
-        else:
-            print(
-                f"remote-mcp listening on http://127.0.0.1:{port}/mcp\n"
-                "no [bastion] configured; every host must use via=\"direct\"",
-                flush=True,
-            )
-        # Started only after the initial login (so it can't race the first
-        # TOTP prompt); it never reconnects, see pool.heartbeat_once().
-        heartbeat = asyncio.create_task(pool.heartbeat_loop())
-        try:
-            await tools.mcp.run_streamable_http_async()
-        finally:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+        )
+        if on_server:
+            on_server(server)
+        await server.serve()
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        with contextlib.suppress(Exception):
+            await pool.reset_all()
 
-    asyncio.run(_serve())
+
+def main() -> None:
+    cfg, port = init_service()
+    asyncio.run(serve(cfg, port))
 
 
 if __name__ == "__main__":

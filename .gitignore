@@ -1,5 +1,6 @@
 # Configuration with credentials
 config.toml
+config.toml.bak
 nodes.yaml
 
 # Local scratch files

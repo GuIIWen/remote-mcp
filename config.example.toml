@@ -45,6 +45,7 @@ allowed = ["dev1", "lab3", "lab4", "nmz01"]
 [host.dev1]
 user        = "yourname"                 # 该目标机上的登录用户名
 default_cwd = "/home/yourname"    # 相对路径参数的解析基准（远端 Linux 路径）；各集群家目录不同，先在远端 echo $HOME 确认
+# address / port（可选）：跳板机解析不了节点名时（报 Temporary failure in name resolution），填它的 IP 或域名和 SSH 端口作为隧道目标
 # via = "bastion" 是默认值，省略即可；节点名 dev1 本身会作为主机名交给跳板机解析
 # （即 yourname@dev1），认证只用密钥（key / cert，规则同下面的 direct+key 节点），
 # 不支持也不接受 password。

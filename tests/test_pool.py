@@ -736,5 +736,32 @@ class ProbeTests(PoolTestCase):
         self.assertEqual([r["host"] for r in rows[1:]], ["n", "h", "d"])
 
 
+class BastionRouteAddressTests(PoolTestCase):
+    async def test_tunnel_target_uses_address_and_port(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"zz": {"address": "10.1.2.3", "port": 2200, "user": "me"},
+                             "plain": {"user": "me"}}}
+        pool._bastion_conns["default"] = FakeConn()
+        seen = {}
+
+        async def fake_connect(host, **kw):
+            seen[host] = kw
+            return FakeConn()
+
+        with mock.patch.object(pool.asyncssh, "connect", fake_connect),                 mock.patch.object(pool, "_host_client_keys", return_value=[]),                 mock.patch.object(pool, "_idle_probe_ok", mock.AsyncMock(return_value=True)):
+            await pool.get_target("zz")
+            await pool.get_target("plain")
+        self.assertEqual(seen["10.1.2.3"]["port"], 2200)
+        self.assertIs(seen["10.1.2.3"]["tunnel"], pool._bastion_conns["default"])
+        self.assertEqual(seen["plain"]["port"], 22)  # no address: node name is the target
+
+    def test_address_no_longer_warned_for_bastion_route(self):
+        cfg = {"bastion": {"host": "b", "user": "u"},
+               "host": {"zz": {"address": "10.1.2.3"}, "pw": {"password": "x"}}}
+        _, warnings = pool.validate_config(cfg)
+        self.assertFalse(any("zz" in w for w in warnings))
+        self.assertTrue(any("pw" in w and "password" in w for w in warnings))
+
+
 if __name__ == "__main__":
     unittest.main()

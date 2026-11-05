@@ -233,9 +233,9 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
                     f"warning: [host.{host}] 配置了 container_user 但没有 container，将被忽略"
                 )
         else:
-            if hc.get("password") or hc.get("address"):
+            if hc.get("password"):
                 warnings.append(
-                    f"warning: [host.{host}] 走 bastion 路由，但配置了 password/address 字段，将被忽略"
+                    f"warning: [host.{host}] 走 bastion 路由只用密钥认证，password 字段将被忽略"
                 )
     return errors, warnings
 
@@ -757,11 +757,20 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
         if (
             isinstance(e, asyncssh.PermissionDenied)
             and _route(host) == "bastion"
-            and (hc.get("password") or hc.get("address"))
+            and hc.get("password")
         ):
             _log(
-                f"[target {host}]   hint: via=\"bastion\" 节点只用密钥认证，password / address 字段不生效；"
+                f"[target {host}]   hint: via=\"bastion\" 节点只用密钥认证，password 字段不生效；"
                 "要用密码登录请把 via 改成 direct 并填写 address，或确认本机密钥已加到该节点的 authorized_keys"
+            )
+        if (
+            isinstance(e, asyncssh.ChannelOpenError)
+            and _route(host) == "bastion"
+            and not hc.get("address")
+        ):
+            _log(
+                f"[target {host}]   hint: 跳板机连不上 {host!r}（常见原因：跳板机解析不了这个名字）；"
+                "可在 [host." + host + "] 里填 address（IP 或域名）和 port 作为隧道目标"
             )
         raise
 
@@ -826,8 +835,12 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
 
             username = host_cfg.get("user", bastions()[bname].get("user", ""))
 
+            # The tunnel destination is resolved BY the bastion: `address`
+            # (if set) lets a node name that the bastion can't resolve still
+            # be reached by IP; `port` is that node's SSH port.
             conn = await asyncssh.connect(
-                host,
+                host_cfg.get("address") or host,
+                port=host_cfg.get("port", 22),
                 username=username,
                 tunnel=bastion,
                 client_keys=_host_client_keys(host),

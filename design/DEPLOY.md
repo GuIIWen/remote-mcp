@@ -149,7 +149,7 @@ default_cwd = "<远端家目录>"
 | `host.<name>.node` | 仅 hop 节点，选填：跳板机实际 `ssh` 的目标主机名；省略则等于段名。缓存、锁、并发限制仍按段名区分，所以多个段可以共用同一个 `node`（各配不同容器） |
 | `host.<name>.container` | 仅 hop 节点，选填：容器名或 ID 前缀；设了就用 `docker exec -i` 在该容器里执行命令，`default_cwd` 变为容器内路径。字符集限字母、数字、`.`、`_`、`-` |
 | `host.<name>.container_user` | 仅 hop 节点且已配 `container`，选填：`docker exec -u` 的值；省略则不传 `-u`。与 `user`（跳板机 ssh 到 node 的 `-l`）是两个不同字段 |
-| `host.<name>.address` | **仅 direct 节点需要**：这台机器的地址（域名或 IP）。bastion / hop 路由的节点不需要这个字段（直接用节点名当主机名，交给跳板机或跳板机上的 ssh 解析），如果误填了会在启动时打印警告并忽略 |
+| `host.<name>.address` | direct 节点**必填**：这台机器的地址（域名或 IP）。bastion 路由的节点**可选**：隧道目标默认是节点名（由跳板机解析），跳板机解析不了时（日志里 `Temporary failure in name resolution`）在这里填 IP / 域名，端口用 `port`。hop 路由的节点不需要（用 `node` 字段），误填会打印警告并忽略 |
 | `host.<name>.port` | direct 节点：SSH 端口，默认 22。hop 节点：选填，跳板机 ssh 到目标机时用的 `-p`；留空则由跳板机自己的 `~/.ssh/config` 或 ssh 默认值决定 |
 | `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion / hop 路由的节点固定用密钥登录（且密钥都不在本机——bastion 路由是跳板机隧道到目标机时用本机私钥，hop 路由是跳板机自己的私钥），不支持这个字段 |
 | `host.<name>.key` / `cert` | 仅 direct + `auth="key"`：私钥路径（和可选的 OpenSSH 用户证书路径）。留空时的回退顺序是 `[host.x] key` → `[bastion] key` → 本机默认密钥对（`~/.ssh/id_*`） |

@@ -36,8 +36,8 @@ NODE_FIELDS = [
     ("bastion", "所属跳板机", "bastion",
      "bastion / hop 节点走哪台跳板机；有多台时必填，只有一台可留空"),
     ("user", "用户名", "str", "目标机登录用户名"),
-    ("address", "地址", "str", "IP 或域名（direct 必填）"),
-    ("port", "端口", "int", "direct：SSH 端口；hop：跳板机 ssh 的 -p"),
+    ("address", "地址", "str", "direct 必填；bastion 节点可选：跳板机解析不了节点名时填 IP / 域名"),
+    ("port", "端口", "int", "目标机 SSH 端口（direct / bastion），hop：跳板机 ssh 的 -p"),
     ("auth", "认证方式", "choice:key,password", "direct 节点：密钥或密码"),
     ("key", "私钥路径", "file", "留空则回退到所属跳板机的 key / 默认密钥对"),
     ("cert", "用户证书", "file", "可选：CA 签发的 *-cert.pub"),
@@ -49,8 +49,8 @@ NODE_FIELDS = [
     ("default_cwd", "默认工作目录", "str", "远端 Linux 路径（容器节点为容器内路径）"),
 ]
 VIA_HINTS = {
-    "bastion": "提示：所有字段都可以填写并保存。当前版本里，经跳板机的节点只用密钥认证，"
-               "地址 / 密码等字段暂不生效（后续支持后即可直接使用）。",
+    "bastion": "提示：经跳板机的节点只用密钥认证，password 字段暂不生效。"
+               "节点名需要能被跳板机解析；解析不了就在“地址”里填 IP（端口用“端口”）。",
     "hop": "提示：所有字段都可以填写并保存。hop 节点由跳板机上的 ssh 代为连接，"
            "本机的地址 / 密钥 / 密码字段暂不生效。",
     "direct": "直连节点：认证方式选 password 时使用密码（留空则启动服务时弹窗输入）。",

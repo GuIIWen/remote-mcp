@@ -132,18 +132,30 @@ class App:
         self.panel_open = True
         tk.Button(self.panel, text="节点状态  ▸ 收起", anchor="w", relief="flat",
                   command=self.toggle_panel).pack(fill="x")
-        self.tree = ttk.Treeview(self.panel, columns=("via", "state"), height=8)
+        self.tree = ttk.Treeview(self.panel, columns=("via", "state", "test"), height=8)
         self.tree.heading("#0", text="节点")
         self.tree.heading("via", text="路由")
         self.tree.heading("state", text="状态")
+        self.tree.heading("test", text="测试")
         self.tree.column("#0", width=80, minwidth=50, stretch=False)
         self.tree.column("via", width=55, minwidth=40, stretch=False)
         self.tree.column("state", width=150, minwidth=80)
+        self.tree.column("test", width=110, minwidth=60)
         self.tree.tag_configure("connected", foreground="#1a7f37")
         self.tree.tag_configure("via-bastion", foreground="#1a7f37")
         self.tree.tag_configure("idle", foreground="#6e7781")
         self.tree.tag_configure("offline", foreground="#cf222e")
+        self.tree.tag_configure("ok", foreground="#1a7f37")
+        self.tree.tag_configure("fail", foreground="#cf222e")
         self.tree.pack(fill="both", expand=True)
+        btns = tk.Frame(self.panel)
+        btns.pack(fill="x", pady=(4, 0))
+        self.btn_test_sel = tk.Button(btns, text="测试选中", command=self.test_selected)
+        self.btn_test_sel.pack(side="left")
+        self.btn_test_all = tk.Button(btns, text="测试全部", command=self.test_all)
+        self.btn_test_all.pack(side="left", padx=6)
+        self.probe_results: dict[str, str] = {}  # node -> text shown in the 测试 column
+        self.probing = False
         # 收起后留在右边缘的小按钮，点它重新展开
         self.expand_btn = tk.Button(self.body, text="◂" + chr(10) + "节" + chr(10) + "点" + chr(10) + "状" + chr(10) + "态",
                                     width=2, relief="flat", command=self.toggle_panel)
@@ -347,15 +359,71 @@ class App:
     def refresh_nodes(self) -> None:
         running = bool(self.thread and self.thread.is_alive() and self.server)
         if self.panel_open:
+            selected = set(self.tree.selection())
             rows = pool.connection_status() if running else []
             self.tree.delete(*self.tree.get_children())
             if not running:
                 self.tree.insert("", "end", text="服务未启动", tags=("idle",))
-            for r in rows:
+            for i, r in enumerate(rows):
                 mark = {"connected": "● ", "via-bastion": "● ", "idle": "○ ", "offline": "✕ "}[r["state"]]
-                self.tree.insert("", "end", text=r["name"], values=(r["via"], mark + r["detail"]),
-                                 tags=(r["state"],))
+                host = r.get("host")
+                result = self.probe_results.get(host, "") if host else ""
+                tags = [r["state"]]
+                if result.startswith("✓"):
+                    tags = ["ok"]
+                elif result.startswith("✗"):
+                    tags = ["fail"]
+                iid = f"n:{host}" if host else f"b:{i}"
+                self.tree.insert("", "end", iid=iid, text=r["name"],
+                                 values=(r["via"], mark + r["detail"], result), tags=tags)
+                if iid in selected:
+                    self.tree.selection_add(iid)
+        self.btn_test_sel.configure(state="normal" if running and not self.probing else "disabled")
+        self.btn_test_all.configure(state="normal" if running and not self.probing else "disabled")
         self.root.after(2000, self.refresh_nodes)
+
+    # ── 测试连接 ──────────────────────────────────────────
+    def test_selected(self) -> None:
+        hosts = [i[2:] for i in self.tree.selection() if i.startswith("n:")]
+        if not hosts:
+            messagebox.showinfo("测试连接", "请先在节点状态里选中一个或多个节点（跳板机行不能测试）。")
+            return
+        self._run_probes(hosts)
+
+    def test_all(self) -> None:
+        self._run_probes([h for h in pool.cfg.get("host", {})])
+
+    def _run_probes(self, hosts: list[str]) -> None:
+        loop = self.loop
+        if not (loop and self.server) or self.probing or not hosts:
+            return
+        self.probing = True
+        for h in hosts:
+            self.probe_results[h] = "测试中…"
+
+        async def work() -> None:
+            # One node at a time: a bastion login may need a verification
+            # code, and several dialogs at once would be confusing.
+            try:
+                for h in hosts:
+                    ok, detail = await pool.probe(h)
+                    text = ("✓ " if ok else "✗ ") + detail
+                    print(f"[测试] {h} {text}")
+                    self.call_ui(self.probe_results.__setitem__, h, text)
+            finally:
+                self.call_ui(setattr, self, "probing", False)
+
+        asyncio.run_coroutine_threadsafe(work(), loop)
+        self.refresh_nodes_now()
+
+    def refresh_nodes_now(self) -> None:
+        # refresh_nodes() reschedules itself; just redraw the rows once.
+        if self.panel_open:
+            for iid in self.tree.get_children():
+                if iid.startswith("n:"):
+                    vals = list(self.tree.item(iid, "values"))
+                    vals[2] = self.probe_results.get(iid[2:], "")
+                    self.tree.item(iid, values=vals)
 
     def clear_log(self) -> None:
         self.log.configure(state="normal")

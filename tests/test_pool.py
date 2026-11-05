@@ -699,5 +699,42 @@ class MultiBastionTests(PoolTestCase):
         self.assertEqual(rows["d"]["state"], "idle")
 
 
+class ConnectFailureLogTests(PoolTestCase):
+    async def test_failed_connect_is_logged_with_hint(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"zz": {"user": "me", "password": "x"}, "dd": {"via": "direct", "address": "1.1.1.1"}}}
+        boom = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("denied"))
+        with mock.patch.object(pool, "_get_target", boom), capture() as out:
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.get_target("zz")
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.get_target("dd")
+        text = out.getvalue()
+        self.assertIn("[target zz] connect failed: PermissionDenied", text)
+        self.assertIn("hint:", text)  # bastion route + password configured
+        self.assertIn("[target dd] connect failed", text)
+        self.assertEqual(text.count("hint:"), 1)
+
+
+class ProbeTests(PoolTestCase):
+    async def test_probe_ok_and_failure_never_raise(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"n": {}}}
+        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=object())):
+            ok, detail = await pool.probe("n")
+        self.assertTrue(ok)
+        self.assertTrue(detail.endswith("s"))
+        with mock.patch.object(pool, "run", mock.AsyncMock(side_effect=asyncssh.PermissionDenied("no"))):
+            ok, detail = await pool.probe("n")
+        self.assertFalse(ok)
+        self.assertIn("PermissionDenied", detail)
+
+    def test_status_rows_carry_host_key(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"n": {}, "h": {"via": "hop"}, "d": {"via": "direct", "address": "x"}}}
+        rows = pool.connection_status()
+        self.assertIsNone(rows[0]["host"])
+        self.assertEqual([r["host"] for r in rows[1:]], ["n", "h", "d"])
+
+
 if __name__ == "__main__":
     unittest.main()

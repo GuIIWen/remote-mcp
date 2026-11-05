@@ -746,6 +746,27 @@ async def get_bastion(name: str | None = None) -> asyncssh.SSHClientConnection:
 
 
 async def get_target(host: str) -> asyncssh.SSHClientConnection:
+    """Pooled connection to a target. Failures are logged here (the tool
+    call only returns the error to the MCP client, so without this the
+    daemon window / app.log would show nothing about why a node is down)."""
+    try:
+        return await _get_target(host)
+    except Exception as e:
+        _log(f"[target {host}] connect failed: {_fmt_exc(e)}")
+        hc = cfg.get("host", {}).get(host, {})
+        if (
+            isinstance(e, asyncssh.PermissionDenied)
+            and _route(host) == "bastion"
+            and (hc.get("password") or hc.get("address"))
+        ):
+            _log(
+                f"[target {host}]   hint: via=\"bastion\" 节点只用密钥认证，password / address 字段不生效；"
+                "要用密码登录请把 via 改成 direct 并填写 address，或确认本机密钥已加到该节点的 authorized_keys"
+            )
+        raise
+
+
+async def _get_target(host: str) -> asyncssh.SSHClientConnection:
     if not _allowed(host):
         raise ValueError(f"Host '{host}' is not in the allowed list")
     if _route(host) == "hop":
@@ -973,6 +994,7 @@ async def _run_hop(
                 raise RemoteTimeout(timeout) from None
     if result.returncode == 255:
         detail = (result.stderr or "").strip() or "(no stderr)"
+        _log(f"[{host}] hop ssh failed on the bastion: {detail}")
         raise HopSSHError(
             f"ssh to {host} on the bastion failed: {detail}"
         )
@@ -1088,7 +1110,7 @@ def connection_status() -> list[dict]:
         conn = _bastion_conns.get(bname)
         rows.append({
             "name": "跳板机" if bname == DEFAULT_BASTION else f"跳板机 {bname}",
-            "via": "bastion",
+            "host": None, "via": "bastion",
             "state": "connected" if conn is not None else "offline",
             "detail": age(conn) if conn is not None else "未登录（首次调用时需验证码）",
         })
@@ -1099,24 +1121,36 @@ def connection_status() -> list[dict]:
         suffix = f"（{bname}）" if bname and len(bs) > 1 else ""
         if via == "hop":
             if bname is None:
-                rows.append({"name": host, "via": via, "state": "offline",
+                rows.append({"name": host, "host": host, "via": via, "state": "offline",
                              "detail": "未指定跳板机（bastion 字段）"})
             else:
                 rows.append({
-                    "name": host, "via": via,
+                    "name": host, "host": host, "via": via,
                     "state": "via-bastion" if bastion_up else "offline",
                     "detail": f"经跳板机代跑 ssh{suffix}" if bastion_up else f"跳板机未登录{suffix}",
                 })
             continue
         conn = _target_conns.get(host)
         if conn is not None:
-            rows.append({"name": host, "via": via, "state": "connected", "detail": age(conn) + suffix})
+            rows.append({"name": host, "host": host, "via": via, "state": "connected", "detail": age(conn) + suffix})
         elif via == "bastion" and not bastion_up:
-            rows.append({"name": host, "via": via, "state": "offline", "detail": f"跳板机未登录{suffix}"})
+            rows.append({"name": host, "host": host, "via": via, "state": "offline", "detail": f"跳板机未登录{suffix}"})
         else:
-            rows.append({"name": host, "via": via, "state": "idle",
+            rows.append({"name": host, "host": host, "via": via, "state": "idle",
                          "detail": f"未连接（首次调用时按需连接）{suffix}"})
     return rows
+
+
+async def probe(host: str, timeout: int = 15) -> tuple[bool, str]:
+    """Actively test a node: connect if needed (so a bastion login / TOTP
+    prompt can happen) and run `true` on it. Returns (ok, detail); never
+    raises. Used by the GUI's "test connection" button."""
+    t0 = time.monotonic()
+    try:
+        await run(host, "true", timeout=timeout)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, f"{time.monotonic() - t0:.1f}s"
 
 
 async def reset_all() -> None:

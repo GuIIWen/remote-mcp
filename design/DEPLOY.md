@@ -262,6 +262,10 @@ ssh -o BatchMode=yes nmz01 hostname
 
 ## 5. 启动 daemon
 
+**推荐：图形界面。** 双击 `start-app.bat`（或 `python app.py`）打开窗口，点菜单 服务 → 启动服务；跳板机验证码 / 直连节点密码改为弹窗输入，日志显示在窗口里。功能都在顶部导航栏：服务（启动 / 停止 / 退出）、配置（配置编辑）、工具（复制 MCP 地址 / claude 注册命令、清空日志）。窗口右侧是可折叠、可拖动的节点状态面板。配置编辑是图形化编辑器：可改 `[bastion]` / `[daemon]` / `[hosts]` 和每个节点的全部字段，新增、删除、重命名节点和跳板机；保存时先校验再写回 `config.toml`（注释不会保留，旧版备份为 `config.toml.bak`）；服务运行中保存，节点和白名单的改动会立即热更新，跳板机和 daemon 的改动需停止后重新启动。窗口日志同时写入项目目录的 `app.log`。下面的命令行方式仍然可用，二者跑的是同一套服务，不要同时开（同一个端口）。
+
+命令行方式：
+
 ```powershell
 cd <REMOTE_MCP_DIR>
 uv run daemon.py
@@ -348,4 +352,24 @@ daemon 启动、TOTP 输入完成后，依次验证：
 
 ## 10. 多跳板机
 
-暂不支持；如果以后需要接入多台并列跳板机，改动方案见 `TODO.md`。
+`[bastion]` 可以换成多张 `[bastion.<名字>]` 表（字段相同），节点用 `bastion = "<名字>"` 绑定走哪一台：
+
+```toml
+[bastion.a]
+host = "bastion-a.example.com"
+user = "yourname"
+
+[bastion.b]
+host = "bastion-b.example.com"
+user = "yourname"
+
+[host.nmz01]
+via     = "hop"
+bastion = "a"
+```
+
+- 原来的单个 `[bastion]` 继续兼容，当作名为 `default` 的那一台。
+- 只配置一台跳板机时，节点的 `bastion` 字段可省略；配置了多台时，所有 `via = "bastion"`（默认）和 `via = "hop"` 的节点**必须**写 `bastion`，漏写或名字不存在会在启动 / 保存时报错。`via = "direct"` 的节点不经过跳板机，不需要也不应该写。
+- 启动时逐台登录，验证码弹窗和提示里会带上跳板机名字（如 `[a] Verification code:`）。
+- 每台跳板机有自己的连接、锁和心跳；某台断线只会清掉经它连出去的节点，其它跳板机和 direct 节点不受影响。
+- `list_hosts` 和图形界面的节点状态面板会显示每台跳板机的状态，以及节点走的是哪一台。

@@ -28,7 +28,7 @@ Agent (CC / Codex)
 | `hop` | 只有跳板机能登录的节点（私钥在跳板机上） | 由跳板机执行 `ssh <node>`；可用 `node` 指定 IP 或主机名，用 `port`、`user` 指定端口和用户；加 `container` 可进入已有容器（`docker exec`） |
 | `direct` | 本机能直接访问的节点 | 直连 `address:port`，密钥、证书或密码登录，不经过跳板机 |
 
-当前只支持一台跳板机，不支持多台并列。
+支持一台或多台并列跳板机：多台时写成 `[bastion.<名字>]`，`bastion` / `hop` 节点用 `bastion = "<名字>"` 指定走哪一台（见下文「多个跳板机」）。
 
 ### 工具
 
@@ -122,6 +122,15 @@ default_cwd = "<远端家目录>"
 
 ### 启动服务
 
+**图形界面（推荐）**：双击 `start-app.bat`（或 `python app.py`），点菜单 服务 → 启动服务。验证码和密码用弹窗输入，不用盯着终端。
+
+- **导航栏**：服务（启动 / 停止）、配置（配置编辑）、工具（复制 MCP 地址 / claude 注册命令、清空日志）。
+- **节点状态面板**：窗口右侧，显示跳板机和每个节点的连接状态，可折叠、可左右拖动；连接是按需建立的，未使用的节点显示「未连接」属正常。
+- **配置编辑**：可视化编辑 `config.toml`，新增 / 删除 / 重命名节点和跳板机，保存前校验；运行中保存会热更节点和白名单。保存会重写文件（注释不保留，旧版备份为 `config.toml.bak`）。
+- 日志同时写入项目目录下的 `app.log`；停止后可以再次启动。
+
+**命令行**：
+
 `daemon.py` 默认读取同级目录下的 `config.toml`。在工具目录中启动，并在**这个窗口**里输入跳板机的验证码；如果没有配置免密登录，还需要在这里输入跳板机密码：
 
 ```shell
@@ -190,6 +199,26 @@ nodes:
 
 该脚本不经过跳板机，只适用于本机能直连、且目前可以用密码登录的机器（`via = "direct"`）。`nodes.yaml` 里是明文密码，已加入 `.gitignore`，配完后建议删掉。
 
+### 多个跳板机
+
+```toml
+[bastion.a]
+host = "bastion-a.example.com"
+user = "yourname"
+
+[bastion.b]
+host = "bastion-b.example.com"
+user = "yourname"
+
+[host.nmz01]
+via     = "hop"
+bastion = "a"      # 绑定走哪台跳板机
+```
+
+- 原来的单个 `[bastion]` 继续兼容；只有一台跳板机时节点的 `bastion` 可省略。
+- 有多台时，`via = "bastion"`（默认）和 `via = "hop"` 的节点必须写 `bastion`；`direct` 节点不经过跳板机，不要写。
+- 启动时逐台登录，验证码提示带跳板机名字；某台断线只影响经它连出去的节点。
+
 ## 配置热更
 
 运行中改了 `config.toml`，让 Agent 调用 `reload_config` 即可生效，不需要重启：
@@ -213,9 +242,10 @@ nodes:
 | `design/DEPLOY.md` | 部署指南：环境、完整配置字段、密钥部署、排障 |
 | `design/remote-mcp-design.html` | 设计文档 |
 | `design/remote-mcp-guide.html` | 图解说明文档 |
-| `design/TODO.md` | 待办：多跳板机、局域网访问 |
+| `design/TODO.md` | 待办：局域网访问 |
 | `.claude/skills/remote-linux-mcp/` | 安装与使用 Skill |
-| `tests/` | 单元测试（`test_pool.py`、`test_daemon.py`、`test_tools.py`），不连真实 SSH |
+| `app.py` / `config_editor.py` / `config_io.py` | 图形界面：启动 / 停止服务、节点状态、配置编辑 |
+| `tests/` | 单元测试（`test_pool.py`、`test_daemon.py`、`test_tools.py`、`test_config_io.py`），不连真实 SSH |
 
 在项目根目录运行单元测试：
 

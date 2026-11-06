@@ -38,6 +38,10 @@ cfg: dict = {}
 
 DEFAULT_BASTION = "default"
 
+# Last connect failure per node ("Type: message"), shown in the GUI status
+# panel; cleared on the next success and when the node's config changes.
+_last_error: dict[str, str] = {}
+
 
 def bastions(c: dict | None = None) -> dict[str, dict]:
     """Configured bastions by name. Two config shapes are accepted:
@@ -750,8 +754,11 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
     call only returns the error to the MCP client, so without this the
     daemon window / app.log would show nothing about why a node is down)."""
     try:
-        return await _get_target(host)
+        conn = await _get_target(host)
+        _last_error.pop(host, None)
+        return conn
     except Exception as e:
+        _last_error[host] = f"{type(e).__name__}: {e}"
         _log(f"[target {host}] connect failed: {_fmt_exc(e)}")
         hc = cfg.get("host", {}).get(host, {})
         if (
@@ -1136,6 +1143,9 @@ def connection_status() -> list[dict]:
             if bname is None:
                 rows.append({"name": host, "host": host, "via": via, "state": "offline",
                              "detail": "未指定跳板机（bastion 字段）"})
+            elif _last_error.get(host):
+                rows.append({"name": host, "host": host, "via": via, "state": "offline",
+                             "detail": f"连接失败：{_last_error[host]}"})
             else:
                 rows.append({
                     "name": host, "host": host, "via": via,
@@ -1143,14 +1153,19 @@ def connection_status() -> list[dict]:
                     "detail": f"经跳板机代跑 ssh{suffix}" if bastion_up else f"跳板机未登录{suffix}",
                 })
             continue
+        err = _last_error.get(host)
         conn = _target_conns.get(host)
+        if conn is None and err:
+            rows.append({"name": host, "host": host, "via": via, "state": "offline",
+                         "detail": f"连接失败：{err}"})
+            continue
         if conn is not None:
             rows.append({"name": host, "host": host, "via": via, "state": "connected", "detail": age(conn) + suffix})
         elif via == "bastion" and not bastion_up:
             rows.append({"name": host, "host": host, "via": via, "state": "offline", "detail": f"跳板机未登录{suffix}"})
         else:
             rows.append({"name": host, "host": host, "via": via, "state": "idle",
-                         "detail": f"未连接（首次调用时按需连接）{suffix}"})
+                         "detail": f"尚未连接{suffix}"})
     return rows
 
 
@@ -1162,11 +1177,58 @@ async def probe(host: str, timeout: int = 15) -> tuple[bool, str]:
     try:
         await run(host, "true", timeout=timeout)
     except Exception as e:
+        _last_error[host] = f"{type(e).__name__}: {e}"
         return False, f"{type(e).__name__}: {e}"
+    _last_error.pop(host, None)
     return True, f"{time.monotonic() - t0:.1f}s"
 
 
+def _awaiting_password(host: str) -> bool:
+    """A direct+password node whose password hasn't been supplied yet: it
+    can't be connected without a prompt, which only startup may show."""
+    hc = cfg.get("host", {}).get(host, {})
+    return (
+        hc.get("via", "bastion") == "direct"
+        and hc.get("auth", "key") == "password"
+        and not _passwords.get(host)
+    )
+
+
+async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
+    """Actively connect every node in `hosts` (bastion / direct: open the
+    pooled connection; hop: run `true` through the bastion) instead of
+    waiting for the first tool call. Failures are logged and recorded in
+    _last_error, never raised. Nodes still waiting for a typed password are
+    skipped."""
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(host: str) -> None:
+        async with sem:
+            if _awaiting_password(host):
+                return
+            ok, detail = await probe(host)
+            _log(f"[connect] {host} " + (f"ok ({detail})" if ok else f"failed: {detail}"))
+
+    await asyncio.gather(*(one(h) for h in hosts), return_exceptions=True)
+
+
+_bg_tasks: set = set()
+
+
+def connect_in_background(hosts: list[str]):
+    """Start connect_nodes() as a task on the running loop (startup, config
+    reload). Returns the task, or None if there is nothing to connect."""
+    hosts = list(hosts)
+    if not hosts:
+        return None
+    task = asyncio.get_running_loop().create_task(connect_nodes(hosts))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
 async def reset_all() -> None:
+    _last_error.clear()
     for conn in list(_target_conns.values()):
         _close_local(conn)
     _target_conns.clear()
@@ -1275,6 +1337,7 @@ def apply_config(new_cfg: dict) -> dict:
 
     cfg = merged
     for h in removed + changed:
+        _last_error.pop(h, None)
         _invalidate_target(h)  # no-op for hop nodes (no entry); never closes the bastion
     for h in removed:
         _passwords.pop(h, None)

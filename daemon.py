@@ -43,8 +43,8 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
     lockout policy. Either way, failure just skips the host — it doesn't
     block daemon startup, and the host can still be reached later once its
     config/password is fixed (reset_connections picks up a new attempt).
-    Key-auth direct nodes are untouched here: they connect lazily on first
-    use, same as bastion-routed nodes always have."""
+    Every other node (key-auth direct, bastion, hop) is connected by
+    pool.connect_nodes() once the bastions are logged in."""
     for host, hc in cfg.get("host", {}).items():
         if hc.get("via", "bastion") != "direct":
             continue
@@ -185,6 +185,9 @@ async def serve(cfg: dict, port: int, on_server=None, use_colors: bool | None = 
     # Started only after the initial login (so it can't race the first
     # TOTP prompt); it never reconnects, see pool.heartbeat_once().
     heartbeat = asyncio.create_task(pool.heartbeat_loop())
+    # Connect every configured node now instead of on first use; runs in the
+    # background so the HTTP server comes up immediately.
+    sweep = pool.connect_in_background(list(cfg.get("host", {})))
     try:
         # FastMCP builds its StreamableHTTP session manager once and that
         # manager can only run() once per instance, so a second start in the
@@ -206,6 +209,8 @@ async def serve(cfg: dict, port: int, on_server=None, use_colors: bool | None = 
             on_server(server)
         await server.serve()
     finally:
+        if sweep is not None:
+            sweep.cancel()
         heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat

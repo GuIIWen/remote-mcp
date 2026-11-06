@@ -763,5 +763,59 @@ class BastionRouteAddressTests(PoolTestCase):
         self.assertTrue(any("pw" in w and "password" in w for w in warnings))
 
 
+class EagerConnectTests(PoolTestCase):
+    def setUp(self):
+        super().setUp()
+        pool._last_error.clear()
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"a": {}, "h": {"via": "hop"},
+                             "d": {"via": "direct", "address": "1.1.1.1"},
+                             "pw": {"via": "direct", "address": "2.2.2.2", "auth": "password"}}}
+
+    async def test_connect_nodes_runs_probe_for_every_node_but_awaiting_password(self):
+        probed = []
+
+        async def fake_probe(host, timeout=15):
+            probed.append(host)
+            return (host != "d", "x")
+
+        with mock.patch.object(pool, "probe", fake_probe), capture() as out:
+            await pool.connect_nodes(["a", "h", "d", "pw"])
+        self.assertEqual(sorted(probed), ["a", "d", "h"])  # pw has no password yet
+        text = out.getvalue()
+        self.assertIn("[connect] a ok", text)
+        self.assertIn("[connect] d failed", text)
+
+    async def test_password_node_with_password_is_connected(self):
+        pool._passwords["pw"] = "secret"
+        with mock.patch.object(pool, "probe", mock.AsyncMock(return_value=(True, "0.1s"))) as p, capture():
+            await pool.connect_nodes(["pw"])
+        p.assert_awaited_once()
+
+    async def test_in_background_returns_task_or_none(self):
+        self.assertIsNone(pool.connect_in_background([]))
+        with mock.patch.object(pool, "probe", mock.AsyncMock(return_value=(True, "0s"))) as p, capture():
+            task = pool.connect_in_background(["a", "d"])
+            await task
+        self.assertEqual(p.await_count, 2)
+
+    async def test_failure_is_recorded_and_shown_in_status(self):
+        with mock.patch.object(pool, "run", mock.AsyncMock(side_effect=asyncssh.PermissionDenied("no"))):
+            ok, _ = await pool.probe("d")
+        self.assertFalse(ok)
+        rows = {r["name"]: r for r in pool.connection_status()}
+        self.assertEqual(rows["d"]["state"], "offline")
+        self.assertIn("PermissionDenied", rows["d"]["detail"])
+        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=object())):
+            self.assertTrue((await pool.probe("d"))[0])
+        self.assertEqual({r["name"]: r for r in pool.connection_status()}["d"]["state"], "idle")
+
+    def test_apply_config_clears_error_of_changed_node(self):
+        pool._last_error["d"] = "x"
+        new = {**pool.cfg, "host": {**pool.cfg["host"], "d": {"via": "direct", "address": "9.9.9.9"}}}
+        pool.apply_config(new)
+        self.assertNotIn("d", pool._last_error)
+
+
 if __name__ == "__main__":
     unittest.main()

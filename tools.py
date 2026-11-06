@@ -602,6 +602,9 @@ async def reload_config() -> str:
         _audit("-", "reload_config", out.replace("\n", " | "))
         return out
 
+    # New / changed nodes get connected right away, like at startup.
+    pool.connect_in_background([h for h in s["added"] + s["changed"] if h not in s["need_password"]])
+
     def names(xs: list[str]) -> str:
         return ", ".join(xs) if xs else "(none)"
 

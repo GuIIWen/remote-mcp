@@ -237,9 +237,13 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
                     f"warning: [host.{host}] 配置了 container_user 但没有 container，将被忽略"
                 )
         else:
-            if hc.get("password"):
+            auth = hc.get("auth", "key")
+            if auth not in ("key", "password"):
+                errors.append(f"[host.{host}] auth 必须是 \"key\" 或 \"password\"，当前是 {auth!r}")
+            elif auth == "key" and hc.get("password"):
                 warnings.append(
-                    f"warning: [host.{host}] 走 bastion 路由只用密钥认证，password 字段将被忽略"
+                    f"warning: [host.{host}] 配置了 password，但认证方式是 key，密码不会被使用"
+                    "（需要密码登录请设 auth = \"password\"）"
                 )
     return errors, warnings
 
@@ -765,10 +769,11 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
             isinstance(e, asyncssh.PermissionDenied)
             and _route(host) == "bastion"
             and hc.get("password")
+            and hc.get("auth", "key") != "password"
         ):
             _log(
-                f"[target {host}]   hint: via=\"bastion\" 节点只用密钥认证，password 字段不生效；"
-                "要用密码登录请把 via 改成 direct 并填写 address，或确认本机密钥已加到该节点的 authorized_keys"
+                f"[target {host}]   hint: 配置了 password 但认证方式是 key，密码没有被使用；"
+                "把“认证方式”改成 password，或确认本机密钥已加到该节点的 authorized_keys"
             )
         if (
             isinstance(e, asyncssh.ChannelOpenError)
@@ -845,17 +850,23 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
             # The tunnel destination is resolved BY the bastion: `address`
             # (if set) lets a node name that the bastion can't resolve still
             # be reached by IP; `port` is that node's SSH port.
-            conn = await asyncssh.connect(
-                host_cfg.get("address") or host,
+            tkw: dict = dict(
                 port=host_cfg.get("port", 22),
                 username=username,
                 tunnel=bastion,
-                client_keys=_host_client_keys(host),
-                known_hosts=None,
+                known_hosts=host_cfg.get("known_hosts") or None,
                 connect_timeout=_connect_timeout(),
                 client_factory=lambda: _TargetClient(host),
                 **_keepalive_kwargs(bname),
             )
+            if host_cfg.get("auth", "key") == "password":
+                tkw["password"] = _passwords.get(host, "")
+                # Same as direct: don't burn the server's MaxAuthTries on keys.
+                tkw["client_keys"] = None
+                tkw["agent_path"] = None
+            else:
+                tkw["client_keys"] = _host_client_keys(host)
+            conn = await asyncssh.connect(host_cfg.get("address") or host, **tkw)
         _target_conns[host] = conn
         if host not in _sems:
             _sems[host] = asyncio.Semaphore(8)
@@ -1183,15 +1194,17 @@ async def probe(host: str, timeout: int = 15) -> tuple[bool, str]:
     return True, f"{time.monotonic() - t0:.1f}s"
 
 
+def _uses_password(hc: dict) -> bool:
+    """direct and bastion-routed nodes can log in with a password
+    (auth = "password"); hop nodes never do (the bastion's ssh does it)."""
+    return hc.get("via", "bastion") in ("direct", "bastion") and hc.get("auth", "key") == "password"
+
+
 def _awaiting_password(host: str) -> bool:
     """A direct+password node whose password hasn't been supplied yet: it
     can't be connected without a prompt, which only startup may show."""
     hc = cfg.get("host", {}).get(host, {})
-    return (
-        hc.get("via", "bastion") == "direct"
-        and hc.get("auth", "key") == "password"
-        and not _passwords.get(host)
-    )
+    return _uses_password(hc) and not _passwords.get(host)
 
 
 async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
@@ -1344,7 +1357,7 @@ def apply_config(new_cfg: dict) -> dict:
     need_password: list[str] = []
     for h in added + changed:
         hc = new_hosts[h]
-        if hc.get("via", "bastion") != "direct" or hc.get("auth", "key") != "password":
+        if not _uses_password(hc):
             _passwords.pop(h, None)
         elif hc.get("password"):
             _passwords[h] = hc["password"]

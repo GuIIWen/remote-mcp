@@ -328,7 +328,7 @@ async def list_hosts() -> str:
         else:
             bname = pool._bastion_or_none(host)
             route_desc = "bastion" + (f" {bname}" if bname and len(bs) > 1 else "")
-            auth = "key"
+            auth = hc.get("auth", "key")
             state = "connected" if not pool._is_closed(pool._target_conns.get(host)) else "disconnected"
         lines.append(f"  {host}: {route_desc}, auth={auth}, {state}")
     return "\n".join(lines)

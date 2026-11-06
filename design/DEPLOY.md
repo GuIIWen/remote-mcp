@@ -151,9 +151,9 @@ default_cwd = "<远端家目录>"
 | `host.<name>.container_user` | 仅 hop 节点且已配 `container`，选填：`docker exec -u` 的值；省略则不传 `-u`。与 `user`（跳板机 ssh 到 node 的 `-l`）是两个不同字段 |
 | `host.<name>.address` | direct 节点**必填**：这台机器的地址（域名或 IP）。bastion 路由的节点**可选**：隧道目标默认是节点名（由跳板机解析），跳板机解析不了时（日志里 `Temporary failure in name resolution`）在这里填 IP / 域名，端口用 `port`。hop 路由的节点不需要（用 `node` 字段），误填会打印警告并忽略 |
 | `host.<name>.port` | direct 节点：SSH 端口，默认 22。hop 节点：选填，跳板机 ssh 到目标机时用的 `-p`；留空则由跳板机自己的 `~/.ssh/config` 或 ssh 默认值决定 |
-| `host.<name>.auth` | 仅 direct 节点：`"key"`（默认）或 `"password"`。bastion / hop 路由的节点固定用密钥登录（且密钥都不在本机——bastion 路由是跳板机隧道到目标机时用本机私钥，hop 路由是跳板机自己的私钥），不支持这个字段 |
-| `host.<name>.key` / `cert` | 仅 direct + `auth="key"`：私钥路径（和可选的 OpenSSH 用户证书路径）。留空时的回退顺序是 `[host.x] key` → `[bastion] key` → 本机默认密钥对（`~/.ssh/id_*`） |
-| `host.<name>.password` | 仅 direct + `auth="password"`：留空则 daemon 启动时用 `getpass` 交互提示输入（提示里会带上节点名），不会明文出现在配置文件里；如果填了，daemon 只会用这一份密码尝试一次，认证失败不重试（避免触发远端账号锁定策略），也绝不会出现在日志、错误信息或 `list_hosts` 输出里 |
+| `host.<name>.auth` | direct 和 bastion 路由的节点：`"key"`（默认）或 `"password"`。bastion 路由用密码时，密码经跳板机隧道发给目标机。hop 路由的节点不支持（由跳板机上的 ssh 认证，用的是跳板机自己的私钥） |
+| `host.<name>.key` / `cert` | direct / bastion + `auth="key"`：私钥路径（和可选的 OpenSSH 用户证书路径）。留空时的回退顺序是 `[host.x] key` → `[bastion] key` → 本机默认密钥对（`~/.ssh/id_*`） |
+| `host.<name>.password` | `auth = "password"` 的 direct / bastion 路由节点才会使用：留空则 daemon 启动时弹窗（或终端 `getpass`）输入，提示里带节点名；填了就只用这一份密码尝试一次，认证失败不重试（避免触发远端账号锁定），也绝不会出现在日志、错误信息或 `list_hosts` 输出里。`auth` 是 key 时填了也不会使用（启动时会警告）；hop 节点不支持 |
 | `host.<name>.known_hosts` | 选填，direct 节点：一个 `known_hosts` 文件路径，用来校验目标机的 host key。direct 节点不在跳板机后面，建议至少对密码认证的 direct 节点配置这个字段；留空则不校验（等同现在 bastion 路由节点的行为） |
 
 **注意**：`<远端家目录>` 因集群而异，不一定是 `/home/<远端用户名>`（有的集群是 `/public/home/<远端用户名>` 这类形式）。请在远端执行 `echo $HOME` 确认后原样填入 `default_cwd`，写错会导致所有相对路径解析到不存在的目录。

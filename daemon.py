@@ -35,8 +35,10 @@ async def _prompt_password(loop: asyncio.AbstractEventLoop, host: str) -> str:
 
 
 async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) -> None:
-    """Pre-connect every direct+password node once at startup: prompt for a
-    password if [host.x].password is empty, then verify it. A bad
+    """Collect the password of every auth="password" node at startup (prompt
+    if [host.x].password is empty). Direct nodes are also pre-connected here
+    to verify it; bastion-routed ones need the bastion first, so they are
+    only prompted here and connect later with the rest. A bad
     interactively-typed password gets re-prompted (up to PASSWORD_RETRIES
     total attempts); a bad password taken from config.toml is never
     retried, since retrying it would be pointless and could trip a remote
@@ -46,9 +48,7 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
     Every other node (key-auth direct, bastion, hop) is connected by
     pool.connect_nodes() once the bastions are logged in."""
     for host, hc in cfg.get("host", {}).items():
-        if hc.get("via", "bastion") != "direct":
-            continue
-        if hc.get("auth", "key") != "password":
+        if not pool._uses_password(hc):
             continue
 
         configured_password = hc.get("password", "")
@@ -57,6 +57,8 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
             pool._passwords[host] = await _prompt_password(loop, host)
         else:
             pool._passwords[host] = configured_password
+        if hc.get("via", "bastion") != "direct":
+            continue  # verified by connect_nodes() once the bastion is up
 
         attempts_left = PASSWORD_RETRIES if interactive else 1
         while True:

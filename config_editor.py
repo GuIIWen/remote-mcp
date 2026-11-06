@@ -38,10 +38,10 @@ NODE_FIELDS = [
     ("user", "用户名", "str", "目标机登录用户名"),
     ("address", "地址", "str", "direct 必填；bastion 节点可选：跳板机解析不了节点名时填 IP / 域名"),
     ("port", "端口", "int", "目标机 SSH 端口（direct / bastion），hop：跳板机 ssh 的 -p"),
-    ("auth", "认证方式", "choice:key,password", "direct 节点：密钥或密码"),
+    ("auth", "认证方式", "choice:key,password", "direct / bastion 节点：密钥或密码（hop 由跳板机认证，不用）"),
     ("key", "私钥路径", "file", "留空则回退到所属跳板机的 key / 默认密钥对"),
     ("cert", "用户证书", "file", "可选：CA 签发的 *-cert.pub"),
-    ("password", "密码", "secret", "留空则启动服务时弹窗输入"),
+    ("password", "密码", "secret", "认证方式为 password 时使用；留空则启动服务时弹窗输入"),
     ("known_hosts", "known_hosts", "file", "可选：校验 host key，密码认证节点建议配置"),
     ("node", "跳板机 ssh 目标", "str", "hop：省略则等于节点名"),
     ("container", "容器名", "str", "hop：设了就在 docker 容器里执行"),
@@ -49,7 +49,7 @@ NODE_FIELDS = [
     ("default_cwd", "默认工作目录", "str", "远端 Linux 路径（容器节点为容器内路径）"),
 ]
 VIA_HINTS = {
-    "bastion": "提示：经跳板机的节点只用密钥认证，password 字段暂不生效。"
+    "bastion": "提示：经跳板机的节点，认证方式可选密钥或密码。"
                "节点名需要能被跳板机解析；解析不了就在“地址”里填 IP（端口用“端口”）。",
     "hop": "提示：所有字段都可以填写并保存。hop 节点由跳板机上的 ssh 代为连接，"
            "本机的地址 / 密钥 / 密码字段暂不生效。",

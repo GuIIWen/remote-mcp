@@ -817,5 +817,58 @@ class EagerConnectTests(PoolTestCase):
         self.assertNotIn("d", pool._last_error)
 
 
+class BastionRoutePasswordTests(PoolTestCase):
+    async def _connect(self, hc):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"n": hc}}
+        pool._bastion_conns["default"] = FakeConn()
+        seen = {}
+
+        async def fake_connect(host, **kw):
+            seen.update(kw)
+            return FakeConn()
+
+        keys = mock.Mock(return_value=["KEY"])
+        with mock.patch.object(pool.asyncssh, "connect", fake_connect), \
+                mock.patch.object(pool, "_host_client_keys", keys), \
+                mock.patch.object(pool, "_idle_probe_ok", mock.AsyncMock(return_value=True)):
+            await pool.get_target("n")
+        return seen
+
+    async def test_password_auth_through_the_tunnel(self):
+        pool._passwords["n"] = "s3cret"
+        kw = await self._connect({"auth": "password", "user": "me"})
+        self.assertEqual(kw["password"], "s3cret")
+        self.assertIsNone(kw["client_keys"])  # no keys offered first
+        self.assertIs(kw["tunnel"], pool._bastion_conns["default"])
+
+    async def test_key_auth_is_still_the_default(self):
+        kw = await self._connect({"user": "me", "password": "ignored"})
+        self.assertEqual(kw["client_keys"], ["KEY"])
+        self.assertNotIn("password", kw)
+
+    def test_uses_password(self):
+        self.assertTrue(pool._uses_password({"auth": "password"}))
+        self.assertTrue(pool._uses_password({"via": "direct", "auth": "password"}))
+        self.assertFalse(pool._uses_password({"via": "hop", "auth": "password"}))
+        self.assertFalse(pool._uses_password({"password": "x"}))
+
+    def test_validate_password_with_key_auth_warns_only(self):
+        base = {"bastion": {"host": "b", "user": "u"}}
+        _, w = pool.validate_config({**base, "host": {"n": {"password": "x"}}})
+        self.assertTrue(any("n" in x and "password" in x for x in w))
+        e, w = pool.validate_config({**base, "host": {"n": {"auth": "password", "password": "x"}}})
+        self.assertEqual((e, w), ([], []))
+        e, _ = pool.validate_config({**base, "host": {"n": {"auth": "nope"}}})
+        self.assertTrue(any("auth" in x for x in e))
+
+    def test_apply_config_collects_password_for_bastion_route(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {}}
+        s = pool.apply_config({"bastion": pool.cfg["bastion"],
+                               "host": {"n": {"auth": "password", "password": "pw"},
+                                        "m": {"auth": "password"}}})
+        self.assertEqual(pool._passwords["n"], "pw")
+        self.assertEqual(s["need_password"], ["m"])
+
+
 if __name__ == "__main__":
     unittest.main()

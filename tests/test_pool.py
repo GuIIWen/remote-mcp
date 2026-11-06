@@ -505,7 +505,9 @@ class PasswordTests(PoolTestCase):
             await pool.get_target("lab4")
         kwargs = c.await_args.kwargs
         self.assertEqual(c.await_args.args, ("10.0.0.4",))
-        self.assertEqual(kwargs["password"], "s3cret")
+        # the password is answered by the client callback, not passed as an argument
+        self.assertIsNone(kwargs.get("password"))
+        self.assertEqual(kwargs["client_factory"]().password_auth_requested(), "s3cret")
         self.assertIsNone(kwargs["client_keys"])  # rejected keys would count toward lockout
         self.assertIsNone(kwargs["agent_path"])
         self.assertNotIn("tunnel", kwargs)
@@ -517,7 +519,9 @@ class PasswordTests(PoolTestCase):
             await pool.get_target("lab4")
             pool._invalidate_target("lab4")
             await pool.get_target("lab4")
-        self.assertEqual([k.kwargs["password"] for k in c.await_args_list], ["s3cret", "s3cret"])
+        self.assertEqual(
+            [k.kwargs["client_factory"]().password_auth_requested() for k in c.await_args_list],
+            ["s3cret", "s3cret"])
 
     async def test_run_does_not_retry_permission_denied(self):
         pool.cfg = {"host": {"lab4": _direct_pw()}}
@@ -837,7 +841,7 @@ class BastionRoutePasswordTests(PoolTestCase):
     async def test_password_auth_through_the_tunnel(self):
         pool._passwords["n"] = "s3cret"
         kw = await self._connect({"auth": "password", "user": "me"})
-        self.assertEqual(kw["password"], "s3cret")
+        self.assertEqual(kw["client_factory"]().password_auth_requested(), "s3cret")
         self.assertIsNone(kw["client_keys"])  # no keys offered first
         self.assertIs(kw["tunnel"], pool._bastion_conns["default"])
 
@@ -868,6 +872,52 @@ class BastionRoutePasswordTests(PoolTestCase):
                                         "m": {"auth": "password"}}})
         self.assertEqual(pool._passwords["n"], "pw")
         self.assertEqual(s["need_password"], ["m"])
+
+
+class TargetVerificationCodeTests(PoolTestCase):
+    """auth="password" nodes that also ask for a verification code."""
+
+    async def test_password_from_config_once_then_code_is_asked(self):
+        pool._passwords["zz"] = "s3cret"
+        asked = []
+
+        async def fake_ask(prompt, echo):
+            asked.append(prompt)
+            return "123456"
+
+        client = pool._TargetClient("zz", interactive=True)
+        self.assertEqual(client.kbdint_auth_requested(), "")
+        with mock.patch.object(pool, "ask", fake_ask), capture():
+            resp = await client.kbdint_challenge_received(
+                "", "", "", [("Password: ", False), ("Verification code: ", True)])
+            # a second password prompt means the first was rejected: ask, don't resend
+            resp2 = await client.kbdint_challenge_received("", "", "", [("Password: ", False)])
+        self.assertEqual(resp, ["s3cret", "123456"])
+        self.assertEqual(resp2, ["123456"])
+        self.assertEqual(asked, ["[zz] Verification code: ", "[zz] Password: "])
+
+    async def test_key_auth_target_does_not_do_keyboard_interactive(self):
+        client = pool._TargetClient("k")
+        self.assertIsNone(client.kbdint_auth_requested())
+        self.assertIsNone(client.password_auth_requested())
+
+    async def test_password_nodes_get_a_longer_connect_timeout(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"n": {"auth": "password"}, "k": {}}}
+        pool._bastion_conns["default"] = FakeConn()
+        seen = {}
+
+        async def fake_connect(host, **kw):
+            seen[host] = kw
+            return FakeConn()
+
+        with mock.patch.object(pool.asyncssh, "connect", fake_connect), \
+                mock.patch.object(pool, "_host_client_keys", return_value=[]), \
+                mock.patch.object(pool, "_idle_probe_ok", mock.AsyncMock(return_value=True)):
+            await pool.get_target("n")
+            await pool.get_target("k")
+        self.assertGreaterEqual(seen["n"]["connect_timeout"], pool.PASSWORD_CONNECT_TIMEOUT)
+        self.assertLess(seen["k"]["connect_timeout"], pool.PASSWORD_CONNECT_TIMEOUT)
 
 
 if __name__ == "__main__":

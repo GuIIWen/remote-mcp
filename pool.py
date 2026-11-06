@@ -22,6 +22,9 @@ CONFIG_PATH = Path(__file__).parent / "config.toml"
 # human typing a TOTP code — so the bastion gets a much longer budget than
 # [daemon] connect_timeout (which still applies to every target).
 BASTION_CONNECT_TIMEOUT = 120
+# Same reasoning for auth="password" targets, which may ask for a verification
+# code; shorter than the bastion's because an unreachable node waits this long.
+PASSWORD_CONNECT_TIMEOUT = 60
 
 # container / container_user charset (docker names, plus a numeric uid is fine);
 # no leading "-" so the value can never be parsed as a docker option.
@@ -593,32 +596,37 @@ async def ask(prompt: str, echo: bool) -> str:
     return await loop.run_in_executor(None, getpass.getpass, prompt)
 
 
-class _BastionClient(_TrackedClient):
-    _label = "bastion"
+class _InteractiveAuth:
+    """Answers password / keyboard-interactive authentication from the saved
+    password and, for everything else (verification code / OTP), through
+    ask() — a terminal prompt or a GUI dialog. Shared by the bastion clients
+    and by auth="password" targets (which may also want a code).
 
-    def __init__(self, name: str = DEFAULT_BASTION):
-        super().__init__()
-        self._name = name
-        self._label = _blabel(name)
-        # [bastion] password is offered at most once per connection: if the
+    The host class must call _ia_init() and may set _ia_enabled = False to
+    opt out (key-auth targets)."""
+
+    _ia_enabled = True
+
+    def _ia_init(self, secret_key: str, tag: str, label: str) -> None:
+        self._ia_secret_key = secret_key  # _passwords key of the saved password
+        self._ia_tag = tag  # prefix of every prompt, names who is asking
+        self._ia_label = label  # shown in "(using [label] password from config)"
+        # The saved password is offered at most once per connection: if the
         # server asks again it was rejected, and resending it would only burn
-        # attempts toward a lockout — the terminal takes over instead.
+        # attempts toward a lockout — the user is asked instead.
         self._password_sent = False
 
-    def auth_banner_received(self, msg: str, lang: str) -> None:
-        print(msg, end="", flush=True)
-
-    def kbdint_auth_requested(self) -> str:
+    def kbdint_auth_requested(self) -> str | None:
         # asyncssh only attempts keyboard-interactive auth (needed for TOTP)
         # when this returns a string instead of the default None; an empty
         # string lets the server pick the submethod.
-        return ""
+        return "" if self._ia_enabled else None
 
     def _take_config_password(self) -> str | None:
-        """Return the configured bastion password at most once per connection."""
+        """Return the saved password at most once per connection."""
         if self._password_sent:
             return None
-        saved = _passwords.get(_bpw_key(self._name))
+        saved = _passwords.get(self._ia_secret_key)
         if not saved:
             return None
         self._password_sent = True
@@ -633,7 +641,7 @@ class _BastionClient(_TrackedClient):
         keyboard-interactive password from being sent a second time via the
         ordinary method.
         """
-        return self._take_config_password()
+        return self._take_config_password() if self._ia_enabled else None
 
     async def kbdint_challenge_received(
         self,
@@ -645,11 +653,10 @@ class _BastionClient(_TrackedClient):
         # Each prompt is answered on its own, in the order the server sends
         # them, so "code then password" and "password then code" (in one
         # challenge or across several) both work: a password-looking prompt
-        # gets [bastion] password, everything else is typed in the terminal.
+        # gets the saved password, everything else is typed in.
         if instructions:
             print(instructions, flush=True)
-        # With several bastions the dialog must say which one is asking.
-        tag = "" if self._name == DEFAULT_BASTION else f"[{self._name}] "
+        tag = self._ia_tag
         responses = []
         for prompt, echo in prompts:
             if is_password_prompt(prompt):
@@ -657,12 +664,26 @@ class _BastionClient(_TrackedClient):
             else:
                 saved = None
             if saved is not None:
-                print(f"{tag}{prompt.rstrip()} (using [{_blabel(self._name)}] password from config)", flush=True)
+                print(f"{tag}{prompt.rstrip()} (using [{self._ia_label}] password from config)", flush=True)
                 answer = saved
             else:
                 answer = await ask(tag + prompt, echo)
             responses.append(answer)
         return responses
+
+
+class _BastionClient(_InteractiveAuth, _TrackedClient):
+    _label = "bastion"
+
+    def __init__(self, name: str = DEFAULT_BASTION):
+        super().__init__()
+        self._name = name
+        self._label = _blabel(name)
+        # With several bastions the dialog must say which one is asking.
+        self._ia_init(_bpw_key(name), "" if name == DEFAULT_BASTION else f"[{name}] ", _blabel(name))
+
+    def auth_banner_received(self, msg: str, lang: str) -> None:
+        print(msg, end="", flush=True)
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._report_lost(exc)
@@ -680,11 +701,19 @@ class _BastionClient(_TrackedClient):
                 _target_conns.pop(h, None)
 
 
-class _TargetClient(_TrackedClient):
-    def __init__(self, host: str):
+class _TargetClient(_InteractiveAuth, _TrackedClient):
+    def __init__(self, host: str, interactive: bool = False):
         super().__init__()
         self._host = host
         self._label = f"target {host}"
+        # auth = "password" nodes answer password prompts from the saved
+        # password and ask for anything else (e.g. a verification code).
+        self._ia_enabled = interactive
+        self._ia_init(host, f"[{host}] ", f"target {host}")
+
+    def auth_banner_received(self, msg: str, lang: str) -> None:
+        if self._ia_enabled:
+            print(msg, end="", flush=True)
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._report_lost(exc)
@@ -832,7 +861,11 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
                 **_keepalive_kwargs(),
             )
             if auth == "password":
-                kwargs["password"] = _passwords.get(host, "")
+                # The saved password and any verification code are answered
+                # by _TargetClient (see _InteractiveAuth); the human may need
+                # time to type a code, so allow longer than a plain connect.
+                kwargs["client_factory"] = lambda: _TargetClient(host, interactive=True)
+                kwargs["connect_timeout"] = max(_connect_timeout(), PASSWORD_CONNECT_TIMEOUT)
                 # Don't offer local keys first: each rejected key counts
                 # toward the server's MaxAuthTries / lockout policy.
                 kwargs["client_keys"] = None
@@ -860,7 +893,8 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
                 **_keepalive_kwargs(bname),
             )
             if host_cfg.get("auth", "key") == "password":
-                tkw["password"] = _passwords.get(host, "")
+                tkw["client_factory"] = lambda: _TargetClient(host, interactive=True)
+                tkw["connect_timeout"] = max(_connect_timeout(), PASSWORD_CONNECT_TIMEOUT)
                 # Same as direct: don't burn the server's MaxAuthTries on keys.
                 tkw["client_keys"] = None
                 tkw["agent_path"] = None

@@ -54,8 +54,12 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         pool._conn_stats.clear()
         pool._passwords.clear()
         pool._bastion_locks.clear()
+        pool._auth_blocked.clear()
+        pool._bastion_failed.clear()
 
     def tearDown(self):
+        pool._auth_blocked.clear()
+        pool._bastion_failed.clear()
         pool.cfg, bconns, targets, passwords = self._saved
         pool._bastion_conns.clear()
         pool._bastion_conns.update(bconns)
@@ -1019,6 +1023,73 @@ class BastionPasswordAuthTests(PoolTestCase):
         kw = await self._connect({})
         self.assertEqual(kw["client_keys"], ["KEY"])
         self.assertNotIn("agent_path", kw)
+
+
+class AuthFailureOnceTests(PoolTestCase):
+    """A refused credential must cost ONE attempt, not one per node / sweep."""
+
+    def setUp(self):
+        super().setUp()
+        pool._last_error.clear()
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"n1": {}, "n2": {}, "n3": {}, "hp": {"via": "hop"},
+                             "d": {"via": "direct", "address": "1.1.1.1"}}}
+
+    async def test_failed_bastion_login_is_not_replayed_by_every_node(self):
+        connect = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("bad code"))
+        direct = mock.AsyncMock(return_value=FakeConn())
+        with mock.patch.object(pool, "_connect_bastion", connect),                 mock.patch.object(pool.asyncssh, "connect", direct), capture() as out:
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.get_bastion("default")  # the startup login
+            await pool.connect_nodes(["n1", "n2", "n3", "hp", "d"])
+        self.assertEqual(connect.await_count, 1)
+        self.assertEqual(out.getvalue().count("n1 skipped"), 1)
+        self.assertIn("依赖的跳板机 bastion 未登录", out.getvalue())
+        direct.assert_awaited_once()  # the direct node does not depend on the bastion
+
+    async def test_first_failure_in_a_sweep_spares_the_other_nodes(self):
+        # no startup login happened (e.g. nodes added by a config reload)
+        connect = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("bad code"))
+        with mock.patch.object(pool, "_connect_bastion", connect), capture():
+            await pool.connect_nodes(["n1"])
+            await pool.connect_nodes(["n2", "n3", "hp"])
+        self.assertEqual(connect.await_count, 1)
+
+    async def test_tool_call_may_retry_the_bastion_and_success_clears_the_flag(self):
+        pool._bastion_failed["default"] = "PermissionDenied: bad code"
+        with mock.patch.object(pool, "_connect_bastion", mock.AsyncMock(return_value=FakeConn())), capture():
+            await pool.get_bastion("default")
+        self.assertNotIn("default", pool._bastion_failed)
+
+    async def test_reconnect_all_tries_the_bastion_again_once(self):
+        pool._bastion_failed["default"] = "PermissionDenied: bad code"
+        connect = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("still bad"))
+        with mock.patch.object(pool, "_connect_bastion", connect),                 mock.patch.object(pool.asyncssh, "connect", mock.AsyncMock(return_value=FakeConn())), capture():
+            await pool.reconnect_all()
+        self.assertEqual(connect.await_count, 1)  # 1 login, not 1 + one per node
+
+    async def test_blocked_password_is_never_replayed(self):
+        pool._passwords["d"] = "wrong"
+        pool._auth_blocked["d"] = "配置里的密码被拒绝"
+        connect = mock.AsyncMock(return_value=FakeConn())
+        with mock.patch.object(pool.asyncssh, "connect", connect), capture():
+            await pool.connect_nodes(["d"])  # startup sweep
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.run("d", "true")  # lazy call
+        connect.assert_not_awaited()
+        row = {r["name"]: r for r in pool.connection_status()}["d"]
+        self.assertEqual(row["state"], "offline")
+        self.assertIn("配置里的密码被拒绝", row["detail"])
+
+    async def test_block_is_lifted_by_reload_reconnect_and_reset(self):
+        pool._auth_blocked["d"] = "x"
+        pool.apply_config({**pool.cfg, "host": {**pool.cfg["host"], "d": {"via": "direct", "address": "2.2.2.2"}}})
+        self.assertNotIn("d", pool._auth_blocked)
+        for lift in (pool.reconnect_all, pool.reset_all):
+            pool._auth_blocked["d"] = "x"
+            with mock.patch.object(pool, "_connect_bastion", mock.AsyncMock(return_value=FakeConn())),                     mock.patch.object(pool, "probe", mock.AsyncMock(return_value=(True, "0s"))), capture():
+                await lift()
+            self.assertNotIn("d", pool._auth_blocked, lift.__name__)
 
 
 if __name__ == "__main__":

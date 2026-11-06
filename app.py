@@ -12,6 +12,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -139,6 +140,7 @@ class App:
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.server = None
+        self.closing = False
         self.port = 8765
 
         # ── 导航栏（菜单） ──
@@ -439,12 +441,24 @@ class App:
         self._copy(f"claude mcp add --transport http remote-linux http://127.0.0.1:{self.port}/mcp")
 
     def on_close(self) -> None:
+        if self.closing:
+            return
         if self.thread and self.thread.is_alive():
             if not messagebox.askyesno("退出", "服务仍在运行，退出将断开所有连接。确定退出？"):
                 return
+            self.closing = True
             self.stop()
-            self.thread.join(timeout=5)
+            # Never join() on the Tk thread: it would freeze the window and
+            # stop the after() callbacks (force_exit) that make the service exit.
+            self._wait_exit(time.monotonic() + 8)
+            return
         self.root.destroy()
+
+    def _wait_exit(self, deadline: float) -> None:
+        if self.thread and self.thread.is_alive() and time.monotonic() < deadline:
+            self.root.after(100, self._wait_exit, deadline)
+        else:
+            self.root.destroy()  # the service thread is a daemon: it can't outlive us
 
 
 def main() -> None:

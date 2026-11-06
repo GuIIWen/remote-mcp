@@ -241,6 +241,7 @@ bastion = "a"      # 绑定走哪台跳板机
 |---|---|
 | `config.example.toml` | 配置模板，每个字段都有注释 |
 | `design/DEPLOY.md` | 部署指南：环境、完整配置字段、密钥部署、排障 |
+| `design/PR2_REVIEW.md` | PR #2 审查记录：认证重试与 GUI 生命周期问题及修复方案 |
 | `design/remote-mcp-design.html` | 设计文档 |
 | `design/remote-mcp-guide.html` | 图解说明文档 |
 | `design/TODO.md` | 待办：局域网访问 |

@@ -56,6 +56,15 @@ DEFAULT_BASTION = "default"
 # panel; cleared on the next success and when the node's config changes.
 _last_error: dict[str, str] = {}
 
+# Credentials that were tried and refused. _auth_blocked: host -> reason; the
+# node's password was rejected at startup, so _get_target() fails fast instead
+# of replaying it. _bastion_failed: bastion -> reason of its last failed login;
+# only the eager sweep (connect_nodes) honours it, so a dead bastion costs one
+# login attempt, not one per node. A tool call that needs the node/bastion may
+# still try again. Cleared by reconnect_all / reset_all / apply_config.
+_auth_blocked: dict[str, str] = {}
+_bastion_failed: dict[str, str] = {}
+
 
 def bastions(c: dict | None = None) -> dict[str, dict]:
     """Configured bastions by name. Two config shapes are accepted:
@@ -798,7 +807,12 @@ async def _ensure_bastion(name: str | None = None) -> asyncssh.SSHClientConnecti
         # below, instead of failing a real command on it first.
         _invalidate_bastion(name)
     if _bastion_conns.get(name) is None:
-        _bastion_conns[name] = await _connect_bastion(name)
+        try:
+            _bastion_conns[name] = await _connect_bastion(name)
+        except Exception as e:
+            _bastion_failed[name] = _fmt_exc(e)
+            raise
+        _bastion_failed.pop(name, None)
     return _bastion_conns[name]
 
 
@@ -858,6 +872,8 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
             f"[host.{host}] via=\"hop\" has no direct connection; "
             "use pool.run() (or a hop-aware file helper), not get_target()/with_sftp()"
         )
+    if host in _auth_blocked:
+        raise asyncssh.PermissionDenied(_auth_blocked[host])
 
     async with _host_lock(host):
         conn = _target_conns.get(host)
@@ -1284,6 +1300,10 @@ async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
     async def one(host: str) -> None:
         if _awaiting_password(host):
             return
+        bname = None if _route(host) == "direct" else _bastion_or_none(host)
+        if bname in _bastion_failed and bname not in _bastion_conns:
+            _log(f"[connect] {host} skipped: 依赖的跳板机 {_blabel(bname)} 未登录（{_bastion_failed[bname]}）")
+            return
         ok, detail = await probe(host)
         _log(f"[connect] {host} " + (f"ok ({detail})" if ok else f"failed: {detail}"))
 
@@ -1306,6 +1326,8 @@ async def reconnect_all() -> None:
     errors, log in to any bastion that is down, then connect every node."""
     _prompt_cooldown.clear()
     _last_error.clear()
+    _auth_blocked.clear()
+    _bastion_failed.clear()
     for name in list(bastions()):
         if name not in _bastion_conns:
             try:
@@ -1333,6 +1355,8 @@ def connect_in_background(hosts: list[str]):
 async def reset_all() -> None:
     _last_error.clear()
     _prompt_cooldown.clear()
+    _auth_blocked.clear()
+    _bastion_failed.clear()
     for conn in list(_target_conns.values()):
         _close_local(conn)
     _target_conns.clear()
@@ -1442,6 +1466,7 @@ def apply_config(new_cfg: dict) -> dict:
     cfg = merged
     for h in removed + changed:
         _last_error.pop(h, None)
+        _auth_blocked.pop(h, None)  # new password / address: one fresh attempt is allowed
         _invalidate_target(h)  # no-op for hop nodes (no entry); never closes the bastion
     for h in removed:
         _passwords.pop(h, None)

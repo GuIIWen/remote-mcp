@@ -69,9 +69,11 @@ async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) ->
             except asyncssh.PermissionDenied:
                 attempts_left -= 1
                 if not interactive:
+                    pool._auth_blocked[host] = "配置里的密码被拒绝"
                     print(f"[{host}] 配置里的密码错误，跳过该节点", flush=True)
                     break
                 if attempts_left <= 0:
+                    pool._auth_blocked[host] = "输入的密码被拒绝（连续输错次数过多）"
                     print(f"[{host}] 密码连续输错次数过多，跳过该节点", flush=True)
                     break
                 print(f"[{host}] 密码错误，请重新输入", flush=True)
@@ -146,6 +148,9 @@ def init_service() -> tuple[dict, int]:
     _report_config(warnings, [])
 
     pool.cfg = cfg
+    # A GUI restart runs in the same process: drop the previous run's
+    # passwords so a password removed/changed in config is not still used.
+    pool._passwords.clear()
     # Not prompted for when empty: the bastion's own keyboard-interactive
     # prompt already asks for it, exactly as before.
     for bname, bcfg in pool.bastions(cfg).items():
@@ -173,27 +178,31 @@ async def serve(cfg: dict, port: int, on_server=None, use_colors: bool | None = 
 
     bs = pool.bastions(cfg)
     loop = asyncio.get_running_loop()
-    await _prepare_password_hosts(cfg, loop)
-
-    not_logged_in = []
-    for bname in bs:
-        if not await _login_bastion(bname):
-            not_logged_in.append(bname)
-    lines = [f"remote-mcp listening on http://127.0.0.1:{port}/mcp"]
-    for bname, b in bs.items():
-        lines.append(f"{pool._blabel(bname)}: {b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}")
-    if not bs:
-        lines.append('no [bastion] configured; every host must use via="direct"')
-    print(chr(10).join(lines), flush=True)
-    for bname in not_logged_in:
-        print(f"[{pool._blabel(bname)}] 尚未登录，首次需要它的调用会要求输入验证码", flush=True)
-    # Started only after the initial login (so it can't race the first
-    # TOTP prompt); it never reconnects, see pool.heartbeat_once().
-    heartbeat = asyncio.create_task(pool.heartbeat_loop())
-    # Connect every configured node now instead of on first use; runs in the
-    # background so the HTTP server comes up immediately.
-    sweep = pool.connect_in_background(list(cfg.get("host", {})))
+    heartbeat = None
+    # The try starts before the startup logins so that a Stop during them
+    # (the GUI cancels every task) still closes what they already opened.
     try:
+        await _prepare_password_hosts(cfg, loop)
+
+        not_logged_in = []
+        for bname in bs:
+            if not await _login_bastion(bname):
+                not_logged_in.append(bname)
+        lines = [f"remote-mcp listening on http://127.0.0.1:{port}/mcp"]
+        for bname, b in bs.items():
+            lines.append(f"{pool._blabel(bname)}: {b.get('user', '')}@{b.get('host', '')}:{b.get('port', 22)}")
+        if not bs:
+            lines.append('no [bastion] configured; every host must use via="direct"')
+        print(chr(10).join(lines), flush=True)
+        for bname in not_logged_in:
+            print(f"[{pool._blabel(bname)}] 尚未登录，首次需要它的调用会要求输入验证码", flush=True)
+        # Started only after the initial login (so it can't race the first
+        # TOTP prompt); it never reconnects, see pool.heartbeat_once().
+        heartbeat = asyncio.create_task(pool.heartbeat_loop())
+        # Connect every configured node now instead of on first use; runs in the
+        # background so the HTTP server comes up immediately. Nodes behind a
+        # bastion whose login just failed are skipped (see pool._bastion_failed).
+        pool.connect_in_background(list(cfg.get("host", {})))
         # FastMCP builds its StreamableHTTP session manager once and that
         # manager can only run() once per instance, so a second start in the
         # same process (GUI stop -> start) would die in the lifespan. Drop it
@@ -214,11 +223,12 @@ async def serve(cfg: dict, port: int, on_server=None, use_colors: bool | None = 
             on_server(server)
         await server.serve()
     finally:
-        if sweep is not None:
-            sweep.cancel()
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
+        # Every background task of this run (startup sweep, config-reload
+        # connects), so none can reconnect into the next run's pool.
+        pending = list(pool._bg_tasks) + ([heartbeat] if heartbeat else [])
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         with contextlib.suppress(Exception):
             await pool.reset_all()
 

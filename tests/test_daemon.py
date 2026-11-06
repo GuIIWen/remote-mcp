@@ -100,8 +100,10 @@ class PreparePasswordHostsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved = dict(pool._passwords)
         pool._passwords.clear()
+        pool._auth_blocked.clear()
 
     def tearDown(self):
+        pool._auth_blocked.clear()
         pool._passwords.clear()
         pool._passwords.update(self._saved)
 
@@ -180,6 +182,123 @@ class PreparePasswordHostsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(get.await_count, 1)
         self.assertIn("跳过该节点", out)
+
+
+class WrongPasswordThenSweepTests(unittest.IsolatedAsyncioTestCase):
+    """Startup flow across components: _prepare_password_hosts, then the eager
+    connect_nodes sweep, through the real get_target (only asyncssh.connect is
+    mocked)."""
+
+    def setUp(self):
+        self._saved = (pool.cfg, dict(pool._passwords), dict(pool._target_conns))
+        pool._passwords.clear()
+        pool._target_conns.clear()
+        pool._auth_blocked.clear()
+        pool._last_error.clear()
+
+    def tearDown(self):
+        pool.cfg, passwords, targets = self._saved
+        pool._passwords.clear()
+        pool._passwords.update(passwords)
+        pool._target_conns.clear()
+        pool._target_conns.update(targets)
+        pool._auth_blocked.clear()
+        pool._last_error.clear()
+
+    async def _startup(self, password, typed=()):
+        cfg = _pw_cfg(password)
+        pool.cfg = cfg
+        connect = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("denied"))
+        with mock.patch.object(pool.asyncssh, "connect", connect), \
+                mock.patch.object(daemon, "_prompt_password", mock.AsyncMock(side_effect=list(typed))), \
+                capture():
+            await daemon._prepare_password_hosts(cfg, asyncio.get_running_loop())
+            await pool.connect_nodes(["lab4"])
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await pool.run("lab4", "true")  # a later lazy call
+        return connect
+
+    async def test_wrong_config_password_costs_one_attempt(self):
+        connect = await self._startup("wrong")
+        self.assertEqual(connect.await_count, 1)
+        self.assertIn("配置里的密码被拒绝", pool._last_error["lab4"])
+        rows = {r["name"]: r for r in pool.connection_status()}
+        self.assertIn("配置里的密码被拒绝", rows["lab4"]["detail"])
+
+    async def test_password_typed_wrong_too_often_is_not_replayed_by_the_sweep(self):
+        connect = await self._startup("", typed=["a", "b", "c"])
+        self.assertEqual(connect.await_count, daemon.PASSWORD_RETRIES)
+
+    async def test_lazy_call_works_again_after_block_is_lifted(self):
+        await self._startup("wrong")
+        pool._auth_blocked.clear()  # what reconnect_all / apply_config do
+        conn = mock.Mock()
+        with mock.patch.object(pool.asyncssh, "connect", mock.AsyncMock(return_value=conn)) as connect, \
+                mock.patch.object(pool, "_idle_probe_ok", mock.AsyncMock(return_value=True)):
+            self.assertIs(await pool.get_target("lab4"), conn)
+        connect.assert_awaited_once()
+
+
+class InitServiceTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = (pool.cfg, dict(pool._passwords))
+
+    def tearDown(self):
+        pool.cfg, passwords = self._saved
+        pool._passwords.clear()
+        pool._passwords.update(passwords)
+
+    def _init(self, bastion):
+        cfg = {"bastion": bastion, "host": {}}
+        path = mock.Mock(**{"exists.return_value": True})
+        with mock.patch.object(daemon, "CONFIG_PATH", path), \
+                mock.patch.object(pool, "load_config", return_value=(cfg, [])), \
+                mock.patch.object(daemon, "tools"), capture():
+            daemon.init_service()
+
+    def test_restart_does_not_reuse_the_previous_runs_passwords(self):
+        base = {"host": "b", "user": "u"}
+        self._init({**base, "password": "old"})
+        self.assertEqual(pool._passwords["[bastion]"], "old")
+        pool._passwords["lab4"] = "typed-last-run"
+        self._init(base)  # password removed from config
+        self.assertEqual(pool._passwords, {})
+        self._init({**base, "password": "new"})
+        self.assertEqual(pool._passwords, {"[bastion]": "new"})
+
+
+class ServeCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_during_startup_still_resets_the_pool(self):
+        # The GUI stops a still-starting service by cancelling its tasks.
+        started = asyncio.Event()
+
+        async def hang(*a, **kw):
+            started.set()
+            await asyncio.Event().wait()
+
+        reset = mock.AsyncMock()
+        with mock.patch.object(daemon, "_prepare_password_hosts", hang), \
+                mock.patch.object(pool, "reset_all", reset):
+            task = asyncio.create_task(daemon.serve({"host": {}}, 0))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        reset.assert_awaited_once()
+
+    async def test_background_connects_are_cancelled_with_the_run(self):
+        async def never(*a, **kw):
+            await asyncio.Event().wait()
+
+        server = mock.Mock(serve=mock.AsyncMock())
+        with mock.patch.object(pool, "connect_nodes", never), \
+                mock.patch.object(pool, "reset_all", mock.AsyncMock()), \
+                mock.patch.object(pool, "heartbeat_loop", never), \
+                mock.patch("uvicorn.Server", return_value=server), \
+                mock.patch.object(daemon, "_prepare_password_hosts", mock.AsyncMock()), \
+                capture():
+            await daemon.serve({"host": {"a": {}}}, 0)
+        self.assertEqual(pool._bg_tasks, set())
 
 
 if __name__ == "__main__":

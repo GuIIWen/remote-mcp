@@ -482,8 +482,9 @@ class BastionPasswordTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((errors, warnings), ([], []))
         errors, _ = pool.validate_config({"bastion": {"password": 123}})
         self.assertTrue(any("password" in e for e in errors))
-        _, warnings = pool.validate_config({"bastion": {"auth": "password"}})
-        self.assertTrue(any("auth" in w for w in warnings))
+        self.assertEqual(pool.validate_config({"bastion": {"auth": "password"}}), ([], []))
+        errors, _ = pool.validate_config({"bastion": {"auth": "nope"}})
+        self.assertTrue(any("auth" in e for e in errors))
         errors, _ = pool.validate_config({"bastion": {"key": "password"}})
         self.assertTrue(any("key" in e for e in errors))
         errors, _ = pool.validate_config({"bastion": {"key": __file__}})
@@ -993,6 +994,31 @@ class InteractiveNodesAreSerialTests(PoolTestCase):
         self.assertFalse(ok)
         self.assertEqual(get.await_count, 1)  # no 2nd / 3rd attempt, no new dialog
         self.assertIn("已取消输入", out.getvalue())
+
+
+class BastionPasswordAuthTests(PoolTestCase):
+    async def _connect(self, b):
+        pool.cfg = {"bastion": {"host": "h", "user": "u", **b}}
+        seen = {}
+
+        async def fake_create(factory, host, **kw):
+            seen.update(kw)
+            return FakeConn(), factory()
+
+        with mock.patch.object(pool.asyncssh, "create_connection", fake_create), \
+                mock.patch.object(pool, "_bastion_client_keys", return_value=["KEY"]), capture():
+            await pool._connect_bastion("default")
+        return seen
+
+    async def test_password_bastion_offers_no_keys_and_no_agent(self):
+        kw = await self._connect({"auth": "password"})
+        self.assertIsNone(kw["client_keys"])
+        self.assertIsNone(kw["agent_path"])
+
+    async def test_default_bastion_still_offers_keys_first(self):
+        kw = await self._connect({})
+        self.assertEqual(kw["client_keys"], ["KEY"])
+        self.assertNotIn("agent_path", kw)
 
 
 if __name__ == "__main__":

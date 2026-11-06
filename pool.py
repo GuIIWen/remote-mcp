@@ -175,11 +175,8 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
     bs = bastions(cfg)
     for bname, b in bs.items():
         tag = "[bastion]" if bname == DEFAULT_BASTION else f"[bastion.{bname}]"
-        if "auth" in b:
-            warnings.append(
-                f"warning: {tag} 不支持 auth 字段，将被忽略（跳板机总是先发密钥，"
-                "password 只用来自动回答 keyboard-interactive 里的密码提示）"
-            )
+        if b.get("auth", "key") not in ("key", "password"):
+            errors.append(f"{tag} auth 必须是 \"key\" 或 \"password\"，当前是 {b['auth']!r}")
         if b.get("password") is not None and not isinstance(b["password"], str):
             errors.append(f"{tag} password 必须是字符串，当前是 {type(b['password']).__name__}")
         bastion_key = b.get("key", "")
@@ -762,12 +759,19 @@ async def _connect_bastion(name: str | None = None) -> asyncssh.SSHClientConnect
         "enter TOTP / password when prompted.",
         flush=True,
     )
+    if b.get("auth", "key") == "password":
+        # The bastion only takes password (+ code): offer no keys and no agent
+        # identities — every rejected key counts toward the server's
+        # MaxAuthTries and ends in "Too many authentication failures".
+        key_kw: dict = {"client_keys": None, "agent_path": None}
+    else:
+        key_kw = {"client_keys": _bastion_client_keys(name)}
     conn, _ = await asyncssh.create_connection(
         lambda: _BastionClient(name),
         b["host"],
         port=port,
         username=b["user"],
-        client_keys=_bastion_client_keys(name),
+        **key_kw,
         # Both ordinary password auth and keyboard-interactive password
         # prompts are answered by _BastionClient, which shares one
         # per-connection send-once flag between the two paths.

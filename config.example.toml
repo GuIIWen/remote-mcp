@@ -6,6 +6,7 @@
 host = "bastion.example.com"
 port = 22
 user = "yourname"
+# auth = "key"      # key（默认）：先试密钥，再走密码 / 验证码；password：不试任何密钥，只走密码 + 验证码
 key  = ""            # 私钥路径；留空用默认密钥对（~/.ssh/id_*）
 password = ""        # 可选：自动回答跳板机的“密码”提示；验证码仍弹窗/终端输入。留空则全部手动输入
 # keepalive_interval  = 15   # 可选：SSH 保活间隔（秒），0 关闭

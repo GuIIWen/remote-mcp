@@ -19,7 +19,9 @@ BASTION_FIELDS = [
     ("host", "地址", "str", "跳板机域名或 IP"),
     ("port", "端口", "int", "默认 22"),
     ("user", "用户名", "str", "跳板机登录用户名"),
-    ("key", "私钥路径", "file", "留空则用默认密钥对 (~/.ssh/id_*)"),
+    ("auth", "认证方式", "choice:key,password",
+     "key：先试密钥再走密码 / 验证码；password：不试任何密钥，只走密码 + 验证码（密钥会让服务器报 Too many authentication failures）"),
+    ("key", "私钥路径", "file", "留空则用默认密钥对 (~/.ssh/id_*)；认证方式为 password 时不使用"),
     ("password", "密码", "secret", "可选：自动回答 keyboard-interactive 的密码提示；验证码仍需输入"),
     ("keepalive_interval", "保活间隔(秒)", "num", "默认 15，0 关闭；该跳板机及经它的连接使用"),
     ("keepalive_count_max", "保活失败次数", "int", "连续多少次无响应判定断线，默认 8"),
@@ -242,7 +244,7 @@ class ConfigEditor(tk.Toplevel):
             self.add_row("__name", "跳板机名字", "str",
                          "节点的“所属跳板机”引用这个名字；只有一台时可叫 default", name)
             for key, label, k, hint in BASTION_FIELDS:
-                self.add_row(key, label, k, hint, bc.get(key, ""))
+                self.add_row(key, label, k, hint, bc.get(key, "key" if key == "auth" else ""))
             for r in self.rows.values():
                 r.pack(fill="x", pady=2)
             tk.Label(self.form, fg="gray", anchor="w", justify="left", wraplength=560,
@@ -325,6 +327,8 @@ class ConfigEditor(tk.Toplevel):
                 bc.pop(key, None)
             else:
                 bc[key] = _parse(kind, text, label)
+        if bc.get("auth") == "key":
+            bc.pop("auth")  # default; keep the file minimal
         self.bastions = {(new if k == old else k): (bc if k == old else v)
                          for k, v in self.bastions.items()}
         if new != old:

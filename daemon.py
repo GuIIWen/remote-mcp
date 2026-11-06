@@ -31,7 +31,7 @@ def _validate_config(cfg: dict) -> None:
 
 
 async def _prompt_password(loop: asyncio.AbstractEventLoop, host: str) -> str:
-    return await pool.ask(f"[{host}] password: ", False)
+    return (await pool.ask(f"[{host}] password: ", False)) or ""
 
 
 async def _prepare_password_hosts(cfg: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -109,6 +109,9 @@ async def _login_bastion(name: str | None = None) -> bool:
         except asyncssh.PermissionDenied as e:
             attempts_left -= 1
             reason = getattr(e, "reason", "") or str(e)
+            if name and pool.prompt_cooling(pool._bpw_key(name)):
+                print(f"[{label}] 已取消输入，放弃启动时登录（稍后可在菜单 服务 → 重新连接节点 重试）", flush=True)
+                return False
             if attempts_left <= 0:
                 print(f"[{label}] 认证失败（{reason}），次数已用完，放弃启动时登录", flush=True)
                 return False

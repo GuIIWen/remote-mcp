@@ -26,6 +26,17 @@ BASTION_CONNECT_TIMEOUT = 120
 # code; shorter than the bastion's because an unreachable node waits this long.
 PASSWORD_CONNECT_TIMEOUT = 60
 
+# When the user dismisses a verification-code dialog, don't pop it up again
+# for this long (per node / bastion): the server rejects the empty answer,
+# retries and background reconnects would otherwise re-open the window over
+# and over. "Reconnect nodes" in the GUI (reconnect_all) clears it.
+PROMPT_COOLDOWN = 600
+_prompt_cooldown: dict[str, float] = {}  # _ia_secret_key -> monotonic deadline
+
+
+def prompt_cooling(key: str) -> bool:
+    return time.monotonic() < _prompt_cooldown.get(key, 0.0)
+
 # container / container_user charset (docker names, plus a numeric uid is fine);
 # no leading "-" so the value can never be parsed as a docker option.
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9._-]*$")
@@ -587,7 +598,9 @@ def is_password_prompt(prompt: str) -> bool:
 prompt_handler = None
 
 
-async def ask(prompt: str, echo: bool) -> str:
+async def ask(prompt: str, echo: bool) -> str | None:
+    """None means the user dismissed the prompt (GUI only; the terminal
+    always returns a string)."""
     if prompt_handler is not None:
         return await prompt_handler(prompt, echo)
     loop = asyncio.get_running_loop()
@@ -666,8 +679,17 @@ class _InteractiveAuth:
             if saved is not None:
                 print(f"{tag}{prompt.rstrip()} (using [{self._ia_label}] password from config)", flush=True)
                 answer = saved
+            elif prompt_cooling(self._ia_secret_key):
+                answer = ""  # dismissed recently: fail fast, don't pop up again
             else:
                 answer = await ask(tag + prompt, echo)
+                if answer is None:
+                    _prompt_cooldown[self._ia_secret_key] = time.monotonic() + PROMPT_COOLDOWN
+                    _log(
+                        f"[{self._ia_label}] 已取消输入，{PROMPT_COOLDOWN // 60} 分钟内不再弹出验证码窗口"
+                        "（菜单 服务 → 重新连接节点 可立即重试）"
+                    )
+                    answer = ""
             responses.append(answer)
         return responses
 
@@ -1246,17 +1268,47 @@ async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
     pooled connection; hop: run `true` through the bastion) instead of
     waiting for the first tool call. Failures are logged and recorded in
     _last_error, never raised. Nodes still waiting for a typed password are
-    skipped."""
+    skipped.
+
+    auth="password" nodes may ask for a verification code, so they are
+    connected ONE AT A TIME: only one dialog is open at once, and each
+    node's connect timeout starts when its own turn does (not while an
+    earlier node's dialog is still being answered). Everything else runs
+    concurrently."""
     sem = asyncio.Semaphore(concurrency)
 
     async def one(host: str) -> None:
-        async with sem:
-            if _awaiting_password(host):
-                return
-            ok, detail = await probe(host)
-            _log(f"[connect] {host} " + (f"ok ({detail})" if ok else f"failed: {detail}"))
+        if _awaiting_password(host):
+            return
+        ok, detail = await probe(host)
+        _log(f"[connect] {host} " + (f"ok ({detail})" if ok else f"failed: {detail}"))
 
-    await asyncio.gather(*(one(h) for h in hosts), return_exceptions=True)
+    async def limited(host: str) -> None:
+        async with sem:
+            await one(host)
+
+    async def interactive(hs: list[str]) -> None:
+        for h in hs:
+            await one(h)
+
+    hosts_cfg = cfg.get("host", {})
+    asking = [h for h in hosts if _uses_password(hosts_cfg.get(h, {}))]
+    rest = [h for h in hosts if h not in asking]
+    await asyncio.gather(*(limited(h) for h in rest), interactive(asking), return_exceptions=True)
+
+
+async def reconnect_all() -> None:
+    """GUI "reconnect nodes": forget dismissed-prompt cooldowns and past
+    errors, log in to any bastion that is down, then connect every node."""
+    _prompt_cooldown.clear()
+    _last_error.clear()
+    for name in list(bastions()):
+        if name not in _bastion_conns:
+            try:
+                await get_bastion(name)
+            except Exception as e:
+                _log(f"[{_blabel(name)}] login failed: {_fmt_exc(e)}")
+    await connect_nodes(list(cfg.get("host", {})))
 
 
 _bg_tasks: set = set()
@@ -1276,6 +1328,7 @@ def connect_in_background(hosts: list[str]):
 
 async def reset_all() -> None:
     _last_error.clear()
+    _prompt_cooldown.clear()
     for conn in list(_target_conns.values()):
         _close_local(conn)
     _target_conns.clear()

@@ -13,7 +13,7 @@ import re
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, simpledialog, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 import daemon
 import pool
@@ -51,6 +51,59 @@ class _LogWriter:
 
     def isatty(self) -> bool:
         return False
+
+
+class _PromptDialog(tk.Toplevel):
+    """Non-blocking input dialog (no nested event loop). on_done(value) gets
+    the text, or None if the user cancelled / closed it; dismiss() closes it
+    programmatically (e.g. the connection that asked has already given up)."""
+
+    def __init__(self, master, prompt: str, echo: bool, on_done):
+        super().__init__(master)
+        self._on_done = on_done
+        self._finished = False
+        self.title("需要输入")
+        self.transient(master)
+        self.resizable(False, False)
+        tk.Label(self, text=prompt.strip() or "请输入", justify="left", wraplength=380,
+                 padx=14, pady=10).pack(anchor="w")
+        self.var = tk.StringVar()
+        self.entry = tk.Entry(self, textvariable=self.var, show="" if echo else "*", width=40)
+        self.entry.pack(padx=14)
+        tk.Label(self, fg="gray", padx=14, anchor="w", justify="left",
+                 text="取消后 10 分钟内不再为它弹窗；菜单 服务 → 重新连接节点 可立即重试。").pack(fill="x")
+        row = tk.Frame(self)
+        row.pack(pady=10)
+        tk.Button(row, text="确定", width=8, command=self._ok).pack(side="left", padx=6)
+        tk.Button(row, text="取消", width=8, command=self._cancel).pack(side="left", padx=6)
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # A dialog opened from a background-triggered callback can end up
+        # behind other windows; make sure the user can see it.
+        self.attributes("-topmost", True)
+        self.after(300, lambda: self.winfo_exists() and self.attributes("-topmost", False))
+        self.lift()
+        self.grab_set()
+        self.entry.focus_force()
+
+    def _finish(self, value) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._on_done(value)
+        self.destroy()
+
+    def _ok(self) -> None:
+        self._finish(self.var.get())
+
+    def _cancel(self) -> None:
+        self._finish(None)
+
+    def dismiss(self) -> None:
+        if not self._finished:
+            self._finished = True
+            self.destroy()
 
 
 def _port_in_use(port: int) -> bool:
@@ -93,6 +146,7 @@ class App:
         self.svc_menu = tk.Menu(menubar, tearoff=False)
         self.svc_menu.add_command(label="启动服务", command=self.start)
         self.svc_menu.add_command(label="停止服务", command=self.stop, state="disabled")
+        self.svc_menu.add_command(label="重新连接节点", command=self.reconnect_nodes)
         self.svc_menu.add_separator()
         self.svc_menu.add_command(label="退出", command=self.on_close)
         menubar.add_cascade(label="服务", menu=self.svc_menu)
@@ -235,6 +289,7 @@ class App:
         pool._sems.clear()
         pool._bastion_conns.clear()
         pool._target_conns.clear()
+        self._prompt_lock = asyncio.Lock()
         pool.prompt_handler = self._prompt_from_service
 
         def on_server(server) -> None:
@@ -276,27 +331,37 @@ class App:
             )
 
     # ── 弹窗输入（在 Tk 主线程里执行） ────────────────────
-    async def _prompt_from_service(self, prompt: str, echo: bool) -> str:
+    async def _prompt_from_service(self, prompt: str, echo: bool) -> "str | None":
+        """One dialog at a time. Returns the text, or None if dismissed."""
         loop = asyncio.get_running_loop()
-        fut: "asyncio.Future[str]" = loop.create_future()
+        async with self._prompt_lock:
+            fut: "asyncio.Future[str | None]" = loop.create_future()
+            box: dict = {}
 
-        def ask() -> None:
-            # A dialog opened from a background-triggered callback can end up
-            # behind other windows; make sure the user can see it.
-            self.root.deiconify()
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-            self.root.after(300, lambda: self.root.attributes("-topmost", False))
-            self.root.focus_force()
-            ans = simpledialog.askstring(
-                "需要输入", prompt.strip() or "请输入", show="" if echo else "*", parent=self.root
-            )
-            # Cancelled dialog -> empty answer (server will reject it; the
-            # daemon's normal retry/give-up logic takes over).
-            loop.call_soon_threadsafe(fut.set_result, ans or "")
+            def done(value) -> None:
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(value))
 
-        self.call_ui(ask)
-        return await fut
+            def show() -> None:
+                self.root.deiconify()
+                self.root.lift()
+                box["dlg"] = _PromptDialog(self.root, prompt, echo, done)
+
+            self.call_ui(lambda: self.root.after(0, show))
+            try:
+                return await fut
+            except asyncio.CancelledError:
+                # The connection that asked gave up (e.g. connect timeout):
+                # take the stale dialog down instead of leaving it open.
+                self.call_ui(lambda: box.get("dlg") and box["dlg"].dismiss())
+                raise
+
+    def reconnect_nodes(self) -> None:
+        loop = self.loop
+        if not (loop and self.server):
+            messagebox.showinfo("重新连接节点", "服务还没有运行。")
+            return
+        print("重新连接所有节点…")
+        asyncio.run_coroutine_threadsafe(pool.reconnect_all(), loop)
 
     # ── 配置编辑 ──────────────────────────────────────────
     def open_editor(self) -> None:

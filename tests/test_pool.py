@@ -920,5 +920,80 @@ class TargetVerificationCodeTests(PoolTestCase):
         self.assertLess(seen["k"]["connect_timeout"], pool.PASSWORD_CONNECT_TIMEOUT)
 
 
+class DismissedPromptTests(PoolTestCase):
+    def setUp(self):
+        super().setUp()
+        pool._prompt_cooldown.clear()
+        pool._passwords.pop("zz", None)
+
+    async def test_dismissed_prompt_is_not_shown_again_until_cooldown_ends(self):
+        asked = []
+
+        async def fake_ask(prompt, echo):
+            asked.append(prompt)
+            return None  # user closed the dialog
+
+        client = pool._TargetClient("zz", interactive=True)
+        with mock.patch.object(pool, "ask", fake_ask), capture() as out:
+            first = await client.kbdint_challenge_received("", "", "", [("Verification code: ", True)])
+            # every retry / reconnect that follows must fail fast, silently
+            second = await pool._TargetClient("zz", interactive=True).kbdint_challenge_received(
+                "", "", "", [("Verification code: ", True)])
+        self.assertEqual((first, second), ([""], [""]))
+        self.assertEqual(len(asked), 1)
+        self.assertTrue(pool.prompt_cooling("zz"))
+        self.assertIn("已取消输入", out.getvalue())
+        # other nodes are unaffected
+        self.assertFalse(pool.prompt_cooling("other"))
+
+    async def test_cooldown_expires_and_reconnect_all_clears_it(self):
+        pool._prompt_cooldown["zz"] = time.monotonic() - 1
+        self.assertFalse(pool.prompt_cooling("zz"))
+        pool._prompt_cooldown["zz"] = time.monotonic() + 1000
+        pool.cfg = {"host": {}}
+        await pool.reconnect_all()
+        self.assertFalse(pool.prompt_cooling("zz"))
+
+    async def test_empty_answer_is_not_a_dismissal(self):
+        client = pool._TargetClient("zz", interactive=True)
+        with mock.patch.object(pool, "ask", mock.AsyncMock(return_value="")), capture():
+            await client.kbdint_challenge_received("", "", "", [("Verification code: ", True)])
+        self.assertFalse(pool.prompt_cooling("zz"))
+
+
+class InteractiveNodesAreSerialTests(PoolTestCase):
+    async def test_password_nodes_connect_one_at_a_time(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"p1": {"auth": "password"}, "p2": {"auth": "password"},
+                             "p3": {"via": "direct", "address": "x", "auth": "password"},
+                             "k1": {}, "k2": {}, "k3": {}}}
+        pool._passwords.update({"p1": "x", "p2": "x", "p3": "x"})
+        active = {"pw": 0, "max_pw": 0, "key": 0, "max_key": 0}
+
+        async def fake_probe(host, timeout=15):
+            kind = "pw" if host.startswith("p") else "key"
+            active[kind] += 1
+            active["max_" + kind] = max(active["max_" + kind], active[kind])
+            await asyncio.sleep(0.05)
+            active[kind] -= 1
+            return True, "0s"
+
+        with mock.patch.object(pool, "probe", fake_probe), capture():
+            await pool.connect_nodes(["p1", "p2", "p3", "k1", "k2", "k3"])
+        self.assertEqual(active["max_pw"], 1)   # one dialog / one timeout clock at a time
+        self.assertGreater(active["max_key"], 1)  # the rest still run concurrently
+
+    async def test_bastion_login_gives_up_once_the_prompt_was_dismissed(self):
+        import daemon
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}}
+        pool._prompt_cooldown[pool._bpw_key("default")] = time.monotonic() + 100
+        get = mock.AsyncMock(side_effect=asyncssh.PermissionDenied("no"))
+        with mock.patch.object(pool, "get_bastion", get), capture() as out:
+            ok = await daemon._login_bastion("default")
+        self.assertFalse(ok)
+        self.assertEqual(get.await_count, 1)  # no 2nd / 3rd attempt, no new dialog
+        self.assertIn("已取消输入", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

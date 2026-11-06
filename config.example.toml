@@ -1,112 +1,82 @@
-# 配置模板：复制为 config.toml 后填写真实值。
-# config.toml 本身已加入 .gitignore，不会被提交；这份模板里全是占位值，可以放心提交。
+# 配置模板：复制为 config.toml 后填写（也可以用应用里“配置 → 配置编辑”图形化编辑）。
+# config.toml 已加入 .gitignore；这份模板全是占位值，可以放心提交。
+# 所有节点在服务启动后都会主动连接；连不上的原因会打印在日志里并显示在状态面板中。
 
 [bastion]
-host = "bastion.example.com"   # 跳板机地址（域名或 IP）
+host = "bastion.example.com"
 port = 22
-user = "yourname"              # 你在跳板机上的登录用户名
-key  = ""                      # 私钥路径；留空则用默认密钥对（~/.ssh/id_*）
-password = ""                  # 可选：跳板机登录密码。填了就自动回答 keyboard-interactive 里的“密码”提示，
-                               # 验证码（TOTP / OTP / code）提示仍在终端输入；先问验证码还是先问密码都可以。
-                               # 留空则所有提示都在终端输入（和以前一样）。明文保存在本机 config.toml（已 gitignore）。
-# keepalive_interval  = 15     # 可选：SSH 层保活间隔（秒），0 关闭；也用于所有目标机连接。默认 15
-# keepalive_count_max = 8      # 可选：连续多少次保活无响应才判定断线。默认 8
-# 跳板机总是先用密钥认证，然后走 keyboard-interactive 做 TOTP / 密码；不要在这里写 address/auth——
-# 写了会在启动时被忽略并打印警告。
-
-# ── 多个并列跳板机（可选）──────────────────────────────────────────
-# 把上面的 [bastion] 换成多张 [bastion.<名字>] 表即可（字段和上面一样）：
-#   [bastion.a]
-#   host = "bastion-a.example.com"
-#   user = "yourname"
-#   [bastion.b]
-#   host = "bastion-b.example.com"
-#   user = "yourname"
-# 有多台时，每个 via="bastion"（默认）或 via="hop" 的节点必须用 bastion 字段指定走哪一台：
-#   [host.nmz01]
-#   via     = "hop"
-#   bastion = "a"      # 只有一台跳板机时可省略
-# 启动时会逐台登录，验证码弹窗 / 提示里带上跳板机名字（如 "[a] Verification code:"）。
-# 某台跳板机断线只影响经它连出去的节点，direct 节点和其它跳板机不受影响。
+user = "yourname"
+key  = ""            # 私钥路径；留空用默认密钥对（~/.ssh/id_*）
+password = ""        # 可选：自动回答跳板机的“密码”提示；验证码仍弹窗/终端输入。留空则全部手动输入
+# keepalive_interval  = 15   # 可选：SSH 保活间隔（秒），0 关闭
+# keepalive_count_max = 8    # 可选：连续多少次保活无响应判定断线
+# 有多台并列跳板机时，把 [bastion] 换成多张 [bastion.<名字>] 表（字段相同，如 [bastion.a]、[bastion.b]）；
+# 此时每个 bastion / hop 节点必须用 bastion = "<名字>" 指定走哪一台，只有一台时可省略。
 
 [daemon]
-port            = 8765   # daemon 监听的本地端口，仅绑定 127.0.0.1
-audit_log       = ""      # 留空则不记录；填绝对路径则写 JSONL 审计日志（不含密码）
-connect_timeout = 20      # 目标机建连超时（秒）；跳板机固定 120 秒
-# heartbeat_interval = 60 # 可选：每隔多少秒在已有的跳板机连接上开一个真实 channel 跑 `true`，防止跳板机按
-                          # “channel 无活动”踢掉会话（SSH 层保活不算 channel 活动）。0 关闭，默认 60。
-                          # 心跳只用现有连接，绝不会自己重连，所以不会凭空弹出 TOTP。
+port            = 8765   # 本地监听端口（仅 127.0.0.1）；改后需重启服务
+audit_log       = ""     # 留空不记录；填路径则写 JSONL 审计日志（不含密码）
+connect_timeout = 20     # 目标机建连超时（秒）；跳板机 120 秒，auth="password" 的节点 60 秒（要留时间输验证码）
+# heartbeat_interval = 60  # 可选：每隔多少秒在已有的跳板机连接上跑一次 `true` 防止空闲被踢，0 关闭
 
 [hosts]
-# 允许访问的目标机白名单，支持 fnmatch 通配符；留空表示不限制（生产环境建议显式配置）
-allowed = ["dev1", "lab3", "lab4", "nmz01"]
+# 允许访问的节点白名单，匹配 [host.xxx] 的节点名（不是 IP），支持通配符；留空表示不限制
+allowed = ["dev1", "dev2", "nmz01", "nmz01-ctr", "lab3", "lab4"]
 
-# ── 跳板机路由节点（默认，via 可以省略） ──────────────────────────
+# 通用字段：user 登录用户名；default_cwd 相对路径的基准（远端 Linux 路径，先在远端 echo $HOME 确认）。
+# auth = "password" 的节点：密码自动回答，服务器多要的验证码（OTP）会弹窗输入。
+# auth 不写就是 "key"，只发密钥，不支持验证码。
+
+# ── 经跳板机的节点（via 默认就是 bastion）：本机私钥 + 跳板机隧道 ──────────
 [host.dev1]
-user        = "yourname"                 # 该目标机上的登录用户名
-default_cwd = "/home/yourname"    # 相对路径参数的解析基准（远端 Linux 路径）；各集群家目录不同，先在远端 echo $HOME 确认
-# address / port（可选）：跳板机解析不了节点名时（报 Temporary failure in name resolution），填它的 IP 或域名和 SSH 端口作为隧道目标
-# via = "bastion" 是默认值，省略即可；节点名 dev1 本身会作为主机名交给跳板机解析
-# （即 yourname@dev1），认证只用密钥（key / cert，规则同下面的 direct+key 节点），
-# 不支持也不接受 password。
+user        = "yourname"
+default_cwd = "/home/yourname"
+# bastion = "a"        # 多台跳板机时必填
 
-# ── hop 路由节点：这台机器只有跳板机能免密登录，本机没有它的私钥 ─────
-# 典型场景：计算节点（如 nmz01）只在跳板机的 authorized_keys 里加过本机公钥，
-# 私钥则一直留在跳板机上，本机从没拿到过、也不需要拿到——这种节点没法用
-# tunnel= 直连（那需要本机私钥能认证 nmz01），只能让跳板机自己代跑
-# `ssh nmz01 '<命令>'`，daemon 在跳板机上执行这条命令，而不是在本机上转发端口。
+# 跳板机解析不了节点名时（日志报 Temporary failure in name resolution），用 address / port 指定隧道目标；
+# 目标机用密码（+ 验证码）登录时设 auth = "password"。
+[host.dev2]
+user        = "yourname"
+address     = "10.0.0.12"
+port        = 22
+auth        = "password"
+password    = ""     # 留空则启动时弹窗输入
+default_cwd = "/home/yourname"
+
+# ── hop 节点：只有跳板机能登录它，由跳板机执行 ssh <node> ───────────────
+# 前提：跳板机上已能免密 ssh 到该节点（自检：在跳板机上跑 ssh -o BatchMode=yes <node> hostname）。
+# 不支持密码 / 验证码；address / auth / key / cert / password 填了会被忽略。
 [host.nmz01]
 via         = "hop"
-user        = "yourname"          # 可选：跳板机 ssh 到 nmz01 时用的 -l 用户名；
-                                   # 留空则交给跳板机自己的 ~/.ssh/config 或 ssh 默认值决定
-# port      = 22                  # 可选：跳板机 ssh 到 nmz01 时用的 -p 端口；同上，留空则用默认/~/.ssh/config
-default_cwd = "/home/yourname"    # 远端 Linux 路径，语义和其它节点一致
-# 部署前提（在跳板机上准备，不是在本机）：
-#   1. nmz01 的私钥已经放在跳板机上，且跳板机能免密 ssh 到 nmz01——
-#      这通常是跳板机侧已有的集群内网配置，本项目不负责生成或分发这把私钥。
-#   2. 自检：登录跳板机后手动跑一次
-#        ssh -o BatchMode=yes nmz01 hostname
-#      能直接打印 nmz01 的 hostname、不弹密码/密钥口令提示，才说明这里能正常工作；
-#      如果卡住或报错，先在跳板机上把这一步跑通，再回来用这个 daemon。
-# hop 节点不支持 address/password/auth/key/cert——这些字段属于"daemon 直接连这台机器"
-# 的场景，hop 节点从头到尾都是跳板机在连，填了会在启动时打印警告并被忽略。
+node        = "nmz01"      # 可选：跳板机实际 ssh 的目标（IP 或主机名），省略则等于节点名
+user        = "yourname"   # 可选：跳板机 ssh 用的 -l
+# port      = 22           # 可选：跳板机 ssh 用的 -p
+default_cwd = "/home/yourname"
 
-# ── hop 路由 + docker 容器：命令在目标节点的容器里执行 ───────────────
-# 段名（nmz01-ctr）是 MCP 里使用的节点名，也是 [hosts] allowed 匹配的名字；
-# 跳板机实际 ssh 的目标由 node 决定，所以同一个 node 上可以有多个段对应不同容器。
+# hop + docker 容器：命令在目标节点的容器里执行（default_cwd 是容器内路径）
 [host.nmz01-ctr]
 via            = "hop"
-node           = "nmz01"          # 可选：跳板机实际 ssh 的目标；省略则等于段名
-user           = "yourname"       # 仍然是跳板机 ssh 到 node 用的 -l（不是容器内用户）
-container      = "mycontainer"    # 容器名或 ID 前缀；设了就用 docker exec -i 在容器里执行
-                                   # 只允许字母、数字、. _ -（且不以 - 开头），否则启动报错
-# container_user = "root"         # 可选：docker exec -u 的值；省略则不传 -u（用镜像默认用户）
-default_cwd    = "/workspace/proj" # 注意：此时是【容器内】路径
-# 前提：跳板机上的 ssh 用户能在 node 上直接运行 docker（无需 sudo），且容器里有 bash、
-# coreutils（stat/readlink/base64/timeout）。container/node/container_user 只在 via="hop" 时有效，
-# 其它路由配了会打印警告并被忽略。别忘了把 nmz01-ctr 加进上面 [hosts] allowed。
+node           = "nmz01"
+user           = "yourname"
+container      = "mycontainer"   # 容器名或 ID 前缀，只允许字母、数字、. _ -
+# container_user = "root"        # 可选：docker exec -u
+default_cwd    = "/workspace/proj"
 
-# ── 直连节点 + 密钥认证（可选 OpenSSH 用户证书） ───────────────────
+# ── 直连节点：不经过跳板机，直接连 address:port ─────────────────────────
 [host.lab3]
-via         = "direct"                      # 不经过跳板机，直接连 address:port
-address     = "192.168.10.23"               # 必填：IP 或域名
-port        = 2222                          # 默认 22
+via         = "direct"
+address     = "192.168.10.23"   # 必填
+port        = 2222
 user        = "yourname"
-auth        = "key"                         # key | password
-key         = "C:/Users/<本机用户名>/.ssh/lab3_ed25519"   # 本机私钥路径；留空则依次回退到 [bastion] key、默认密钥对
-cert        = ""                            # 可选：CA 签发的用户证书路径（*-cert.pub），配合 key 一起用
-default_cwd = "/home/yourname"     # 远端 Linux 路径
-# known_hosts = ""   # 可选：这台机器的 known_hosts 文件路径，用来校验 host key；
-                     # 留空则不校验。direct 节点不在跳板机后面，建议至少给密码
-                     # 认证的 direct 节点配这个字段。
+key         = "C:/Users/<本机用户名>/.ssh/lab3_ed25519"   # 留空依次回退到 [bastion] key、默认密钥对
+# cert      = ""                # 可选：CA 签发的用户证书（*-cert.pub）
+default_cwd = "/home/yourname"
+# known_hosts = ""   # 可选：校验 host key 的 known_hosts 文件；留空不校验（密码认证节点建议配置）
 
-# ── 直连节点 + 密码认证 ────────────────────────────────────────
 [host.lab4]
 via         = "direct"
 address     = "192.168.10.24"
-port        = 22
 user        = "yourname"
 auth        = "password"
-password    = ""    # 明文写在本机 config.toml（已 gitignore）；留空则在 daemon 启动时用 getpass 交互输入
-default_cwd = "/home/yourname"     # 远端 Linux 路径
-# known_hosts = ""   # 同上，密码认证节点尤其建议配置
+password    = ""     # 明文只存本机 config.toml；留空则启动时弹窗输入
+default_cwd = "/home/yourname"

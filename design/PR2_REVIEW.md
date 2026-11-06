@@ -1,10 +1,10 @@
 # PR #2 审查记录：认证重试与 GUI 生命周期
 
-本文记录 PR #2（`feat/gui-app-multi-bastion`）在本地审查中发现的三个行为级问题，并给出建议的修复方案。审查基线为 `main@1e83473`，PR 当前提交为 `9ec7b95`。
+本文记录 PR #2（`feat/gui-app-multi-bastion`）在本地审查中发现的三个行为级问题及修复结果。审查基线为 `main@1e83473`，被审查的 PR 提交为 `9ec7b95`，修复提交为 `873fcff`。
 
 ## 结论
 
-PR 的 118 项单元测试、Python 编译检查和 `git diff --check` 均通过。测试覆盖了单个函数和模拟 SSH 行为，但没有覆盖“启动登录失败后批量连接”和“GUI 停止后再次启动”这两条跨组件流程。因此这三个问题不会被现有测试捕获，建议修复后再合并。
+初始 PR 的 118 项单元测试、Python 编译检查和 `git diff --check` 均通过，但测试没有覆盖“启动登录失败后批量连接”和“GUI 停止后再次启动”这两条跨组件流程，因此发现了本文记录的问题。修复提交新增跨组件回归测试，当前全量测试为 138 项。
 
 ## 问题一：跳板机认证失败会被每个节点重复触发
 
@@ -116,7 +116,7 @@ GUI 启动服务时会把非空的 bastion 密码写入 `pool._passwords`。停�
 
 ## 修复状态
 
-三个问题均已修复，新增 17 个测试（`tests/test_pool.py::AuthFailureOnceTests`、`tests/test_daemon.py`、`tests/test_app.py`），全量 135 项通过。
+三个问题均已修复，新增 20 个测试（`tests/test_pool.py::AuthFailureOnceTests`、`tests/test_daemon.py`、`tests/test_app.py`），全量 138 项通过。
 
 | 问题 | 做法 |
 |---|---|
@@ -126,7 +126,6 @@ GUI 启动服务时会把非空的 bastion 密码写入 `pool._passwords`。停�
 | 三 B | `on_close()` 改为 `root.after(100)` 轮询（上限 8 秒），不再在 Tk 主线程 `join`；`closing` 标志防止重复点击。 |
 | 三 4 | `serve()` 的 `try/finally` 从启动登录阶段就开始，启动中被取消也会 `reset_all()`；`finally` 取消 `_bg_tasks` 与心跳。 |
 
-阻断状态在 `reconnect_all()`、`reset_all()`（含 `reset_connections` 工具与服务停止）和 `apply_config()`（节点被改动或删除）时清除。
+阻断状态在 `reconnect_all()`、`reset_all()`（含 `reset_connections` 工具与服务停止）和 `apply_config()`（节点被改动或删除）时清除。`reconnect_all()` 对被拒绝的手输密码会重新弹窗询问（取消则该节点等待密码，不重放旧值）；被拒绝的 `config.toml` 密码保留，显式重连时再试一次。`reset_all()` 不询问，保留密码。
 
 未做：问题一的“单 bastion 登录结果共享”闸门（`_bastion_lock` 已保证同一时刻只有一个登录，启动阶段的重复已由 `_bastion_failed` 消除；并发的工具调用各自重试仍是显式需求）；问题三的 `RuntimeState` 整体重构（用“启动时清缓存 + 停止时 `reset_all`”达到同样效果）。
-

@@ -1091,6 +1091,49 @@ class AuthFailureOnceTests(PoolTestCase):
                 await lift()
             self.assertNotIn("d", pool._auth_blocked, lift.__name__)
 
+class ReconnectAfterRejectedPasswordTests(PoolTestCase):
+    """Explicit "reconnect nodes" must not silently replay a refused password."""
+
+    def setUp(self):
+        super().setUp()
+        pool._last_error.clear()
+        pool._prompt_cooldown.clear()
+        pool.cfg = {"host": {
+            "typed": {"via": "direct", "address": "1.1.1.1", "auth": "password"},
+            "conf": {"via": "direct", "address": "2.2.2.2", "auth": "password", "password": "fromfile"},
+        }}
+        pool._passwords.update({"typed": "wrong-typed", "conf": "fromfile"})
+        pool._auth_blocked.update({"typed": "x", "conf": "y"})
+
+    async def _reconnect(self, answer):
+        used = {}
+
+        async def fake_probe(host, timeout=15):
+            used[host] = pool._passwords.get(host)
+            return True, "0s"
+
+        ask = mock.AsyncMock(return_value=answer)
+        with mock.patch.object(pool, "ask", ask), mock.patch.object(pool, "probe", fake_probe), capture():
+            await pool.reconnect_all()
+        return ask, used
+
+    async def test_typed_password_is_asked_again_and_config_one_is_kept(self):
+        ask, used = await self._reconnect("fresh")
+        ask.assert_awaited_once()
+        self.assertIn("[typed]", ask.await_args.args[0])
+        self.assertEqual(used, {"typed": "fresh", "conf": "fromfile"})
+
+    async def test_dismissed_dialog_leaves_the_node_unconnected_not_replayed(self):
+        ask, used = await self._reconnect(None)
+        self.assertEqual(used, {"conf": "fromfile"})  # "typed" is awaiting a password, skipped
+        self.assertNotIn("wrong-typed", pool._passwords.values())
+
+    async def test_nothing_is_asked_when_no_password_was_rejected(self):
+        pool._auth_blocked.clear()
+        ask, used = await self._reconnect("fresh")
+        ask.assert_not_awaited()
+        self.assertEqual(used["typed"], "wrong-typed")  # reconnecting a healthy node keeps its password
+
 
 if __name__ == "__main__":
     unittest.main()

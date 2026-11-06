@@ -1326,6 +1326,14 @@ async def reconnect_all() -> None:
     errors, log in to any bastion that is down, then connect every node."""
     _prompt_cooldown.clear()
     _last_error.clear()
+    # A refused typed password is asked for again instead of being replayed
+    # (a dismissed dialog leaves the node waiting for a password); a refused
+    # config.toml one is kept, since the user may have fixed the account.
+    hosts_cfg = cfg.get("host", {})
+    for host in list(_auth_blocked):
+        hc = hosts_cfg.get(host, {})
+        if _uses_password(hc) and not hc.get("password"):
+            _passwords[host] = await ask(f"[{host}] password: ", False) or ""
     _auth_blocked.clear()
     _bastion_failed.clear()
     for name in list(bastions()):

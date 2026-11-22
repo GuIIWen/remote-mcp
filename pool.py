@@ -1003,7 +1003,7 @@ def _timeout_wrap(cmd: str, timeout: int) -> str:
     )
 
 
-def hop_ssh_command(host: str, cmd: str, timeout: int) -> str:
+def hop_ssh_command(host: str, cmd: str, timeout: int, *, fresh: bool = False) -> str:
     """Build the command line a hop-routed host's operation runs *on the
     bastion*: an `ssh` client that hops one more time to `host` and runs
     `cmd` there.
@@ -1056,9 +1056,12 @@ def hop_ssh_command(host: str, cmd: str, timeout: int) -> str:
         if container_user:
             docker += "-u " + shlex.quote(str(container_user)) + " "
         cmd = docker + shlex.quote(str(container)) + " bash -c " + shlex.quote(cmd)
-    opts = ["-o", "BatchMode=yes", "-o", "ControlMaster=auto",
-            "-o", f"ControlPath=~/.ssh/remote-mcp-%C",
-            "-o", "ControlPersist=10m"]
+    opts = ["-o", "BatchMode=yes"]
+    if fresh:
+        opts += ["-S", "none", "-o", "ControlMaster=no"]
+    else:
+        opts += ["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/remote-mcp-%C",
+                 "-o", "ControlPersist=10m"]
     port = hc.get("port")
     if port:
         opts += ["-p", str(port)]
@@ -1074,6 +1077,8 @@ async def _run_hop(
     cmd: str,
     timeout: int,
     stdin: str | None,
+    *,
+    fresh: bool = False,
 ) -> asyncssh.SSHCompletedProcess:
     """Run one command on a hop host, by running `ssh <node> '<cmd>'` on the
     bastion connection.
@@ -1092,7 +1097,7 @@ async def _run_hop(
     async with _hop_sem(bname):
         with _in_use(bastion):
             process = await bastion.create_process(
-                hop_ssh_command(host, cmd, timeout), input=stdin, errors="replace"
+                hop_ssh_command(host, cmd, timeout, fresh=fresh), input=stdin, errors="replace"
             )
             try:
                 result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
@@ -1226,48 +1231,59 @@ def connection_status() -> list[dict]:
         bname = None if via == "direct" else _bastion_or_none(host)
         bastion_up = bname is not None and bname in _bastion_conns
         suffix = f"（{bname}）" if bname and len(bs) > 1 else ""
-        if via == "hop":
-            if bname is None:
-                rows.append({"name": host, "host": host, "via": via, "state": "offline",
-                             "detail": "未指定跳板机（bastion 字段）"})
-            elif _last_error.get(host):
-                rows.append({"name": host, "host": host, "via": via, "state": "offline",
-                             "detail": f"连接失败：{_last_error[host]}"})
-            else:
-                rows.append({
-                    "name": host, "host": host, "via": via,
-                    "state": "via-bastion" if bastion_up else "offline",
-                    "detail": f"经跳板机代跑 ssh{suffix}" if bastion_up else f"跳板机未登录{suffix}",
-                })
-            continue
         err = _last_error.get(host)
         conn = _target_conns.get(host)
-        if conn is None and err:
-            rows.append({"name": host, "host": host, "via": via, "state": "offline",
-                         "detail": f"连接失败：{err}"})
-            continue
-        if conn is not None:
-            rows.append({"name": host, "host": host, "via": via, "state": "connected", "detail": age(conn) + suffix})
+        if not _allowed(host):
+            state, detail = "offline", "未列入白名单"
+        elif via == "hop":
+            if bname is None:
+                state, detail = "offline", "未指定跳板机（bastion 字段）"
+            elif err:
+                state, detail = "offline", f"连接失败：{err}"
+            elif bastion_up:
+                state, detail = "via-bastion", f"经跳板机代跑 ssh{suffix}"
+            else:
+                state, detail = "offline", f"跳板机未登录{suffix}"
+        elif err:
+            state, detail = "offline", f"连接失败：{err}"
+        elif conn is not None:
+            state, detail = "connected", age(conn) + suffix
         elif via == "bastion" and not bastion_up:
-            rows.append({"name": host, "host": host, "via": via, "state": "offline", "detail": f"跳板机未登录{suffix}"})
+            state, detail = "offline", f"跳板机未登录{suffix}"
         else:
-            rows.append({"name": host, "host": host, "via": via, "state": "idle",
-                         "detail": f"尚未连接{suffix}"})
+            state, detail = "idle", f"尚未连接{suffix}"
+        rows.append({"name": host, "host": host, "via": via, "bastion": bname,
+                     "state": state, "detail": detail})
     return rows
 
 
-async def probe(host: str, timeout: int = 15) -> tuple[bool, str]:
+async def probe(host: str, timeout: int = 15, *, fresh_hop: bool = False) -> tuple[bool, str]:
     """Actively test a node: connect if needed (so a bastion login / TOTP
     prompt can happen) and run `true` on it. Returns (ok, detail); never
     raises. Used by the GUI's "test connection" button."""
+    if host not in cfg.get("host", {}):
+        return False, "节点已从配置移除"
+    if not _allowed(host):
+        return False, "节点未列入白名单"
+    if _awaiting_password(host) and host not in _auth_blocked:
+        return False, "等待输入密码，请点「重连节点」"
     t0 = time.monotonic()
     try:
-        await run(host, "true", timeout=timeout)
+        if fresh_hop and _route(host) == "hop":
+            result = await _run_hop(host, "true", timeout, None, fresh=True)
+        else:
+            result = await run(host, "true", timeout=timeout)
     except Exception as e:
-        _last_error[host] = f"{type(e).__name__}: {e}"
-        return False, f"{type(e).__name__}: {e}"
-    _last_error.pop(host, None)
-    return True, f"{time.monotonic() - t0:.1f}s"
+        detail = _fmt_exc(e)
+    else:
+        if result.returncode == 0:
+            _last_error.pop(host, None)
+            return True, f"{time.monotonic() - t0:.1f}s"
+        detail = f"探测命令退出码 {result.returncode}"
+        if result.stderr:
+            detail += f"：{result.stderr.strip()}"
+    _last_error[host] = detail
+    return False, detail
 
 
 def _uses_password(hc: dict) -> bool:
@@ -1277,10 +1293,34 @@ def _uses_password(hc: dict) -> bool:
 
 
 def _awaiting_password(host: str) -> bool:
-    """A direct+password node whose password hasn't been supplied yet: it
-    can't be connected without a prompt, which only startup may show."""
+    """Whether a password node still needs input at startup or on explicit reconnect."""
     hc = cfg.get("host", {}).get(host, {})
     return _uses_password(hc) and not _passwords.get(host)
+
+
+async def reconnect_node(host: str) -> tuple[bool, str]:
+    """Reconnect one configured node, leaving shared bastions and other nodes up."""
+    hc = cfg.get("host", {}).get(host)
+    if hc is None:
+        return False, "节点已从配置移除"
+    if not _allowed(host):
+        return False, "节点未列入白名单"
+    bname = _bastion_or_none(host) if _route(host) != "direct" else None
+    _prompt_cooldown.pop(host, None)
+    if bname is not None and _is_closed(_bastion_conns.get(bname)):
+        _prompt_cooldown.pop(_bpw_key(bname), None)
+    if _uses_password(hc) and not hc.get("password") and (host in _auth_blocked or _awaiting_password(host)):
+        _passwords.pop(host, None)
+        password = await ask(f"[{host}] password: ", False)
+        if cfg.get("host", {}).get(host) != hc or not _allowed(host):
+            return False, "节点配置已变化，请重试"
+        if not password:
+            return False, "已取消输入密码"
+        _passwords[host] = password
+    _auth_blocked.pop(host, None)
+    async with _host_lock(host):
+        _invalidate_target(host)
+    return await probe(host, fresh_hop=True)
 
 
 async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
@@ -1348,16 +1388,21 @@ async def reconnect_all() -> None:
 _bg_tasks: set = set()
 
 
+def start_background(coro):
+    """Run a service task and cancel it during daemon shutdown."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
 def connect_in_background(hosts: list[str]):
     """Start connect_nodes() as a task on the running loop (startup, config
     reload). Returns the task, or None if there is nothing to connect."""
     hosts = list(hosts)
     if not hosts:
         return None
-    task = asyncio.get_running_loop().create_task(connect_nodes(hosts))
-    _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
-    return task
+    return start_background(connect_nodes(hosts))
 
 
 async def reset_all() -> None:
@@ -1492,9 +1537,8 @@ def apply_config(new_cfg: dict) -> dict:
         ):
             pass  # same login, keep the password typed at startup
         else:
-            # No terminal inside a tool call, so never prompt here. get_target
-            # will connect with an empty password and get PermissionDenied
-            # (not retried, never blocks); a daemon restart is what fixes it.
+            # Saving or hot-reloading config does not prompt. The next startup
+            # or an explicit GUI node reconnect can collect the new password.
             _passwords.pop(h, None)
             need_password.append(h)
     return {

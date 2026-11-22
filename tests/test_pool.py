@@ -6,6 +6,7 @@ import contextlib
 import io
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import asyncssh
@@ -728,7 +729,7 @@ class ConnectFailureLogTests(PoolTestCase):
 class ProbeTests(PoolTestCase):
     async def test_probe_ok_and_failure_never_raise(self):
         pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"n": {}}}
-        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=object())):
+        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=SimpleNamespace(returncode=0))):
             ok, detail = await pool.probe("n")
         self.assertTrue(ok)
         self.assertTrue(detail.endswith("s"))
@@ -736,6 +737,38 @@ class ProbeTests(PoolTestCase):
             ok, detail = await pool.probe("n")
         self.assertFalse(ok)
         self.assertIn("PermissionDenied", detail)
+
+    async def test_probe_failed_exit_and_whitelist(self):
+        pool.cfg = {"hosts": {"allowed": ["n"]}, "host": {"n": {}, "other": {"via": "hop"}}}
+        run = mock.AsyncMock(return_value=SimpleNamespace(returncode=3, stderr="probe failed"))
+        with mock.patch.object(pool, "run", run):
+            self.assertEqual(await pool.probe("other"), (False, "节点未列入白名单"))
+            self.assertEqual(await pool.reconnect_node("other"), (False, "节点未列入白名单"))
+            ok, detail = await pool.probe("n")
+        self.assertFalse(ok)
+        self.assertIn("退出码 3", detail)
+        run.assert_awaited_once_with("n", "true", timeout=15)
+
+    async def test_reconnect_keeps_shared_bastion_and_other_node(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"n": {}, "other": {}}}
+        selected, other, bastion = FakeConn(), FakeConn(), FakeConn()
+        pool._target_conns.update(n=selected, other=other)
+        pool._bastion_conns["default"] = bastion
+        run = mock.AsyncMock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(pool, "run", run):
+            self.assertTrue((await pool.reconnect_node("n"))[0])
+        self.assertTrue(selected.closed)
+        self.assertFalse(other.closed)
+        self.assertFalse(bastion.closed)
+        run.assert_awaited_once_with("n", "true", timeout=15)
+
+    async def test_hop_reconnect_uses_a_fresh_inner_session(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"}, "host": {"h": {"via": "hop"}}}
+        hop = mock.AsyncMock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(pool, "_run_hop", hop):
+            self.assertTrue((await pool.reconnect_node("h"))[0])
+        hop.assert_awaited_once_with("h", "true", 15, None, fresh=True)
+        self.assertIn("-S none -o ControlMaster=no", pool.hop_ssh_command("h", "true", 15, fresh=True))
 
     def test_status_rows_carry_host_key(self):
         pool.cfg = {"bastion": {"host": "b", "user": "u"},
@@ -815,7 +848,7 @@ class EagerConnectTests(PoolTestCase):
         rows = {r["name"]: r for r in pool.connection_status()}
         self.assertEqual(rows["d"]["state"], "offline")
         self.assertIn("PermissionDenied", rows["d"]["detail"])
-        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=object())):
+        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=SimpleNamespace(returncode=0))):
             self.assertTrue((await pool.probe("d"))[0])
         self.assertEqual({r["name"]: r for r in pool.connection_status()}["d"]["state"], "idle")
 

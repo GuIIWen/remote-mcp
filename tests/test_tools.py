@@ -1,6 +1,6 @@
 """Unit tests for tools.py: password scrubbing in tool output and the audit
-log, and list_hosts following reload_config. No real SSH: pool.run /
-pool.load_config are mocked. Run from the repo root:
+log, and list_hosts following reload_config. No real SSH: tool operations
+and background connections are mocked. Run from the repo root:
 python -m unittest tests.test_tools -v"""
 import os
 import tempfile
@@ -31,6 +31,7 @@ def _lab4(**kw) -> dict:
 
 class ToolsTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(pool, "connect_in_background"))
         self._saved = (pool.cfg, dict(pool._bastion_conns), dict(pool._target_conns),
                        dict(pool._passwords), tools.AUDIT_LOG)
         pool.cfg = {}

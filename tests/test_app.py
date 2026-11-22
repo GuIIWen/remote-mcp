@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import app
+from config_editor import ConfigEditor
 
 
 def fake_app(alive=True):
@@ -48,6 +49,30 @@ class OnCloseTests(unittest.TestCase):
         self = fake_app(alive=False)
         app.App.on_close(self)
         self.root.destroy.assert_called_once()
+
+
+class CopyNodeTests(unittest.TestCase):
+    def test_copies_current_draft_with_unique_name(self):
+        source = {"via": "direct", "address": "example.invalid", "extra": {"value": [1]}}
+        name_entry = mock.Mock()
+        editor = SimpleNamespace(
+            current=("node", "lab"),
+            cfg={"host": {"lab": source, "lab-copy": {}}, "hosts": {"allowed": ["lab"]}},
+            commit=mock.Mock(return_value=True),
+            refresh_list=mock.Mock(),
+            select=mock.Mock(),
+            ctrls={"__name": (None, [name_entry], "str")},
+            dirty=False,
+        )
+        ConfigEditor.copy_node(editor)
+        editor.commit.assert_called_once()
+        editor.select.assert_called_once_with(("node", "lab-copy-2"))
+        self.assertEqual(editor.cfg["hosts"]["allowed"], ["lab"])
+        copied = editor.cfg["host"]["lab-copy-2"]
+        self.assertEqual(copied, source)
+        copied["extra"]["value"].append(2)
+        self.assertEqual(source["extra"]["value"], [1])
+        self.assertTrue(editor.dirty)
 
 
 if __name__ == "__main__":

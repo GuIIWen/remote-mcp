@@ -7,6 +7,7 @@
 只用标准库 tkinter，无需额外依赖。运行：python app.py（或双击 start-app.bat）。
 """
 import asyncio
+import contextlib
 import logging
 import queue
 import re
@@ -14,7 +15,12 @@ import sys
 import threading
 import time
 import tkinter as tk
+from functools import partial
 from tkinter import messagebox, scrolledtext, ttk
+
+import httpx
+from mcp import ClientSession
+from mcp.client import streamable_http
 
 import daemon
 import pool
@@ -118,6 +124,24 @@ def _port_in_use(port: int) -> bool:
     return False
 
 
+async def _check_mcp_endpoint(url: str) -> tuple[bool, str]:
+    """Check the same HTTP transport a client uses, without calling an SSH tool."""
+    async with asyncio.timeout(5), contextlib.AsyncExitStack() as stack:
+        client = getattr(streamable_http, "streamable_http_client", None)
+        if client:
+            http = await stack.enter_async_context(httpx.AsyncClient(trust_env=False))
+            transport = client(url, http_client=http)
+        else:
+            transport = streamable_http.streamablehttp_client(url)
+        read, write, _ = await stack.enter_async_context(transport)
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        tools = await session.list_tools()
+    if not any(tool.name == "list_hosts" for tool in tools.tools):
+        return False, "MCP 已响应，但未提供 Remote MCP 的 list_hosts 工具"
+    return True, f"握手通过，{len(tools.tools)} 个工具"
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -142,6 +166,12 @@ class App:
         self.server = None
         self.closing = False
         self.port = 8765
+        self.service_state = "stopped"
+        self.stop_requested = threading.Event()
+        self.mcp_check_busy = False
+        self.node_operation = None
+        self.node_result = None
+        self.node_rows = {}
 
         # ── 导航栏（菜单） ──
         menubar = tk.Menu(root)
@@ -157,12 +187,14 @@ class App:
         cfg_menu.add_command(label="配置编辑…", command=self.open_editor)
         menubar.add_cascade(label="配置", menu=cfg_menu)
 
-        tool_menu = tk.Menu(menubar, tearoff=False)
-        tool_menu.add_command(label="复制 MCP 地址", command=self.copy_url)
-        tool_menu.add_command(label="复制 claude 注册命令", command=self.copy_claude_cmd)
-        tool_menu.add_separator()
-        tool_menu.add_command(label="清空日志", command=self.clear_log)
-        menubar.add_cascade(label="工具", menu=tool_menu)
+        self.tool_menu = tk.Menu(menubar, tearoff=False)
+        self.tool_menu.add_command(label="检查 MCP 接入", command=self.check_mcp, state="disabled")
+        self.tool_menu.add_command(label="复制 MCP 地址", command=self.copy_url, state="disabled")
+        self.tool_menu.add_command(label="复制 Claude Code 注册命令", command=self.copy_claude_cmd, state="disabled")
+        self.tool_menu.add_command(label="复制 Codex 注册命令", command=self.copy_codex_cmd, state="disabled")
+        self.tool_menu.add_separator()
+        self.tool_menu.add_command(label="清空日志", command=self.clear_log)
+        menubar.add_cascade(label="工具", menu=self.tool_menu)
         root.configure(menu=menubar)
 
         # ── 状态 + 地址 ──
@@ -173,6 +205,9 @@ class App:
         self.url_var = tk.StringVar(value="（服务启动后显示）")
         tk.Entry(top, textvariable=self.url_var, state="readonly").pack(
             side="left", fill="x", expand=True, padx=(12, 0))
+        self.mcp_feedback = tk.StringVar()
+        tk.Label(root, textvariable=self.mcp_feedback, anchor="w", padx=10,
+                 wraplength=680, justify="left").pack(fill="x")
 
         self.body = tk.Frame(root)
         self.body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
@@ -188,7 +223,7 @@ class App:
         self.panel_open = True
         tk.Button(self.panel, text="节点状态  ▸ 收起", anchor="w", relief="flat",
                   command=self.toggle_panel).pack(fill="x")
-        self.tree = ttk.Treeview(self.panel, columns=("via", "state"), height=8)
+        self.tree = ttk.Treeview(self.panel, columns=("via", "state"), height=8, selectmode="browse")
         self.tree.heading("#0", text="节点")
         self.tree.heading("via", text="路由")
         self.tree.heading("state", text="状态")
@@ -196,10 +231,19 @@ class App:
         self.tree.column("via", width=55, minwidth=40, stretch=False)
         self.tree.column("state", width=150, minwidth=80)
         self.tree.tag_configure("connected", foreground="#1a7f37")
-        self.tree.tag_configure("via-bastion", foreground="#1a7f37")
+        self.tree.tag_configure("via-bastion", foreground="#6e7781")
         self.tree.tag_configure("idle", foreground="#6e7781")
         self.tree.tag_configure("offline", foreground="#cf222e")
         self.tree.pack(fill="both", expand=True)
+        actions = ttk.Frame(self.panel)
+        actions.pack(fill="x", pady=(6, 0))
+        self.test_node_button = ttk.Button(actions, text="测试连接", command=self.test_node, state="disabled")
+        self.test_node_button.pack(side="left")
+        self.reconnect_node_button = ttk.Button(actions, text="重连节点", command=self.reconnect_node, state="disabled")
+        self.reconnect_node_button.pack(side="left", padx=6)
+        self.node_feedback = tk.StringVar()
+        ttk.Label(self.panel, textvariable=self.node_feedback, wraplength=270, justify="left").pack(fill="x", pady=6)
+        self.tree.bind("<<TreeviewSelect>>", self.update_node_controls)
         # 收起后留在右边缘的小按钮，点它重新展开
         self.expand_btn = tk.Button(self.body, text="◂" + chr(10) + "节" + chr(10) + "点" + chr(10) + "状" + chr(10) + "态",
                                     width=2, relief="flat", command=self.toggle_panel)
@@ -241,6 +285,7 @@ class App:
 
     # ── 状态 ──────────────────────────────────────────────
     def set_state(self, state: str) -> None:
+        self.service_state = state
         text, color = {
             "stopped": ("● 未启动", "gray"),
             "starting": ("● 启动中…（可能需要输入验证码）", "orange"),
@@ -249,9 +294,14 @@ class App:
         }[state]
         self.status.configure(text=text, fg=color)
         self.svc_menu.entryconfigure("启动服务", state="normal" if state == "stopped" else "disabled")
-        self.svc_menu.entryconfigure("停止服务", state="disabled" if state == "stopped" else "normal")
+        self.svc_menu.entryconfigure("停止服务", state="normal" if state in ("starting", "running") else "disabled")
+        for item in ("检查 MCP 接入", "复制 MCP 地址", "复制 Claude Code 注册命令", "复制 Codex 注册命令"):
+            self.tool_menu.entryconfigure(item, state="normal" if state == "running" else "disabled")
         if state == "stopped":
             self.url_var.set("（服务启动后显示）")
+        if state != "running":
+            self.mcp_feedback.set("")
+        self.update_node_controls()
 
     # ── 启动 / 停止 ──────────────────────────────────────
     def start(self) -> None:
@@ -275,14 +325,12 @@ class App:
 
         self.port = port
         self.server = None
+        self.stop_requested.clear()
         self.set_state("starting")
         self.thread = threading.Thread(target=self._run_service, args=(cfg, port), daemon=True)
         self.thread.start()
 
     def _run_service(self, cfg: dict, port: int) -> None:
-        loop = asyncio.new_event_loop()
-        self.loop = loop
-        asyncio.set_event_loop(loop)
         # asyncio primitives created at import time belong to the previous
         # run's loop; start each run with fresh ones.
         pool._bastion_locks.clear()
@@ -294,30 +342,49 @@ class App:
         self._prompt_lock = asyncio.Lock()
         pool.prompt_handler = self._prompt_from_service
 
-        def on_server(server) -> None:
-            self.server = server
+        async def wait_for_listener(server) -> None:
+            while not server.started:
+                await asyncio.sleep(0.05)
             self.call_ui(self._on_listening, port)
 
+        def on_server(server) -> None:
+            self.server = server
+            pool.start_background(wait_for_listener(server))
+
+        async def serve() -> None:
+            if not self.stop_requested.is_set():
+                await daemon.serve(cfg, port, on_server, use_colors=False)
+
         try:
-            loop.run_until_complete(daemon.serve(cfg, port, on_server, use_colors=False))
+            with asyncio.Runner() as runner:
+                self.loop = runner.get_loop()
+                runner.run(serve())
+        except asyncio.CancelledError:
+            if not self.stop_requested.is_set():
+                print("服务启动任务已取消")
         except BaseException as e:  # noqa: BLE001 - report everything to the log
             print(f"服务异常退出：{type(e).__name__}: {e}")
         finally:
             pool.prompt_handler = None
-            loop.close()
             self.loop = None
             self.call_ui(self._on_stopped)
 
     def _on_listening(self, port: int) -> None:
-        if self.thread and self.thread.is_alive():
+        if self.service_state == "starting" and self.thread and self.thread.is_alive():
             self.url_var.set(f"http://127.0.0.1:{port}/mcp")
             self.set_state("running")
+            self.check_mcp()
 
     def _on_stopped(self) -> None:
+        self.server = None
+        self.mcp_check_busy = False
+        self.node_operation = None
+        self.node_result = None
         self.set_state("stopped")
         print("服务已停止")
 
     def stop(self) -> None:
+        self.stop_requested.set()
         self.set_state("stopping")
         if self.server is not None:
             server = self.server
@@ -344,6 +411,8 @@ class App:
                 loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(value))
 
             def show() -> None:
+                if fut.done():
+                    return
                 self.root.deiconify()
                 self.root.lift()
                 box["dlg"] = _PromptDialog(self.root, prompt, echo, done)
@@ -358,12 +427,58 @@ class App:
                 raise
 
     def reconnect_nodes(self) -> None:
-        loop = self.loop
-        if not (loop and self.server):
+        if not self._submit(pool.reconnect_all):
             messagebox.showinfo("重新连接节点", "服务还没有运行。")
             return
         print("重新连接所有节点…")
-        asyncio.run_coroutine_threadsafe(pool.reconnect_all(), loop)
+
+    def _submit(self, operation, on_result=None) -> bool:
+        """Queue a UI action on the service loop and deliver its result on Tk."""
+        loop, server = self.loop, self.server
+        if self.service_state != "running" or not (loop and server):
+            return False
+
+        async def run() -> None:
+            try:
+                result = await operation()
+            except Exception as exc:
+                while isinstance(exc, ExceptionGroup):
+                    exc = exc.exceptions[0]
+                result = False, f"{type(exc).__name__}: {exc}"
+            if on_result:
+                self.call_ui(self._action_result, loop, on_result, result)
+            elif result:
+                print(result[1])
+
+        def schedule() -> None:
+            if not server.should_exit:
+                pool.start_background(run())
+
+        try:
+            loop.call_soon_threadsafe(schedule)
+        except RuntimeError:
+            return False
+        return True
+
+    def _action_result(self, loop, callback, result) -> None:
+        if self.loop is loop and self.service_state == "running":
+            callback(*result)
+
+    def check_mcp(self) -> None:
+        if self.mcp_check_busy or not self._submit(
+            partial(_check_mcp_endpoint, self.url_var.get()), self._show_mcp_result
+        ):
+            return
+        self.mcp_check_busy = True
+        self.mcp_feedback.set("正在检查 MCP 握手…")
+
+    def _show_mcp_result(self, ok: bool, detail: str) -> None:
+        self.mcp_check_busy = False
+        if not ok and detail.startswith("TimeoutError:"):
+            detail = "等待 MCP 响应超时（5 秒）"
+        message = f"MCP 接入{'成功' if ok else '失败'}：{detail}"
+        self.mcp_feedback.set(message)
+        print(message)
 
     # ── 配置编辑 ──────────────────────────────────────────
     def open_editor(self) -> None:
@@ -390,7 +505,7 @@ class App:
             for sec in s["restart"]:
                 print(f"[{sec}] 有变化，需要停止后重新启动服务才生效")
             for h in s["need_password"]:
-                print(f"[host.{h}] 需要重启服务后输入密码")
+                print(f"[host.{h}] 等待密码，请在节点面板选中它并点「重连节点」")
 
         loop.call_soon_threadsafe(apply)
 
@@ -413,17 +528,78 @@ class App:
             self.expand_btn.pack(side="right", fill="y", padx=(6, 0))
 
     def refresh_nodes(self) -> None:
-        running = bool(self.thread and self.thread.is_alive() and self.server)
         if self.panel_open:
-            rows = pool.connection_status() if running else []
-            self.tree.delete(*self.tree.get_children())
-            if not running:
-                self.tree.insert("", "end", text="服务未启动", tags=("idle",))
+            rows = pool.connection_status() if self.service_state == "running" else []
+            ids = []
+            self.node_rows = {}
             for r in rows:
                 mark = {"connected": "● ", "via-bastion": "● ", "idle": "○ ", "offline": "✕ "}[r["state"]]
-                self.tree.insert("", "end", text=r["name"], values=(r["via"], mark + r["detail"]),
-                                 tags=(r["state"],))
+                host = r["host"]
+                item_id = f"node:{host}" if host is not None else f"bastion:{r['name']}"
+                ids.append(item_id)
+                if host is not None:
+                    self.node_rows[item_id] = r
+                options = {"text": r["name"], "values": (r["via"], mark + r["detail"]), "tags": (r["state"],)}
+                if self.tree.exists(item_id):
+                    self.tree.item(item_id, **options)
+                else:
+                    self.tree.insert("", "end", iid=item_id, **options)
+            if not rows:
+                ids.append("empty")
+                text = self.status.cget("text").removeprefix("● ") if self.service_state != "running" else "暂无配置节点"
+                if self.tree.exists("empty"):
+                    self.tree.item("empty", text=text)
+                else:
+                    self.tree.insert("", "end", iid="empty", text=text, tags=("idle",))
+            self.tree.delete(*(set(self.tree.get_children()) - set(ids)))
+            self.tree.set_children("", *ids)
+            self.update_node_controls()
         self.root.after(2000, self.refresh_nodes)
+
+    def selected_node(self):
+        selection = self.tree.selection()
+        return self.node_rows.get(selection[0]) if selection else None
+
+    def update_node_controls(self, _event=None) -> None:
+        node = self.selected_node() if self.service_state == "running" else None
+        enabled = node is not None and self.node_operation is None
+        self.test_node_button.configure(state="normal" if enabled else "disabled")
+        self.reconnect_node_button.configure(state="normal" if enabled else "disabled")
+        if not node:
+            self.node_feedback.set("")
+            return
+        route = node["via"]
+        if node["bastion"]:
+            route += f" / 跳板机 {node['bastion']}"
+        detail = f"{route} · {node['detail']}"
+        if self.node_operation and self.node_operation[0] == node["host"]:
+            detail += f"\n{self.node_operation[1]}中…"
+        elif self.node_result and self.node_result[0] == node["host"]:
+            detail += f"\n{self.node_result[1]}"
+        self.node_feedback.set(detail)
+
+    def test_node(self) -> None:
+        self._node_action("测试连接", pool.probe)
+
+    def reconnect_node(self) -> None:
+        self._node_action("重连节点", pool.reconnect_node)
+
+    def _node_action(self, label, operation) -> None:
+        node = self.selected_node()
+        if self.node_operation or not node:
+            return
+        host = node["host"]
+        if self._submit(partial(operation, host), partial(self._show_node_result, host, label)):
+            self.node_operation = (host, label)
+            self.node_result = None
+            self.update_node_controls()
+
+    def _show_node_result(self, host: str, label: str, ok: bool, detail: str) -> None:
+        self.node_operation = None
+        message = f"{label}{'成功' if ok else '失败'}：{detail}"
+        self.node_result = (host, message)
+        print(f"[{host}] {message}")
+        self.update_node_controls()
 
     def clear_log(self) -> None:
         self.log.configure(state="normal")
@@ -435,10 +611,13 @@ class App:
         self.root.clipboard_append(text)
 
     def copy_url(self) -> None:
-        self._copy(f"http://127.0.0.1:{self.port}/mcp")
+        self._copy(self.url_var.get())
 
     def copy_claude_cmd(self) -> None:
-        self._copy(f"claude mcp add --transport http remote-linux http://127.0.0.1:{self.port}/mcp")
+        self._copy(f"claude mcp add --transport http --scope user remote-linux {self.url_var.get()}")
+
+    def copy_codex_cmd(self) -> None:
+        self._copy(f"codex mcp add remote-linux --url {self.url_var.get()}")
 
     def on_close(self) -> None:
         if self.closing:

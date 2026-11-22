@@ -107,6 +107,7 @@ class ConfigEditor(tk.Toplevel):
         tk.Button(left, text="＋ 新增跳板机", command=self.add_bastion).pack(fill="x", pady=(6, 0))
         tk.Button(left, text="－ 删除跳板机", command=self.delete_bastion).pack(fill="x", pady=(4, 0))
         tk.Button(left, text="＋ 新增节点", command=self.add_node).pack(fill="x", pady=(10, 0))
+        tk.Button(left, text="复制节点…", command=self.copy_node).pack(fill="x", pady=(4, 0))
         tk.Button(left, text="－ 删除节点", command=self.delete_node).pack(fill="x", pady=(4, 0))
 
         right = tk.Frame(self, padx=8, pady=8)
@@ -237,7 +238,7 @@ class ConfigEditor(tk.Toplevel):
             self.allowed_text.pack(anchor="w", pady=6)
             self.allowed_text.insert("1.0", "\n".join(self.cfg.get("hosts", {}).get("allowed", [])))
             self.allowed_text.edit_modified(False)
-            self.allowed_text.bind("<<Modified>>", lambda _e: setattr(self, "dirty", True))
+            self.allowed_text.bind("<<Modified>>", self.on_allowed_modified)
         elif kind == "bastion":
             bc = self.bastions[name]
             self.title_lbl.configure(text=f"跳板机：{name}（改动需重启服务）")
@@ -260,7 +261,11 @@ class ConfigEditor(tk.Toplevel):
         if kind == "sec" and name == SEC_DAEMON and not self.bastions:
             tk.Label(self.form, fg="gray", anchor="w",
                      text="当前没有跳板机：所有节点都必须是 direct。点左下“＋ 新增跳板机”添加。").pack(fill="x", pady=6)
-        self.dirty = False
+
+    def on_allowed_modified(self, event) -> None:
+        if event.widget.edit_modified():
+            self.dirty = True
+            event.widget.edit_modified(False)
 
     def layout_node_rows(self) -> None:
         via = self.vars["via"].get() or "bastion"
@@ -412,6 +417,28 @@ class ConfigEditor(tk.Toplevel):
         self.select(("node", name))
         self.dirty = True
 
+    def copy_node(self) -> None:
+        if not self.current or self.current[0] != "node":
+            messagebox.showinfo("复制节点", "请先在左侧选中一个节点", parent=self)
+            return
+        if not self.commit():
+            return
+        source = self.current[1]
+        hosts = self.cfg["host"]
+        base = f"{source}-copy"
+        name = base
+        i = 2
+        while name in hosts:
+            name = f"{base}-{i}"
+            i += 1
+        hosts[name] = copy.deepcopy(hosts[source])
+        self.refresh_list()
+        self.select(("node", name))
+        self.dirty = True
+        name_entry = self.ctrls["__name"][1][0]
+        name_entry.focus_set()
+        name_entry.selection_range(0, "end")
+
     def delete_node(self) -> None:
         if not self.current or self.current[0] != "node":
             messagebox.showinfo("删除节点", "请先在左侧选中一个节点", parent=self)
@@ -451,10 +478,11 @@ class ConfigEditor(tk.Toplevel):
             messagebox.showerror("保存失败", str(e), parent=self)
             return False
         self.refresh_list()
-        self.select(self.current)  # redraw from the saved data; clears dirty
+        self.select(self.current)
+        self.dirty = False
         print("config.toml 已保存" + ("".join("\n" + w for w in warnings)))
         if self.on_saved:
-            self.on_saved(cfg)
+            self.on_saved(copy.deepcopy(cfg))
         messagebox.showinfo("已保存", "配置已保存。" + ("\n\n" + "\n".join(warnings) if warnings else ""),
                             parent=self)
         return True

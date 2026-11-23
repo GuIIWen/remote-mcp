@@ -101,7 +101,7 @@ class AuthRecoveryTests(unittest.TestCase):
                 else:
                     ui.root.deiconify.assert_called_once()
                     ui.tray.notify.assert_not_called()
-                self.assertEqual(dialog.call_count, int(not in_tray and bastion is None))
+                self.assertEqual(dialog.call_count, int(not in_tray))
 
     def test_live_outage_replaces_past_recovery_message(self):
         conn = object()

@@ -276,7 +276,7 @@ class App:
         self.tree.column("via", width=55, minwidth=40, stretch=False)
         self.tree.column("state", width=150, minwidth=80)
         self.tree.tag_configure("connected", foreground="#1a7f37")
-        self.tree.tag_configure("via-bastion", foreground="#6e7781")
+        self.tree.tag_configure("via-bastion", foreground="#1a7f37")
         self.tree.tag_configure("idle", foreground="#6e7781")
         self.tree.tag_configure("offline", foreground="#cf222e")
         self.tree.pack(fill="both", expand=True)
@@ -477,8 +477,7 @@ class App:
         if self.root.state() == "iconic":
             self.root.deiconify()
             self.root.lift()
-        if request.bastion is None:
-            self.open_auth_dialog()
+        self.open_auth_dialog()
 
     def clear_pending_auth(self, request: _AuthRequest) -> None:
         if request.dialog:
@@ -819,6 +818,7 @@ class App:
         self.in_tray = False
         self.root.deiconify()
         self.root.lift()
+        self.open_auth_dialog()  # a prompt that arrived while hidden in the tray
 
     def stop_from_tray(self) -> None:
         if self.service_state in ("starting", "running"):

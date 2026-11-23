@@ -1169,6 +1169,25 @@ class InteractiveNodesAreSerialTests(PoolTestCase):
         self.assertEqual(active["max_pw"], 1)   # one dialog / one timeout clock at a time
         self.assertGreater(active["max_key"], 1)  # the rest still run concurrently
 
+    async def test_direct_nodes_do_not_queue_behind_bastion_nodes(self):
+        pool.cfg = {"bastion": {"host": "b", "user": "u"},
+                    "host": {"b1": {}, "b2": {}, "d": {"via": "direct", "address": "x"}}}
+        started = []
+        gate = asyncio.Event()
+
+        async def fake_probe(host, timeout=15):
+            started.append(host)
+            if host != "d":
+                await gate.wait()
+            return True, "0s"
+
+        with mock.patch.object(pool, "probe", fake_probe), capture():
+            task = asyncio.create_task(pool.connect_nodes(["b1", "b2", "d"], concurrency=1))
+            await asyncio.sleep(0.05)
+            self.assertIn("d", started)  # not stuck behind b1 holding the only slot
+            gate.set()
+            await task
+
     async def test_bastion_login_gives_up_once_the_prompt_was_dismissed(self):
         import daemon
         pool.cfg = {"bastion": {"host": "b", "user": "u"}}

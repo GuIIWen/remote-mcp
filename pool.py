@@ -1505,7 +1505,11 @@ async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
     hosts_cfg = cfg.get("host", {})
     asking = [h for h in hosts if _uses_password(hosts_cfg.get(h, {}))]
     rest = [h for h in hosts if h not in asking]
-    await asyncio.gather(*(limited(h) for h in rest), interactive(asking), return_exceptions=True)
+    # Direct nodes don't load any bastion, so they skip the shared limit
+    # instead of queueing behind slow bastion/hop nodes (~15s each).
+    direct = [h for h in rest if _route(h) == "direct"]
+    await asyncio.gather(*(one(h) for h in direct), *(limited(h) for h in rest if h not in direct),
+                         interactive(asking), return_exceptions=True)
 
 
 async def reconnect_all() -> None:

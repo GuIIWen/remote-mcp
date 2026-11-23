@@ -37,6 +37,8 @@ NODE_FIELDS = [
      "bastion=经跳板机；hop=跳板机代 ssh 到该节点；direct=本机直连"),
     ("bastion", "所属跳板机", "bastion",
      "bastion / hop 节点走哪台跳板机；有多台时必填，只有一台可留空"),
+    ("access", "AI 权限", "choice:仅查看,允许执行和写入",
+     "仅查看允许读文件和搜索；执行命令与修改文件需要完整权限"),
     ("user", "用户名", "str", "目标机登录用户名"),
     ("address", "地址", "str", "direct 必填；bastion 节点可选：跳板机解析不了节点名时填 IP / 域名"),
     ("port", "端口", "int", "目标机 SSH 端口（direct / bastion），hop：跳板机 ssh 的 -p"),
@@ -59,6 +61,7 @@ VIA_HINTS = {
 }
 
 SEC_DAEMON, SEC_HOSTS = "daemon", "hosts"
+ACCESS_LABELS = {"read_only": "仅查看", "full": "允许执行和写入"}
 
 
 def _parse(kind: str, text: str, label: str):
@@ -83,7 +86,7 @@ class ConfigEditor(tk.Toplevel):
     def __init__(self, master, on_saved=None):
         super().__init__(master)
         self.title("配置编辑")
-        self.geometry("900x580")
+        self.geometry("900x630")
         self.transient(master)
         self.on_saved = on_saved
         self.cfg = copy.deepcopy(config_io.load())
@@ -224,9 +227,14 @@ class ConfigEditor(tk.Toplevel):
             hc = self.cfg["host"][name]
             self.title_lbl.configure(text=f"节点：{name}")
             self.add_row("__name", "节点名", "str", "MCP 里使用的名字，也是白名单匹配的名字", name)
+            defaults = {"via": "bastion", "auth": "key", "access": "full"}
             for key, label, k, hint in NODE_FIELDS:
-                self.add_row(key, label, k, hint, hc.get(key, "bastion" if key == "via"
-                                                         else "key" if key == "auth" else ""))
+                value = hc.get(key, defaults.get(key, ""))
+                if key == "access":
+                    value = ACCESS_LABELS.get(value, "") if isinstance(value, str) else ""
+                    if not value:
+                        hint = "权限值无效，请重新选择。 " + hint
+                self.add_row(key, label, k, hint, value)
             self.via_hint = tk.Label(self.form, fg="#9a6700", anchor="w", justify="left", wraplength=560)
             self.layout_node_rows()
         elif name == SEC_HOSTS:
@@ -352,7 +360,12 @@ class ConfigEditor(tk.Toplevel):
         hc = dict(self.cfg["host"][old])
         for key, label, kind, _ in NODE_FIELDS:
             text = self.vars[key].get().strip()
-            if text == "":
+            if key == "access":
+                modes = {name: mode for mode, name in ACCESS_LABELS.items()}
+                if text not in modes:
+                    raise ValueError("请选择节点的 AI 权限")
+                hc[key] = modes[text]
+            elif text == "":
                 hc.pop(key, None)
             else:
                 hc[key] = _parse(kind, text, label)
@@ -409,7 +422,7 @@ class ConfigEditor(tk.Toplevel):
         while f"node{i}" in self.cfg["host"]:
             i += 1
         name = f"node{i}"
-        self.cfg["host"][name] = {}
+        self.cfg["host"][name] = {"access": "read_only"}
         allowed = self.cfg.get("hosts", {}).get("allowed")
         if allowed is not None:
             allowed.append(name)  # keep the new node reachable under an explicit whitelist

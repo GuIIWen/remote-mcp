@@ -1,10 +1,17 @@
+import asyncio
 import base64
+import contextvars
 import json
 import posixpath
 import re
 import shlex
 import stat
 import time
+from collections import deque
+from functools import wraps
+from itertools import count
+from threading import Lock
+from uuid import uuid4
 
 import asyncssh
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +23,10 @@ mcp = FastMCP("remote-linux")
 MAX_OUT = 30_000
 MAX_GLOB_RESULTS = 200
 AUDIT_LOG: str = ""
+_activity = deque(maxlen=30)
+_activity_ids = count(1)
+_activity_lock = Lock()
+_tool_status = contextvars.ContextVar("tool_status", default="进行中")
 
 _TILDE_USER_RE = re.compile(r"^~([A-Za-z0-9_.\-]*)$")
 _TILDE_PREFIX_RE = re.compile(r"^~([A-Za-z0-9_.\-]*)/")
@@ -28,6 +39,40 @@ class _RemoteFileNotFound(Exception):
 
 class _OldStrNotFound(Exception):
     pass
+
+
+def recent_activity() -> list[dict]:
+    with _activity_lock:
+        return [dict(row) for row in reversed(_activity)]
+
+
+def _node_tool(*, write: bool = False):
+    """Apply one access rule and record the result at the MCP entry point."""
+    def decorate(func):
+        @wraps(func)
+        async def invoke(host, *args, **kwargs):
+            row = {"id": next(_activity_ids), "host": host, "action": func.__name__,
+                   "time": time.time(), "status": "进行中"}
+            with _activity_lock:
+                _activity.append(row)
+            token = _tool_status.set("进行中")
+            try:
+                with pool.node_request(host, write=write):
+                    return await func(host, *args, **kwargs)
+            except pool.NodeAccessDenied as exc:
+                return _fmt_error(exc, brief=True)
+            except asyncio.CancelledError:
+                _tool_status.set("结果未知" if write else "已取消")
+                raise
+            except Exception as exc:
+                return _fmt_error(exc)
+            finally:
+                status = _tool_status.get()
+                with _activity_lock:
+                    row["status"] = "成功" if status == "进行中" else status
+                _tool_status.reset(token)
+        return invoke
+    return decorate
 
 
 def _trunc(s: str) -> str:
@@ -63,10 +108,20 @@ def _fmt_error(e: Exception, *, brief: bool = False) -> str:
     the existing plain `error: {e}` style used for ValueError (validation
     errors, which never come from asyncssh and don't need the type name)."""
     msg = f"error: {e}" if brief else f"error: {type(e).__name__}: {e}"
+    if isinstance(e, pool.RemoteResultUnknown):
+        _tool_status.set("结果未知")
+    elif isinstance(e, pool.NodeAccessDenied):
+        _tool_status.set("拒绝")
+    elif isinstance(e, (pool.RemoteTimeout, TimeoutError)):
+        _tool_status.set("超时")
+    else:
+        _tool_status.set("失败")
     return _scrub(msg)
 
 
 def _fmt(r: asyncssh.SSHCompletedProcess) -> str:
+    if r.returncode != 0:
+        _tool_status.set(f"失败（退出码 {r.returncode}）")
     parts = [f"exit_code: {r.returncode}"]
     if r.stdout:
         parts.append(f"stdout:\n{_trunc(r.stdout)}")
@@ -197,25 +252,34 @@ async def _sftp_real_path(sftp, path: str) -> str:
     return path
 
 
-async def _atomic_write(sftp, path: str, content: str) -> None:
-    tmp = path + ".mcp.tmp"
-    try:
+async def _atomic_write(sftp, host: str, path: str, content: str, mode: int | None = None) -> None:
+    if mode is None:
         try:
             attrs = await sftp.stat(path)
-            file_mode = stat.S_IMODE(attrs.permissions)
+            mode = stat.S_IMODE(attrs.permissions)
         except asyncssh.SFTPNoSuchFile:
-            file_mode = 0o644
+            mode = 0o644
 
-        async with sftp.open(tmp, "w") as f:
+    tmp = posixpath.join(posixpath.dirname(path), f".mcp-{uuid4().hex}.tmp")
+    created = False
+    try:
+        pool.check_node_request(host)
+        async with sftp.open(tmp, "x") as f:
+            created = True
+            pool.check_node_request(host)
             await f.write(content)
 
-        await sftp.chmod(tmp, file_mode)
+        pool.check_node_request(host)
+        await sftp.chmod(tmp, mode)
+        pool.check_node_request(host)
         await sftp.posix_rename(tmp, path)
-    except Exception:
-        try:
-            await sftp.remove(tmp)
-        except Exception:
-            pass
+    except (Exception, asyncio.CancelledError):
+        # A revoked request may clean up only the temporary file it created.
+        if created:
+            try:
+                await sftp.remove(tmp)
+            except (Exception, asyncio.CancelledError):
+                pass
         raise
 
 
@@ -330,11 +394,13 @@ async def list_hosts() -> str:
             route_desc = "bastion" + (f" {bname}" if bname and len(bs) > 1 else "")
             auth = hc.get("auth", "key")
             state = "connected" if not pool._is_closed(pool._target_conns.get(host)) else "disconnected"
-        lines.append(f"  {host}: {route_desc}, auth={auth}, {state}")
+        access = hc.get("access", "full") if pool._allowed(host) else "denied"
+        lines.append(f"  {host}: {route_desc}, auth={auth}, {state}, access={access}")
     return "\n".join(lines)
 
 
 @mcp.tool()
+@_node_tool(write=True)
 async def exec(host: str, command: str, cwd: str = "", timeout: int = 60) -> str:
     """Execute a shell command on the remote host. A relative `cwd` resolves
     against the host's default_cwd (same as glob_files' `base`), not the
@@ -355,10 +421,15 @@ async def exec(host: str, command: str, cwd: str = "", timeout: int = 60) -> str
 
 
 @mcp.tool()
+@_node_tool()
 async def read_file(host: str, path: str, offset: int = 1, limit: int = 2000) -> str:
     """Read a file with line numbers, starting at offset, up to limit lines."""
     end = offset + limit
-    quoted = _quote_cd_path(path)  # path itself may start with ~
+    # awk treats bare relative names like "a=b" as assignments and leading
+    # dashes as options. Prefix relative paths so they are always filenames.
+    if not (path.startswith("/") or _TILDE_USER_RE.match(path) or _TILDE_PREFIX_RE.match(path)):
+        path = "./" + path
+    quoted = _quote_cd_path(path)
     cmd = (
         _cd_prefix(_host_default_cwd(host))
         + f"awk 'NR>={end}{{exit}} NR>={offset}{{printf \"%6d\\t%s\\n\", NR, $0}}' {quoted}"
@@ -375,6 +446,7 @@ async def read_file(host: str, path: str, offset: int = 1, limit: int = 2000) ->
 
 
 @mcp.tool()
+@_node_tool(write=True)
 async def write_file(host: str, path: str, content: str) -> str:
     """Overwrite a remote file atomically (via SFTP, or via the bastion for
     a hop-routed host, which has no SFTP session of its own)."""
@@ -383,7 +455,7 @@ async def write_file(host: str, path: str, content: str) -> str:
     async def _do(sftp):
         abs_path = await _sftp_resolve_path(sftp, host, path)
         real_path = await _sftp_real_path(sftp, abs_path)
-        await _atomic_write(sftp, real_path, content)
+        await _atomic_write(sftp, host, real_path, content)
 
     try:
         if pool._route(host) == "hop":
@@ -399,6 +471,7 @@ async def write_file(host: str, path: str, content: str) -> str:
 
 
 @mcp.tool()
+@_node_tool(write=True)
 async def edit_file(
     host: str,
     path: str,
@@ -408,16 +481,10 @@ async def edit_file(
 ) -> str:
     """Replace old_str with new_str in a remote file atomically."""
     if old_str == "":
-        return "error: old_str must not be empty"
+        return _fmt_error(ValueError("old_str must not be empty"), brief=True)
     _audit(host, "edit_file", path)
 
     if pool._route(host) == "hop":
-        # Two independently-retried pool.run() calls (read, then write)
-        # rather than one compound with_sftp closure, so this doesn't need
-        # the "count" in result idempotency guard below: each call's own
-        # reconnect-and-retry-once logic is already safe on its own, and
-        # there's no single retried unit that could re-apply a successful
-        # write.
         try:
             original, file_mode = await _hop_read_raw(host, path)
             count = original.count(old_str)
@@ -432,9 +499,9 @@ async def edit_file(
         except ValueError as e:
             return _fmt_error(e, brief=True)
         except _RemoteFileNotFound:
-            return f"error: file not found: {path}"
+            return _fmt_error(ValueError(f"file not found: {path}"), brief=True)
         except _OldStrNotFound:
-            return f"error: old_str not found in {path}"
+            return _fmt_error(ValueError(f"old_str not found in {path}"), brief=True)
         except Exception as e:
             return _fmt_error(e)
         replacements = count if replace_all else 1
@@ -443,13 +510,6 @@ async def edit_file(
     result: dict = {}
 
     async def _do(sftp):
-        if "count" in result:
-            # A previous attempt already renamed the tmp file into place, but
-            # the connection dropped before that success made it back to
-            # pool.with_sftp's caller, triggering a retry. old_str is gone
-            # from the file now, so re-running the edit would wrongly report
-            # "not found" — just confirm success without touching the file.
-            return
         abs_path = await _sftp_resolve_path(sftp, host, path)
         real_path = await _sftp_real_path(sftp, abs_path)
         try:
@@ -471,19 +531,7 @@ async def edit_file(
                 f"old_str appears {count} times; set replace_all=true or provide more context"
             )
 
-        updated = original.replace(old_str, new_str)
-        tmp = real_path + ".mcp.tmp"
-        try:
-            async with sftp.open(tmp, "w") as f:
-                await f.write(updated)
-            await sftp.chmod(tmp, file_mode)
-            await sftp.posix_rename(tmp, real_path)
-        except Exception:
-            try:
-                await sftp.remove(tmp)
-            except Exception:
-                pass
-            raise
+        await _atomic_write(sftp, host, real_path, original.replace(old_str, new_str), mode=file_mode)
         result["count"] = count
 
     try:
@@ -491,9 +539,9 @@ async def edit_file(
     except ValueError as e:
         return _fmt_error(e, brief=True)
     except _RemoteFileNotFound:
-        return f"error: file not found: {path}"
+        return _fmt_error(ValueError(f"file not found: {path}"), brief=True)
     except _OldStrNotFound:
-        return f"error: old_str not found in {path}"
+        return _fmt_error(ValueError(f"old_str not found in {path}"), brief=True)
     except Exception as e:
         return _fmt_error(e)
 
@@ -502,6 +550,7 @@ async def edit_file(
 
 
 @mcp.tool()
+@_node_tool()
 async def grep(
     host: str,
     pattern: str,
@@ -513,7 +562,7 @@ async def grep(
     q_pattern = shlex.quote(pattern)
     q_path = _quote_cd_path(path)  # path may itself start with ~
 
-    rg_glob = f"--glob {shlex.quote(glob)}" if glob else ""
+    rg_glob = f"--glob={shlex.quote(glob)}" if glob else ""
     rg_ctx = f"-C {context}" if context else ""
     grep_include = f"--include={shlex.quote(glob)}" if glob else ""
     grep_ctx = f"-C {context}" if context else ""
@@ -521,9 +570,9 @@ async def grep(
     cmd = (
         _cd_prefix(_host_default_cwd(host))
         + f"if command -v rg >/dev/null 2>&1; then "
-        f"rg -n {rg_ctx} {rg_glob} -e {q_pattern} {q_path}; "
+        f"rg -n {rg_ctx} {rg_glob} --regexp={q_pattern} -- {q_path}; "
         f"else "
-        f"grep -rnE {grep_ctx} {grep_include} --exclude-dir=.git -e {q_pattern} {q_path}; "
+        f"grep -rnE {grep_ctx} {grep_include} --exclude-dir=.git --regexp={q_pattern} -- {q_path}; "
         f"fi"
     )
     try:
@@ -538,6 +587,7 @@ async def grep(
 
 
 @mcp.tool()
+@_node_tool()
 async def glob_files(host: str, pattern: str, base: str = ".") -> str:
     """Find files matching a glob pattern on the remote host, rooted at
     `base` (`**` matches zero or more directories). `base` resolves the same
@@ -562,6 +612,8 @@ async def glob_files(host: str, pattern: str, base: str = ".") -> str:
         return _fmt_error(e, brief=True)
     except Exception as e:
         return _fmt_error(e)
+    if r.returncode != 0:
+        return _fmt(r)
 
     # find printed "./foo/bar" (relative to base); strip the "./" so the
     # result reads like an ordinary relative path under base.

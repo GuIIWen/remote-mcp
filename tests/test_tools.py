@@ -2,9 +2,12 @@
 log, and list_hosts following reload_config. No real SSH: tool operations
 and background connections are mocked. Run from the repo root:
 python -m unittest tests.test_tools -v"""
+import asyncio
+import contextlib
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import asyncssh
@@ -160,6 +163,93 @@ class AuditTests(ToolsTestCase):
         text = self.audit_text()
         self.assertIn("notes.txt", text)
         self.assertNotIn(PW, text)
+
+
+class NodeAccessTests(ToolsTestCase):
+    async def test_read_only_all_routes_and_reload(self):
+        nodes = {route: {"via": route, "address": "node.invalid", "access": "read_only"}
+                 for route in ("direct", "bastion", "hop")}
+        pool.cfg = _cfg(**nodes)
+        expected = SimpleNamespace(returncode=0, stdout="data", stderr="")
+        with mock.patch.object(pool, "run", mock.AsyncMock(return_value=expected)) as run, \
+                mock.patch.object(pool, "with_sftp", mock.AsyncMock()) as sftp:
+            for route in nodes:
+                self.assertEqual(await tools.read_file(route, "log"), "data")
+                self.assertIn("read-only", await tools.exec(route, "true"))
+                self.assertIn("read-only", await tools.write_file(route, "log", "changed"))
+                self.assertIn("read-only", await tools.edit_file(route, "log", "data", "changed"))
+            for call in run.await_args_list:
+                self.assertIn("awk", call.args[1])
+            sftp.assert_not_awaited()
+            self.assertEqual(run.await_count, 3)
+
+            nodes["hop"] = {**nodes["hop"], "access": "full"}
+            pool.apply_config(_cfg(**nodes))
+            self.assertIn("exit_code: 0", await tools.exec("hop", "true"))
+            pool.apply_config(_cfg(**nodes) | {"hosts": {"allowed": ["direct", "bastion"]}})
+            self.assertIn("allowed list", await tools.exec("hop", "true"))
+            self.assertIn("not configured", await tools.exec("unknown", "true"))
+            self.assertEqual(run.await_count, 4)
+
+    async def test_activity_records_unknown_outcome_without_command_arguments(self):
+        pool.cfg = _cfg(lab4=_lab4())
+        with mock.patch.object(pool, "run", mock.AsyncMock(side_effect=pool.RemoteResultUnknown())):
+            response = await tools.exec("lab4", "private command arguments")
+        self.assertIn("remote result unknown", response)
+        row = tools.recent_activity()[0]
+        self.assertEqual((row["host"], row["action"], row["status"]), ("lab4", "exec", "结果未知"))
+        self.assertNotIn("private command arguments", str(row))
+
+    async def test_sftp_rechecks_before_rename_and_cleans_its_temporary_file(self):
+        for operation, args, cancel in (
+            (tools.write_file, ("after",), False),
+            (tools.edit_file, ("before", "after"), False),
+            (tools.write_file, ("after",), True),
+        ):
+            with self.subTest(operation=operation.__name__, cancel=cancel):
+                pool.cfg = _cfg(revision=_lab4())
+                at_chmod, release = asyncio.Event(), asyncio.Event()
+                attrs = SimpleNamespace(permissions=0o100644)
+                remote = mock.Mock()
+                remote.lstat = mock.AsyncMock(return_value=attrs)
+                remote.stat = mock.AsyncMock(return_value=attrs)
+                remote.remove = mock.AsyncMock()
+                remote.posix_rename = mock.AsyncMock()
+                fh = SimpleNamespace(write=mock.AsyncMock(), read=mock.AsyncMock(return_value="before"))
+                temp = []
+
+                @contextlib.asynccontextmanager
+                async def open_file(path, mode):
+                    if mode == "x":
+                        temp.append(path)
+                    yield fh
+
+                async def chmod(_path, _mode):
+                    at_chmod.set()
+                    await release.wait()
+
+                @contextlib.asynccontextmanager
+                async def start_sftp():
+                    yield remote
+
+                remote.open = open_file
+                remote.chmod = chmod
+                conn = mock.Mock(start_sftp_client=start_sftp)
+                with mock.patch.object(pool, "get_target", return_value=conn):
+                    pending = asyncio.create_task(operation("revision", "/sample", *args))
+                    await asyncio.wait_for(at_chmod.wait(), 2)
+                    if cancel:
+                        pending.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await pending
+                    else:
+                        pool.apply_config(_cfg(revision=_lab4(access="read_only")))
+                        release.set()
+                        self.assertIn("read-only", await pending)
+                self.assertEqual(len(temp), 1)
+                self.assertNotEqual(temp[0], "/sample")
+                remote.posix_rename.assert_not_awaited()
+                remote.remove.assert_awaited_once_with(temp[0])
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ allowed = ["dev1", "dev2", "nmz01", "nmz01-ctr", "lab3", "lab4"]
 
 # ── 经跳板机的节点（via 默认就是 bastion）：本机私钥 + 跳板机隧道 ──────────
 [host.dev1]
+# access = "read_only"  # 仅允许读文件和搜索；缺省 full 保留执行和写入权限
 user        = "yourname"
 default_cwd = "/home/yourname"
 # bastion = "a"        # 多台跳板机时必填

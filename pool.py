@@ -1,12 +1,15 @@
 import asyncio
 import contextlib
+import contextvars
 import fnmatch
 import getpass
 import re
 import shlex
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -49,6 +52,18 @@ _target_conns: dict[str, asyncssh.SSHClientConnection] = {}
 _sems: dict[str, asyncio.Semaphore] = {}
 _host_locks: dict[str, asyncio.Lock] = {}
 cfg: dict = {}
+_node_revisions: dict[str, int] = {}
+_next_node_revision = count(1)
+
+
+@dataclass(frozen=True)
+class _NodeRequest:
+    host: str
+    revision: int
+    write: bool
+
+
+_node_request: contextvars.ContextVar[_NodeRequest | None] = contextvars.ContextVar("node_request", default=None)
 
 DEFAULT_BASTION = "default"
 
@@ -210,6 +225,8 @@ def validate_config(cfg: dict) -> tuple[list[str], list[str]]:
         errors.append(f"[daemon] heartbeat_interval 必须是 >= 0 的数字，当前是 {v!r}")
     for host, hc in cfg.get("host", {}).items():
         via = hc.get("via", "bastion")
+        if hc.get("access", "full") not in ("read_only", "full"):
+            errors.append(f"[host.{host}] access 必须是 read_only 或 full")
         if via in ("bastion", "hop") and bs:
             bn = hc.get("bastion")
             if bn is not None and not isinstance(bn, str):
@@ -288,12 +305,19 @@ class RemoteTimeout(RuntimeError):
         super().__init__(f"command timed out after {timeout}s; the remote process was terminated")
 
 
-class HopSSHError(RuntimeError):
-    """Raised when the `ssh` client running on the bastion exits 255 — ssh's
-    own "the connection never got as far as running the command" code
-    (host key changed, permission denied, unresolvable host, ...). The
-    message carries ssh's stderr verbatim so the tool output actually names
-    the cause instead of just showing exit_code: 255."""
+class RemoteResultUnknown(RuntimeError):
+    """A request may have reached the target without returning a result."""
+
+    def __init__(self, detail: str = "the SSH channel was lost"):
+        super().__init__(f"remote result unknown ({detail}); check the target before retrying")
+
+
+class HopSSHError(RemoteResultUnknown):
+    """Exit code 255 from the nested SSH session does not confirm execution."""
+
+
+class NodeAccessDenied(ValueError):
+    """The current configuration does not permit submitting this request."""
 
 
 def _host_lock(host: str) -> asyncio.Lock:
@@ -602,6 +626,7 @@ def is_password_prompt(prompt: str) -> bool:
 # None = ask in the terminal (daemon.py CLI). The GUI (app.py) installs an
 # async handler `(prompt, echo) -> str` that shows a dialog instead.
 prompt_handler = None
+auth_bastion = contextvars.ContextVar("auth_bastion", default=None)
 
 
 async def ask(prompt: str, echo: bool) -> str | None:
@@ -626,24 +651,35 @@ class _InteractiveAuth:
 
     _ia_enabled = True
 
-    def _ia_init(self, secret_key: str, tag: str, label: str) -> None:
+    def _ia_init(
+        self, secret_key: str, tag: str, label: str, *,
+        bastion: str | None = None, revision: int | None = None,
+    ) -> None:
         self._ia_secret_key = secret_key  # _passwords key of the saved password
         self._ia_tag = tag  # prefix of every prompt, names who is asking
         self._ia_label = label  # shown in "(using [label] password from config)"
+        self._ia_bastion = bastion
+        self._ia_revision = revision
         # The saved password is offered at most once per connection: if the
         # server asks again it was rejected, and resending it would only burn
         # attempts toward a lockout — the user is asked instead.
         self._password_sent = False
 
+    def _auth_is_current(self) -> bool:
+        if self._ia_revision is None:
+            return True  # Bastion settings are held fixed until restart.
+        host = self._ia_secret_key
+        return self._ia_revision == _node_revisions.get(host, 0) and _allowed(host)
+
     def kbdint_auth_requested(self) -> str | None:
         # asyncssh only attempts keyboard-interactive auth (needed for TOTP)
         # when this returns a string instead of the default None; an empty
         # string lets the server pick the submethod.
-        return "" if self._ia_enabled else None
+        return "" if self._ia_enabled and self._auth_is_current() else None
 
     def _take_config_password(self) -> str | None:
         """Return the saved password at most once per connection."""
-        if self._password_sent:
+        if self._password_sent or not self._auth_is_current():
             return None
         saved = _passwords.get(self._ia_secret_key)
         if not saved:
@@ -668,7 +704,7 @@ class _InteractiveAuth:
         instructions: str,
         lang: str,
         prompts: list[tuple[str, bool]],
-    ) -> list[str]:
+    ) -> list[str] | None:
         # Each prompt is answered on its own, in the order the server sends
         # them, so "code then password" and "password then code" (in one
         # challenge or across several) both work: a password-looking prompt
@@ -678,6 +714,8 @@ class _InteractiveAuth:
         tag = self._ia_tag
         responses = []
         for prompt, echo in prompts:
+            if not self._auth_is_current():
+                return None
             if is_password_prompt(prompt):
                 saved = self._take_config_password()
             else:
@@ -688,7 +726,13 @@ class _InteractiveAuth:
             elif prompt_cooling(self._ia_secret_key):
                 answer = ""  # dismissed recently: fail fast, don't pop up again
             else:
-                answer = await ask(tag + prompt, echo)
+                token = auth_bastion.set(self._ia_bastion)
+                try:
+                    answer = await ask(tag + prompt, echo)
+                finally:
+                    auth_bastion.reset(token)
+                if not self._auth_is_current():
+                    return None
                 if answer is None:
                     _prompt_cooldown[self._ia_secret_key] = time.monotonic() + PROMPT_COOLDOWN
                     _log(
@@ -708,7 +752,7 @@ class _BastionClient(_InteractiveAuth, _TrackedClient):
         self._name = name
         self._label = _blabel(name)
         # With several bastions the dialog must say which one is asking.
-        self._ia_init(_bpw_key(name), "" if name == DEFAULT_BASTION else f"[{name}] ", _blabel(name))
+        self._ia_init(_bpw_key(name), "" if name == DEFAULT_BASTION else f"[{name}] ", _blabel(name), bastion=name)
 
     def auth_banner_received(self, msg: str, lang: str) -> None:
         print(msg, end="", flush=True)
@@ -721,7 +765,7 @@ class _BastionClient(_InteractiveAuth, _TrackedClient):
         # only clear the pool entry if it's still this client's connection.
         if _bastion_conns.get(self._name) is self._conn:
             _bastion_conns.pop(self._name, None)
-            _log(f"[{_blabel(self._name)}] next call will require a new verification code (TOTP) in this terminal")
+            _log(f"[{_blabel(self._name)}] next connection may require a verification code (TOTP)")
             # Only targets tunneled through THIS bastion are dropped — direct
             # nodes have their own socket, and other bastions are unaffected.
             for h in [h for h in _target_conns
@@ -730,14 +774,16 @@ class _BastionClient(_InteractiveAuth, _TrackedClient):
 
 
 class _TargetClient(_InteractiveAuth, _TrackedClient):
-    def __init__(self, host: str, interactive: bool = False):
+    def __init__(self, host: str, interactive: bool = False, *, revision: int | None = None):
         super().__init__()
         self._host = host
         self._label = f"target {host}"
         # auth = "password" nodes answer password prompts from the saved
         # password and ask for anything else (e.g. a verification code).
         self._ia_enabled = interactive
-        self._ia_init(host, f"[{host}] ", f"target {host}")
+        if revision is None:
+            revision = _node_revisions.get(host, 0)
+        self._ia_init(host, f"[{host}] ", f"target {host}", revision=revision)
 
     def auth_banner_received(self, msg: str, lang: str) -> None:
         if self._ia_enabled:
@@ -749,11 +795,51 @@ class _TargetClient(_InteractiveAuth, _TrackedClient):
             _target_conns.pop(self._host, None)
 
 
-def _allowed(host: str) -> bool:
-    patterns: list[str] = cfg.get("hosts", {}).get("allowed", [])
+def _allowed(host: str, config: dict | None = None) -> bool:
+    config = cfg if config is None else config
+    patterns: list[str] = config.get("hosts", {}).get("allowed", [])
     if not patterns:
         return True
     return any(fnmatch.fnmatch(host, p) for p in patterns)
+
+
+def require_node_access(host: str, *, write: bool = False) -> None:
+    """Authorize MCP access before resolving a route or opening a connection."""
+    hc = cfg.get("host", {}).get(host)
+    if hc is None:
+        raise NodeAccessDenied(f"Host {host!r} is not configured under [host.{host}]")
+    if not _allowed(host):
+        raise NodeAccessDenied(f"Host {host!r} is not in the allowed list")
+    if write and hc.get("access", "full") != "full":
+        raise NodeAccessDenied(f"Host {host!r} is read-only; shell execution and writes require full access")
+
+
+@contextlib.contextmanager
+def node_request(host: str, *, write: bool = False):
+    """Pin an MCP request to the node it was authorized to operate on."""
+    require_node_access(host, write=write)
+    token = _node_request.set(_NodeRequest(host, _node_revisions.get(host, 0), write))
+    try:
+        yield
+    finally:
+        _node_request.reset(token)
+
+
+def check_node_request(host: str, revision: int | None = None) -> int:
+    """Recheck authorization and configuration before handing work to SSH."""
+    current = _node_revisions.get(host, 0)
+    request = _node_request.get()
+    if request is not None:
+        if request.host != host:
+            raise NodeAccessDenied("Request target differs from the authorized node")
+        require_node_access(host, write=request.write)
+        if request.revision != current:
+            raise NodeAccessDenied(f"Host {host!r} configuration changed; submit the request again")
+    elif not _allowed(host):
+        raise NodeAccessDenied(f"Host {host!r} is not in the allowed list")
+    if revision is not None and revision != current:
+        raise NodeAccessDenied(f"Host {host!r} configuration changed; submit the request again")
+    return current
 
 
 async def _connect_bastion(name: str | None = None) -> asyncssh.SSHClientConnection:
@@ -826,11 +912,15 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
     """Pooled connection to a target. Failures are logged here (the tool
     call only returns the error to the MCP client, so without this the
     daemon window / app.log would show nothing about why a node is down)."""
+    revision = check_node_request(host)
     try:
         conn = await _get_target(host)
         _last_error.pop(host, None)
         return conn
+    except NodeAccessDenied:
+        raise
     except Exception as e:
+        check_node_request(host, revision)
         _last_error[host] = f"{type(e).__name__}: {e}"
         _log(f"[target {host}] connect failed: {_fmt_exc(e)}")
         hc = cfg.get("host", {}).get(host, {})
@@ -857,8 +947,7 @@ async def get_target(host: str) -> asyncssh.SSHClientConnection:
 
 
 async def _get_target(host: str) -> asyncssh.SSHClientConnection:
-    if not _allowed(host):
-        raise ValueError(f"Host '{host}' is not in the allowed list")
+    revision = check_node_request(host)
     if _route(host) == "hop":
         # A hop-routed host has no connection of its own — every access
         # goes through run()'s hop branch (ssh run on the bastion
@@ -872,13 +961,15 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
             f"[host.{host}] via=\"hop\" has no direct connection; "
             "use pool.run() (or a hop-aware file helper), not get_target()/with_sftp()"
         )
-    if host in _auth_blocked:
-        raise asyncssh.PermissionDenied(_auth_blocked[host])
-
     async with _host_lock(host):
+        check_node_request(host, revision)
+        if host in _auth_blocked:
+            raise asyncssh.PermissionDenied(_auth_blocked[host])
         conn = _target_conns.get(host)
         if conn is not None:
-            if await _idle_probe_ok(conn, f"target {host}"):
+            healthy = await _idle_probe_ok(conn, f"target {host}")
+            check_node_request(host, revision)
+            if healthy and _target_conns.get(host) is conn:
                 return conn
             _invalidate_target(host)
 
@@ -899,14 +990,14 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
                 # an empty string as a file path, so map it to None.
                 known_hosts=host_cfg.get("known_hosts") or None,
                 connect_timeout=_connect_timeout(),
-                client_factory=lambda: _TargetClient(host),
+                client_factory=lambda: _TargetClient(host, revision=revision),
                 **_keepalive_kwargs(),
             )
             if auth == "password":
                 # The saved password and any verification code are answered
                 # by _TargetClient (see _InteractiveAuth); the human may need
                 # time to type a code, so allow longer than a plain connect.
-                kwargs["client_factory"] = lambda: _TargetClient(host, interactive=True)
+                kwargs["client_factory"] = lambda: _TargetClient(host, interactive=True, revision=revision)
                 kwargs["connect_timeout"] = max(_connect_timeout(), PASSWORD_CONNECT_TIMEOUT)
                 # Don't offer local keys first: each rejected key counts
                 # toward the server's MaxAuthTries / lockout policy.
@@ -918,7 +1009,9 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
         else:
             bname = bastion_of(host)
             async with _bastion_lock(bname):
+                check_node_request(host, revision)
                 bastion = await _ensure_bastion(bname)
+            check_node_request(host, revision)
 
             username = host_cfg.get("user", bastions()[bname].get("user", ""))
 
@@ -931,11 +1024,11 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
                 tunnel=bastion,
                 known_hosts=host_cfg.get("known_hosts") or None,
                 connect_timeout=_connect_timeout(),
-                client_factory=lambda: _TargetClient(host),
+                client_factory=lambda: _TargetClient(host, revision=revision),
                 **_keepalive_kwargs(bname),
             )
             if host_cfg.get("auth", "key") == "password":
-                tkw["client_factory"] = lambda: _TargetClient(host, interactive=True)
+                tkw["client_factory"] = lambda: _TargetClient(host, interactive=True, revision=revision)
                 tkw["connect_timeout"] = max(_connect_timeout(), PASSWORD_CONNECT_TIMEOUT)
                 # Same as direct: don't burn the server's MaxAuthTries on keys.
                 tkw["client_keys"] = None
@@ -943,6 +1036,11 @@ async def _get_target(host: str) -> asyncssh.SSHClientConnection:
             else:
                 tkw["client_keys"] = _host_client_keys(host)
             conn = await asyncssh.connect(host_cfg.get("address") or host, **tkw)
+        try:
+            check_node_request(host, revision)
+        except NodeAccessDenied:
+            _close_local(conn)
+            raise
         _target_conns[host] = conn
         if host not in _sems:
             _sems[host] = asyncio.Semaphore(8)
@@ -1084,26 +1182,20 @@ async def _run_hop(
     bastion connection.
 
     Two semantics differ from the direct/bastion path on purpose:
-    - exit code 255 is ssh-on-the-bastion's own failure (auth, host key,
-      hostname resolution, ControlPersist denial), not the command's — it
-      is turned into HopSSHError carrying ssh's stderr, because "exit_code:
-      255" alone tells the caller nothing about which of those it was;
+    - exit code 255 can indicate that the nested SSH connection failed or lost
+      its response. HopSSHError includes its stderr and prevents replay;
     - a *remote* timeout (124/137) is ssh's exit status once the nested
       `timeout` fires, so it maps to RemoteTimeout just like the local path.
     """
+    revision = check_node_request(host)
     bname = bastion_of(host)
     async with _bastion_lock(bname):
+        check_node_request(host, revision)
         bastion = await _ensure_bastion(bname)
     async with _hop_sem(bname):
+        check_node_request(host, revision)
         with _in_use(bastion):
-            process = await bastion.create_process(
-                hop_ssh_command(host, cmd, timeout, fresh=fresh), input=stdin, errors="replace"
-            )
-            try:
-                result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
-            except asyncio.TimeoutError:
-                await _kill_process(process)
-                raise RemoteTimeout(timeout) from None
+            result = await _wait_for_process(bastion, hop_ssh_command(host, cmd, timeout, fresh=fresh), timeout, stdin)
     if result.returncode == 255:
         detail = (result.stderr or "").strip() or "(no stderr)"
         _log(f"[{host}] hop ssh failed on the bastion: {detail}")
@@ -1115,38 +1207,46 @@ async def _run_hop(
     return result
 
 
+async def _wait_for_process(conn, command: str, timeout: int, stdin: str | None):
+    try:
+        process = await conn.create_process(command, input=stdin, errors="replace")
+        try:
+            result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
+        except asyncio.TimeoutError:
+            await _kill_process(process)
+            raise RemoteTimeout(timeout) from None
+    except (asyncssh.DisconnectError, OSError) as exc:
+        # Even create_process() can lose the channel after submitting the request.
+        raise RemoteResultUnknown() from exc
+    # AsyncSSH reports None when the channel closes without either an exit
+    # status or an exit signal. Output alone does not confirm the outcome.
+    if result.returncode is None:
+        raise RemoteResultUnknown("the SSH channel closed without an exit status or signal")
+    return result
+
+
 async def run(
     host: str,
     cmd: str,
     timeout: int = 60,
     stdin: str | None = None,
 ) -> asyncssh.SSHCompletedProcess:
+    revision = check_node_request(host)
+
     async def _run_once() -> asyncssh.SSHCompletedProcess:
         conn = await get_target(host)
         sem = _sems.setdefault(host, asyncio.Semaphore(8))
         async with sem:
+            check_node_request(host, revision)
             with _in_use_host(host, conn):
-                process = await conn.create_process(
-                    _timeout_wrap(cmd, timeout), input=stdin, errors="replace"
-                )
-                try:
-                    # The remote `timeout` above is the real enforcement; this is
-                    # only a backstop in case the channel itself wedges, so it's
-                    # given extra slack (+15s) to let `timeout -k 5` finish first.
-                    result = await asyncio.wait_for(process.wait(), timeout=timeout + 15)
-                except asyncio.TimeoutError:
-                    await _kill_process(process)
-                    raise RemoteTimeout(timeout) from None
+                result = await _wait_for_process(conn, _timeout_wrap(cmd, timeout), timeout, stdin)
             if result.returncode in (124, 137):
                 raise RemoteTimeout(timeout)
             return result
 
     if _route(host) == "hop":
-        # Only the bastion connection can be stale here, so a retry just
-        # reconnects it (prompting for TOTP again). A HopSSHError is an ssh
-        # *auth/config* failure against the node and is deliberately NOT in
-        # the retry clause below — retrying a known-bad credential risks an
-        # account lockout and cannot fix a host key mismatch.
+        # Reconnect only if the bastion transport drops before opening the
+        # command channel. Nested SSH errors and uncertain results propagate.
         try:
             return await _run_hop(host, cmd, timeout, stdin)
         except TimeoutError:
@@ -1156,6 +1256,7 @@ async def run(
         except HopSSHError:
             raise
         except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
+            check_node_request(host, revision)
             _invalidate_bastion(bastion_of(host))
             return await _run_hop(host, cmd, timeout, stdin)
 
@@ -1177,21 +1278,32 @@ async def run(
         # a second TOTP prompt for what's already a known-bad credential.
         raise
     except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
+        check_node_request(host, revision)
         _invalidate_target(host)
         return await _run_once()
 
 
 async def with_sftp(host: str, func):
-    """Run func(sftp_client) under the host's semaphore, retrying once after
-    reconnecting if the SFTP session drops mid-way."""
+    """Reconnect once if opening SFTP fails before the operation is invoked."""
+    revision = check_node_request(host)
     sem = _sems.setdefault(host, asyncio.Semaphore(8))
+    transport_errors = (asyncssh.DisconnectError, asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection, OSError)
 
     async def _attempt():
         conn = await get_target(host)
         async with sem:
+            check_node_request(host, revision)
             with _in_use_host(host, conn):
-                async with conn.start_sftp_client() as sftp:
-                    return await func(sftp)
+                started = False
+                try:
+                    async with conn.start_sftp_client() as sftp:
+                        started = True
+                        check_node_request(host, revision)
+                        return await func(sftp)
+                except transport_errors as exc:
+                    if started:
+                        raise RemoteResultUnknown("the SFTP session was lost") from exc
+                    raise
 
     try:
         return await _attempt()
@@ -1199,7 +1311,8 @@ async def with_sftp(host: str, func):
         raise  # see the matching comment in run()
     except asyncssh.PermissionDenied:
         raise  # see the matching comment in run()
-    except (asyncssh.ConnectionLost, asyncssh.DisconnectError, OSError):
+    except transport_errors:
+        check_node_request(host, revision)
         _invalidate_target(host)
         return await _attempt()
 
@@ -1222,7 +1335,7 @@ def connection_status() -> list[dict]:
         conn = _bastion_conns.get(bname)
         rows.append({
             "name": "跳板机" if bname == DEFAULT_BASTION else f"跳板机 {bname}",
-            "host": None, "via": "bastion",
+            "host": None, "via": "bastion", "bastion": bname,
             "state": "connected" if conn is not None else "offline",
             "detail": age(conn) if conn is not None else "未登录（首次调用时需验证码）",
         })
@@ -1253,7 +1366,7 @@ def connection_status() -> list[dict]:
         else:
             state, detail = "idle", f"尚未连接{suffix}"
         rows.append({"name": host, "host": host, "via": via, "bastion": bname,
-                     "state": state, "detail": detail})
+                     "state": state, "detail": detail, "access": hc.get("access", "full")})
     return rows
 
 
@@ -1305,6 +1418,7 @@ async def reconnect_node(host: str) -> tuple[bool, str]:
         return False, "节点已从配置移除"
     if not _allowed(host):
         return False, "节点未列入白名单"
+    revision = check_node_request(host)
     bname = _bastion_or_none(host) if _route(host) != "direct" else None
     _prompt_cooldown.pop(host, None)
     if bname is not None and _is_closed(_bastion_conns.get(bname)):
@@ -1312,15 +1426,48 @@ async def reconnect_node(host: str) -> tuple[bool, str]:
     if _uses_password(hc) and not hc.get("password") and (host in _auth_blocked or _awaiting_password(host)):
         _passwords.pop(host, None)
         password = await ask(f"[{host}] password: ", False)
-        if cfg.get("host", {}).get(host) != hc or not _allowed(host):
+        if _node_revisions.get(host, 0) != revision or not _allowed(host):
             return False, "节点配置已变化，请重试"
         if not password:
             return False, "已取消输入密码"
         _passwords[host] = password
     _auth_blocked.pop(host, None)
     async with _host_lock(host):
+        if _node_revisions.get(host, 0) != revision or not _allowed(host):
+            return False, "节点配置已变化，请重试"
         _invalidate_target(host)
     return await probe(host, fresh_hop=True)
+
+
+def affected_nodes(bastion: str) -> list[str]:
+    """Allowed nodes dependent on this bastion, in configured order."""
+    return [host for host, hc in cfg.get("host", {}).items()
+            if hc.get("via") != "direct" and _allowed(host) and _bastion_or_none(host) == bastion]
+
+
+async def reconnect_bastion(name: str) -> tuple[bool, str]:
+    if name not in bastions():
+        return False, "这台跳板机已从配置移除"
+    _prompt_cooldown.pop(_bpw_key(name), None)
+    try:
+        await get_bastion(name)
+    except Exception as exc:
+        return False, _fmt_exc(exc)
+    hosts = affected_nodes(name)
+    await connect_nodes(hosts)
+    ready = [r["host"] for r in connection_status()
+             if r["host"] in hosts and r["state"] in ("connected", "via-bastion")]
+    if name not in _bastion_conns:
+        return False, "验证后连接已断开"
+    waiting = len(hosts) - len(ready)
+    detail = "已连接"
+    if ready:
+        detail += " · 可用节点 " + "、".join(ready[:4])
+        if len(ready) > 4:
+            detail += f" 等 {len(ready)} 台"
+    if waiting:
+        detail += f" · {waiting} 台待处理"
+    return True, detail
 
 
 async def connect_nodes(hosts: list[str], concurrency: int = 8) -> None:
@@ -1481,8 +1628,7 @@ _RESTART_SECTIONS = ("bastion", "daemon")
 
 
 def apply_config(new_cfg: dict) -> dict:
-    """Swap cfg for new_cfg (reload_config) and drop the cached state of
-    removed/changed nodes so the next call rebuilds them from the new config.
+    """Update the config and retire cached connections whose settings changed.
 
     [bastion] and [daemon] are only read at startup, so they keep their old
     values here and are reported in "restart" instead. The swap is a single
@@ -1515,12 +1661,22 @@ def apply_config(new_cfg: dict) -> dict:
     allowed_changed = (
         old.get("hosts", {}).get("allowed", []) != merged.get("hosts", {}).get("allowed", [])
     )
+    revised = added + removed + changed
+    if allowed_changed:
+        revised.extend(h for h in old_hosts.keys() & new_hosts.keys() if _allowed(h, old) != _allowed(h, merged))
 
     cfg = merged
+    # Preserve tombstones on removal so deleting and re-adding the same
+    # alias cannot bring an earlier handshake or queued operation back.
+    for h in set(revised):
+        _node_revisions[h] = next(_next_node_revision)
     for h in removed + changed:
         _last_error.pop(h, None)
         _auth_blocked.pop(h, None)  # new password / address: one fresh attempt is allowed
-        _invalidate_target(h)  # no-op for hop nodes (no entry); never closes the bastion
+        # Changing MCP access fences queued work without closing the
+        # connection underneath an operation already submitted to SSH.
+        if h in removed or (old_hosts[h] | {"access": None}) != (new_hosts[h] | {"access": None}):
+            _invalidate_target(h)  # no-op for hop nodes (no entry); never closes the bastion
     for h in removed:
         _passwords.pop(h, None)
     need_password: list[str] = []

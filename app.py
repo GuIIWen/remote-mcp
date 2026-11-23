@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -24,7 +26,8 @@ from mcp.client import streamable_http
 
 import daemon
 import pool
-from config_editor import ConfigEditor
+import tools
+from config_editor import ACCESS_LABELS, ConfigEditor
 
 # ANSI colour / cursor escapes (uvicorn, rich) show up as garbage in a Tk Text.
 _ANSI_RE = re.compile(chr(27) + r"\[[0-9;?]*[ -/]*[@-~]")
@@ -113,6 +116,20 @@ class _PromptDialog(tk.Toplevel):
             self.destroy()
 
 
+@dataclass(eq=False)
+class _AuthRequest:
+    bastion: str | None
+    prompt: str
+    echo: bool
+    future: asyncio.Future[str | None]
+    done: Callable[[str | None], None]
+    dialog: _PromptDialog | None = None
+
+    @property
+    def action(self) -> str:
+        return "输入密码" if pool.is_password_prompt(self.prompt) else "输入验证码"
+
+
 def _port_in_use(port: int) -> bool:
     import socket
 
@@ -147,7 +164,7 @@ class App:
         self.root = root
         root.title("Remote MCP")
         root.geometry("760x520")
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
         self.log_q: queue.Queue = queue.Queue()
         self.ui_q: queue.Queue = queue.Queue()
@@ -172,6 +189,13 @@ class App:
         self.node_operation = None
         self.node_result = None
         self.node_rows = {}
+        self.pending_auth = None
+        self.recovering_bastion = None
+        self.recovery_result = None
+        self._recovery_connection = None
+        self.tray = None
+        self.in_tray = False
+        self.activity_items = {}
 
         # ── 导航栏（菜单） ──
         menubar = tk.Menu(root)
@@ -209,14 +233,35 @@ class App:
         tk.Label(root, textvariable=self.mcp_feedback, anchor="w", padx=10,
                  wraplength=680, justify="left").pack(fill="x")
 
+        self.recovery_panel = ttk.Frame(root, padding=(10, 6))
+        self.recovery_message = tk.StringVar()
+        ttk.Label(self.recovery_panel, textvariable=self.recovery_message, anchor="w",
+                  justify="left", wraplength=510).pack(side="left", fill="x", expand=True)
+        self.recovery_button = ttk.Button(self.recovery_panel)
+        self.recovery_button.pack(side="right", padx=(8, 0))
+
         self.body = tk.Frame(root)
         self.body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         # 日志(左)和节点状态(右)放在可左右拖动的分隔窗格里，默认 3:2
         self.paned = ttk.PanedWindow(self.body, orient="horizontal")
         self.paned.pack(side="left", fill="both", expand=True)
 
-        self.log = scrolledtext.ScrolledText(self.paned, state="disabled", wrap="word", font=("Consolas", 9))
-        self.paned.add(self.log, weight=3)
+        history = ttk.Frame(self.paned)
+        self.paned.add(history, weight=3)
+        ttk.Label(history, text="最近的 AI 操作").pack(anchor="w")
+        self.activity = ttk.Treeview(history, columns=("time", "host", "action", "status"),
+                                     show="headings", height=4, selectmode="browse")
+        for column, label, width in (("time", "时间", 65), ("host", "节点", 88),
+                                     ("action", "操作", 82), ("status", "结果", 100)):
+            self.activity.heading(column, text=label)
+            self.activity.column(column, width=width, minwidth=35, stretch=column == "host")
+        self.activity.pack(fill="x")
+        self.inspect_button = ttk.Button(history, text="查看节点状态", command=self.inspect_activity_node,
+                                         state="disabled")
+        self.inspect_button.pack(anchor="w", pady=(4, 6))
+        self.activity.bind("<<TreeviewSelect>>", self.update_activity_controls)
+        self.log = scrolledtext.ScrolledText(history, state="disabled", wrap="word", font=("Consolas", 9))
+        self.log.pack(fill="both", expand=True)
 
         self.panel = tk.Frame(self.paned)
         self.paned.add(self.panel, weight=2)
@@ -302,6 +347,7 @@ class App:
         if state != "running":
             self.mcp_feedback.set("")
         self.update_node_controls()
+        self.refresh_recovery()
 
     # ── 启动 / 停止 ──────────────────────────────────────
     def start(self) -> None:
@@ -380,6 +426,9 @@ class App:
         self.mcp_check_busy = False
         self.node_operation = None
         self.node_result = None
+        self.recovering_bastion = None
+        self.recovery_result = None
+        self._recovery_connection = None
         self.set_state("stopped")
         print("服务已停止")
 
@@ -405,26 +454,111 @@ class App:
         loop = asyncio.get_running_loop()
         async with self._prompt_lock:
             fut: "asyncio.Future[str | None]" = loop.create_future()
-            box: dict = {}
 
             def done(value) -> None:
-                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(value))
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(value))
 
-            def show() -> None:
-                if fut.done():
-                    return
-                self.root.deiconify()
-                self.root.lift()
-                box["dlg"] = _PromptDialog(self.root, prompt, echo, done)
-
-            self.call_ui(lambda: self.root.after(0, show))
+            request = _AuthRequest(pool.auth_bastion.get(), prompt, echo, fut, done)
+            self.call_ui(self.set_pending_auth, request)
             try:
                 return await fut
-            except asyncio.CancelledError:
-                # The connection that asked gave up (e.g. connect timeout):
-                # take the stale dialog down instead of leaving it open.
-                self.call_ui(lambda: box.get("dlg") and box["dlg"].dismiss())
-                raise
+            finally:
+                self.call_ui(self.clear_pending_auth, request)
+
+    def set_pending_auth(self, request: _AuthRequest) -> None:
+        if request.future.done():
+            return
+        self.pending_auth = request
+        self.refresh_recovery()
+        if self.in_tray:
+            self.tray.notify(self.recovery_message.get())
+            return
+        if self.root.state() == "iconic":
+            self.root.deiconify()
+            self.root.lift()
+        if request.bastion is None:
+            self.open_auth_dialog()
+
+    def clear_pending_auth(self, request: _AuthRequest) -> None:
+        if request.dialog:
+            request.dialog.dismiss()
+        if self.pending_auth is request:
+            self.pending_auth = None
+            self.refresh_recovery()
+
+    def open_auth_dialog(self) -> None:
+        request = self.pending_auth
+        if not self.in_tray and request and not request.future.done() and request.dialog is None:
+            request.dialog = _PromptDialog(self.root, request.prompt, request.echo, request.done)
+
+    def refresh_recovery(self) -> None:
+        request = self.pending_auth
+        if self.recovery_result and self.recovery_result[1]:
+            name = self.recovery_result[0]
+            connection = pool._bastion_conns.get(name)
+            if connection is None or connection is not self._recovery_connection:
+                self.recovery_result = None
+                self._recovery_connection = None
+        if request and not request.future.done() and self.service_state in ("starting", "running"):
+            if request.bastion is None:
+                detail = f"节点等待验证 · {request.prompt.strip()}"
+            else:
+                detail = self.bastion_message(request.bastion, f"需要{request.action}")
+            self.recovery_message.set(detail)
+            self.recovery_button.configure(text=request.action, command=self.open_auth_dialog, state="normal")
+        elif self.service_state == "running" and (name := self.unavailable_bastion()) is not None:
+            detail = self.bastion_message(name, "正在验证…" if self.recovering_bastion == name else "未连接")
+            if self.recovery_result and self.recovery_result[:2] == (name, False):
+                detail += f"\n{self.recovery_result[2]}"
+            self.recovery_message.set(detail)
+            self.recovery_button.configure(text="重新验证", command=partial(self.recover_bastion, name),
+                                           state="disabled" if self.recovering_bastion else "normal")
+        elif self.service_state == "running" and self.recovery_result and self.recovery_result[1]:
+            name, _ok, detail = self.recovery_result
+            self.recovery_message.set(f"跳板机 {name} {detail}")
+            self.recovery_button.configure(text="关闭提示", command=self.dismiss_recovery_result, state="normal")
+        else:
+            self.recovery_panel.pack_forget()
+            return
+        self.recovery_panel.pack(fill="x", before=self.body)
+
+    def unavailable_bastion(self) -> str | None:
+        offline = [name for name in pool.bastions() if not pool._bastion_conns.get(name) and pool.affected_nodes(name)]
+        selected = self.tree.selection()
+        if selected:
+            for name in offline:
+                label = "跳板机" if name == pool.DEFAULT_BASTION else f"跳板机 {name}"
+                if selected[0] == f"bastion:{label}":
+                    return name
+        return next(iter(offline), None)
+
+    def bastion_message(self, name: str, detail: str) -> str:
+        label = "默认跳板机" if name == pool.DEFAULT_BASTION else f"跳板机 {name}"
+        hosts = pool.affected_nodes(name)
+        affected = "、".join(hosts[:4])
+        if len(hosts) > 4:
+            affected += f" 等 {len(hosts)} 台"
+        return f"{label} {detail}" + (f" · 受影响节点 {affected}" if hosts else "")
+
+    def recover_bastion(self, name: str) -> None:
+        if self._submit(partial(pool.reconnect_bastion, name), partial(self.show_recovery_result, name)):
+            self.recovering_bastion = name
+            self.recovery_result = None
+            self._recovery_connection = None
+            self.refresh_recovery()
+
+    def show_recovery_result(self, name: str, ok: bool, detail: str) -> None:
+        self.recovering_bastion = None
+        self.recovery_result = (name, ok, detail)
+        self._recovery_connection = pool._bastion_conns.get(name) if ok else None
+        print(f"[{name}] {detail}")
+        self.refresh_recovery()
+
+    def dismiss_recovery_result(self) -> None:
+        self.recovery_result = None
+        self._recovery_connection = None
+        self.refresh_recovery()
 
     def reconnect_nodes(self) -> None:
         if not self._submit(pool.reconnect_all):
@@ -527,7 +661,7 @@ class App:
             self.paned.forget(self.panel)
             self.expand_btn.pack(side="right", fill="y", padx=(6, 0))
 
-    def refresh_nodes(self) -> None:
+    def refresh_nodes(self, *, schedule: bool = True) -> None:
         if self.panel_open:
             rows = pool.connection_status() if self.service_state == "running" else []
             ids = []
@@ -554,13 +688,18 @@ class App:
             self.tree.delete(*(set(self.tree.get_children()) - set(ids)))
             self.tree.set_children("", *ids)
             self.update_node_controls()
-        self.root.after(2000, self.refresh_nodes)
+        self.refresh_recovery()
+        self.refresh_activity()
+        if schedule:
+            self.root.after(2000, self.refresh_nodes)
 
     def selected_node(self):
         selection = self.tree.selection()
         return self.node_rows.get(selection[0]) if selection else None
 
     def update_node_controls(self, _event=None) -> None:
+        if _event is not None:
+            self.refresh_recovery()
         node = self.selected_node() if self.service_state == "running" else None
         enabled = node is not None and self.node_operation is None
         self.test_node_button.configure(state="normal" if enabled else "disabled")
@@ -571,7 +710,7 @@ class App:
         route = node["via"]
         if node["bastion"]:
             route += f" / 跳板机 {node['bastion']}"
-        detail = f"{route} · {node['detail']}"
+        detail = f"{route} · {ACCESS_LABELS[node['access']]}\n{node['detail']}"
         if self.node_operation and self.node_operation[0] == node["host"]:
             detail += f"\n{self.node_operation[1]}中…"
         elif self.node_result and self.node_result[0] == node["host"]:
@@ -601,6 +740,46 @@ class App:
         print(f"[{host}] {message}")
         self.update_node_controls()
 
+    def refresh_activity(self) -> None:
+        rows = tools.recent_activity()[:5]
+        self.activity_items = {str(row["id"]): row for row in rows}
+        for item, row in self.activity_items.items():
+            timestamp = time.strftime("%H:%M:%S", time.localtime(row["time"]))
+            values = (timestamp, row["host"], row["action"], row["status"])
+            if self.activity.exists(item):
+                self.activity.item(item, values=values)
+            else:
+                self.activity.insert("", "end", iid=item, values=values)
+        self.activity.delete(*(set(self.activity.get_children()) - self.activity_items.keys()))
+        self.activity.set_children("", *self.activity_items)
+        self.update_activity_controls()
+
+    def selected_activity(self):
+        selected = self.activity.selection()
+        return self.activity_items.get(selected[0]) if selected else None
+
+    def update_activity_controls(self, _event=None) -> None:
+        row = self.selected_activity()
+        enabled = self.service_state == "running" and row and row["status"] == "结果未知"
+        self.inspect_button.configure(state="normal" if enabled else "disabled")
+
+    def inspect_activity_node(self) -> None:
+        row = self.selected_activity()
+        if row is None:
+            return
+        host = row["host"]
+        item = f"node:{host}"
+        if not self.panel_open:
+            self.toggle_panel()
+        self.refresh_nodes(schedule=False)
+        if not self.tree.exists(item):
+            messagebox.showinfo("查看节点状态", f"{host} 当前不在节点列表中。请先确认上一条操作的状态。")
+            return
+        self.tree.selection_set(item)
+        self.tree.see(item)
+        self.node_result = (host, "上一条操作结果未知。连接测试只确认能否连接，请先核查原操作。")
+        self.update_node_controls()
+
     def clear_log(self) -> None:
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -619,6 +798,36 @@ class App:
     def copy_codex_cmd(self) -> None:
         self._copy(f"codex mcp add remote-linux --url {self.url_var.get()}")
 
+    def on_window_close(self) -> None:
+        if sys.platform == "win32" and self.thread and self.thread.is_alive() and not self.closing:
+            try:
+                if self.tray is None:
+                    from windows_tray import WindowsTray
+
+                    self.tray = WindowsTray(self.call_ui, open_window=self.show_window,
+                                            stop_service=self.stop_from_tray, exit_app=self.quit_from_tray)
+                self.in_tray = True
+                self.root.withdraw()
+                if self.pending_auth:
+                    self.tray.notify(self.recovery_message.get())
+                return
+            except Exception as exc:
+                print(f"无法使用 Windows 托盘：{exc}")
+        self.on_close()
+
+    def show_window(self) -> None:
+        self.in_tray = False
+        self.root.deiconify()
+        self.root.lift()
+
+    def stop_from_tray(self) -> None:
+        if self.service_state in ("starting", "running"):
+            self.stop()
+
+    def quit_from_tray(self) -> None:
+        self.show_window()
+        self.on_close()
+
     def on_close(self) -> None:
         if self.closing:
             return
@@ -631,13 +840,20 @@ class App:
             # stop the after() callbacks (force_exit) that make the service exit.
             self._wait_exit(time.monotonic() + 8)
             return
-        self.root.destroy()
+        self.destroy_window()
 
     def _wait_exit(self, deadline: float) -> None:
         if self.thread and self.thread.is_alive() and time.monotonic() < deadline:
             self.root.after(100, self._wait_exit, deadline)
         else:
-            self.root.destroy()  # the service thread is a daemon: it can't outlive us
+            self.destroy_window()  # the service thread is a daemon: it can't outlive us
+
+    def destroy_window(self) -> None:
+        try:
+            if self.tray:
+                self.tray.close()
+        finally:
+            self.root.destroy()
 
 
 def main() -> None:

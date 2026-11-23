@@ -71,6 +71,107 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         pool._conn_stats.clear()
 
 
+class NodeRevisionTests(PoolTestCase):
+    async def test_late_handshake_cannot_use_new_password_or_enter_cache(self):
+        start, finish = asyncio.Event(), asyncio.Event()
+        old, new = FakeConn(), FakeConn()
+        pool.cfg = {"host": {"rev": {"via": "direct", "address": "old.invalid", "auth": "password"}}}
+
+        async def connect(address, *, client_factory, **_kwargs):
+            if address == "old.invalid":
+                start.set()
+                await finish.wait()
+                client = client_factory()
+                self.assertIsNone(client.password_auth_requested())
+                self.assertIsNone(await client.kbdint_challenge_received("", "", "", [("password:", False)]))
+                return old
+            self.assertEqual(address, "new.invalid")
+            self.assertEqual(client_factory().password_auth_requested(), "replacement")
+            return new
+
+        with mock.patch.object(asyncssh, "connect", side_effect=connect):
+            stale = asyncio.create_task(pool.get_target("rev"))
+            await asyncio.wait_for(start.wait(), 2)
+            pool.apply_config({"host": {"rev": {
+                "via": "direct", "address": "new.invalid", "auth": "password", "password": "replacement",
+            }}})
+            finish.set()
+            with self.assertRaisesRegex(pool.NodeAccessDenied, "configuration changed"):
+                await stale
+            self.assertTrue(old.closed)
+            self.assertNotIn("rev", pool._target_conns)
+            self.assertIs(await pool.get_target("rev"), new)
+
+    async def test_queued_exec_rechecks_permission_and_node_identity(self):
+        for route, change in (
+            ("direct", "read_only"), ("bastion", "replace"), ("hop", "revoke"), ("hop", "unrelated"),
+        ):
+            with self.subTest(route=route, change=change):
+                start, finish = asyncio.Event(), asyncio.Event()
+
+                @contextlib.asynccontextmanager
+                async def wait_for_slot():
+                    start.set()
+                    await finish.wait()
+                    yield
+
+                cfg = {**pool.cfg, "hosts": {"allowed": ["queued"]}, "host": {
+                    "queued": {"via": route, "address": "server.invalid"},
+                    "unrelated": {"via": "direct", "address": "spare.invalid"},
+                }}
+                pool.cfg = cfg
+                conn = FakeConn()
+                conn.create_process = mock.AsyncMock(
+                    return_value=SimpleNamespace(wait=mock.AsyncMock(return_value=SimpleNamespace(returncode=0)))
+                )
+
+                async def exec_queued():
+                    with pool.node_request("queued", write=True):
+                        return await pool.run("queued", "true")
+
+                with mock.patch.object(pool, "get_target", return_value=conn), \
+                        mock.patch.object(pool, "_ensure_bastion", return_value=conn), \
+                        mock.patch.object(pool, "_hop_sem", side_effect=lambda _name: wait_for_slot()), \
+                        mock.patch.object(pool, "_sems", {"queued": wait_for_slot()}):
+                    request = asyncio.create_task(exec_queued())
+                    await asyncio.wait_for(start.wait(), 2)
+                    hosts = cfg["host"]
+                    if change == "read_only":
+                        pool.apply_config({**cfg, "host": {**hosts, "queued": {**hosts["queued"], "access": "read_only"}}})
+                    elif change == "replace":
+                        pool.apply_config({**cfg, "host": {"unrelated": hosts["unrelated"]}})
+                        pool.apply_config(cfg)  # An identical replacement alias still has a new revision.
+                    elif change == "revoke":
+                        pool.apply_config({**cfg, "hosts": {"allowed": ["unrelated"]}})
+                    else:
+                        pool.apply_config({**cfg, "host": {**hosts, "unrelated": {
+                            "via": "direct", "address": "spare-new.invalid",
+                        }}})
+                    finish.set()
+                    if change == "unrelated":
+                        self.assertEqual((await request).returncode, 0)
+                        conn.create_process.assert_awaited_once()
+                    else:
+                        with self.assertRaises(pool.NodeAccessDenied):
+                            await request
+                        conn.create_process.assert_not_awaited()
+
+    async def test_missing_exit_status_is_unknown_but_explicit_results_are_retained(self):
+        for returncode in (None, 0, 2, -15):
+            with self.subTest(returncode=returncode):
+                result = SimpleNamespace(returncode=returncode, stdout="started")
+                process = SimpleNamespace(wait=mock.AsyncMock(return_value=result))
+                conn = FakeConn()
+                conn.create_process = mock.AsyncMock(return_value=process)
+                with mock.patch.object(pool, "get_target", return_value=conn):
+                    if returncode is None:
+                        with self.assertRaisesRegex(pool.RemoteResultUnknown, "without an exit status"):
+                            await pool.run("command", "true")
+                    else:
+                        self.assertIs(await pool.run("command", "true"), result)
+                conn.create_process.assert_awaited_once()
+
+
 class ClassifyDropTests(unittest.TestCase):
     def hints(self, *a, **kw):
         return " | ".join(pool.classify_drop(*a, **kw))
@@ -776,6 +877,53 @@ class ProbeTests(PoolTestCase):
         rows = pool.connection_status()
         self.assertIsNone(rows[0]["host"])
         self.assertEqual([r["host"] for r in rows[1:]], ["n", "h", "d"])
+
+    async def test_recover_bastion_probes_only_its_allowed_nodes(self):
+        pool.cfg = {
+            "bastion": {"one": {"host": "one", "user": "me"}, "two": {"host": "two", "user": "me"}},
+            "hosts": {"allowed": ["visible", "independent", "other"]},
+            "host": {"visible": {"via": "hop", "bastion": "one"}, "hidden": {"bastion": "one"},
+                     "independent": {"via": "direct"}, "other": {"bastion": "two"}},
+        }
+        pool._bastion_conns["one"] = FakeConn()
+        pool._prompt_cooldown[pool._bpw_key("one")] = 1
+        pool._prompt_cooldown[pool._bpw_key("two")] = 1
+        with mock.patch.object(pool, "get_bastion", mock.AsyncMock()) as login, \
+                mock.patch.object(pool, "connect_nodes", mock.AsyncMock()) as connect:
+            ok, detail = await pool.reconnect_bastion("one")
+        self.assertTrue(ok)
+        self.assertIn("visible", detail)
+        login.assert_awaited_once_with("one")
+        connect.assert_awaited_once_with(["visible"])
+        self.assertNotIn(pool._bpw_key("one"), pool._prompt_cooldown)
+        self.assertEqual(pool._prompt_cooldown.pop(pool._bpw_key("two")), 1)
+
+    async def test_command_is_not_replayed_once_submission_can_have_happened(self):
+        process = SimpleNamespace(wait=mock.AsyncMock(side_effect=asyncssh.ConnectionLost("mock disconnect")))
+        conn = FakeConn()
+        conn.create_process = mock.AsyncMock(return_value=process)
+        for route in ("direct", "hop"):
+            pool.cfg["host"] = {"test": {"via": route}}
+            conn.create_process.reset_mock()
+            with mock.patch.object(pool, "get_target", mock.AsyncMock(return_value=conn)), \
+                    mock.patch.object(pool, "_ensure_bastion", mock.AsyncMock(return_value=conn)):
+                with self.assertRaises(pool.RemoteResultUnknown):
+                    await pool.run("test", "true")
+            conn.create_process.assert_awaited_once()
+
+    async def test_sftp_write_is_not_replayed_after_loss_of_reply(self):
+        conn = FakeConn()
+
+        @contextlib.asynccontextmanager
+        async def session():
+            yield object()
+
+        conn.start_sftp_client = mock.Mock(side_effect=session)
+        write = mock.AsyncMock(side_effect=asyncssh.SFTPConnectionLost("mock disconnect"))
+        with mock.patch.object(pool, "get_target", mock.AsyncMock(return_value=conn)):
+            with self.assertRaises(pool.RemoteResultUnknown):
+                await pool.with_sftp("test", write)
+        write.assert_awaited_once()
 
 
 class BastionRouteAddressTests(PoolTestCase):
